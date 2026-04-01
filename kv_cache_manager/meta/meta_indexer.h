@@ -1,6 +1,9 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -9,6 +12,7 @@
 #include <vector>
 
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
@@ -90,8 +94,51 @@ public:
     size_t GetMaxKeyCount() const noexcept;
     size_t GetCacheUsage() const noexcept;
 
+    // storage usage interfaces
+    [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
+    [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
+    void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+    std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+    std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+
 private:
     class ScopedBatchLock;
+
+    // instance storage usage data
+    class StorageUsageData : public Jsonizable {
+    public:
+        StorageUsageData() = default;
+        ~StorageUsageData() override = default;
+
+        [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
+        [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
+
+        void Reset() noexcept;
+        void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+
+        std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+        std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+
+        void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+        bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+
+        [[nodiscard]] std::string Serialize() const noexcept;
+        ErrorCode Deserialize(const std::string &str) noexcept;
+
+    private:
+        using array_t_ = std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DataStorageType::COUNT)>;
+        using size_t_ = array_t_::size_type;
+
+        // storage usage data array aggregated by storage type
+        // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
+        // slot 1: DATA_STORAGE_TYPE_HF3FS usage data
+        // slot 2: DATA_STORAGE_TYPE_MOONCAKE usage data
+        // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL usage data
+        // slot 4: DATA_STORAGE_TYPE_NFS usage data
+        // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+        array_t_ storage_usage_by_type_;
+    };
+
     struct BatchMetaData {
         std::vector<std::vector<int32_t>> batch_shard_indexs; // shard mutex index
         std::vector<std::vector<int32_t>> batch_indexs;       // raw index in KeyVector
@@ -130,9 +177,7 @@ private:
     size_t mutex_shard_num_ = MetaIndexerConfig::kDefaultMutexShardNum;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
-
-public:
-    std::array<std::atomic<std::uint64_t>, 5> storage_usage_array_ = {0, 0, 0, 0, 0};
+    StorageUsageData storage_usage_data_;
 };
 
 } // namespace kv_cache_manager
