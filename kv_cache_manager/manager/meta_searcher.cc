@@ -144,7 +144,8 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
 
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
-    for (size_t i = 0; i < keys.size(); ++i) {
+    std::size_t i = 0;
+    for (; i != keys.size(); ++i) {
         if (result.error_codes[i] != ErrorCode::EC_OK) {
             KVCM_LOG_DEBUG("prefix match end because Get keys[%lu](%lu) return %d", i, keys[i], result.error_codes[i]);
             break;
@@ -174,6 +175,30 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             break;
         }
         out_locations.push_back(std::move(merged));
+    }
+
+    if (!prune_keys.empty()) {
+        for (i == keys.size() ? /* do nothing */ i : ++i; i != keys.size(); ++i) {
+            if (result.error_codes[i] != ErrorCode::EC_OK) {
+                continue;
+            }
+            int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
+            BlockCacheLocationsMeta meta;
+            if (!meta.FromJsonString(uris[i])) {
+                continue;
+            }
+            index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
+            auto &location_map = meta.location_map();
+            if (location_map.empty()) {
+                continue;
+            }
+            std::vector<std::string> prune_loc_ids;
+            policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+            if (!prune_loc_ids.empty()) {
+                prune_keys.emplace_back(keys[i]);
+                prune_loc_ids_vec.emplace_back(prune_loc_ids);
+            }
+        }
     }
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(

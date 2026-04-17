@@ -68,28 +68,49 @@ CacheLocation *WeightSLPolicy::SelectForMatch(CacheLocationMap &location_map,
     return serving_locations[dist(rng)];
 }
 
-bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map) const {
+bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
+                                    CheckLocDataExistFunc check_loc_data_exist,
+                                    std::vector<std::string> &out_prune_loc_ids) const {
+    bool exists = false;
+    out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
         if (kv.second.status() != CacheLocationStatus::CLS_NOT_FOUND) {
-            if (GetWeight(kv) > 0) {
-                return true;
+            if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
+                !check_loc_data_exist(kv.second)) {
+                out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
+            if (!exists && GetWeight(kv) > 0) {
+                exists = true;
             }
         }
     }
-    return false;
+    return exists;
 }
 
 bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
-                                    const std::vector<std::string> &requested_spec_names) const {
+                                    const std::vector<std::string> &requested_spec_names,
+                                    CheckLocDataExistFunc check_loc_data_exist,
+                                    std::vector<std::string> &out_prune_loc_ids) const {
     // If no specific spec names requested, fall back to block-level check
     if (requested_spec_names.empty()) {
-        return ExistsForWrite(location_map);
+        return ExistsForWrite(location_map, check_loc_data_exist, out_prune_loc_ids);
     }
     // Check if any single serving location already covers ALL requested specs.
     // Use linear search on location_specs (typically 2-4 elements) instead of
     // building a hash set — avoids heap allocation and string copies.
+    bool exists = false;
+    out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
         if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND) {
+            continue;
+        }
+        if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
+            !check_loc_data_exist(kv.second)) {
+            out_prune_loc_ids.emplace_back(kv.first);
+            continue;
+        }
+        if (exists) {
             continue;
         }
         if (GetWeight(kv) <= 0) {
@@ -102,10 +123,10 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
                     loc_specs.begin(), loc_specs.end(), [&name](const auto &spec) { return spec.name() == name; });
             });
         if (covers_all) {
-            return true;
+            exists = true;
         }
     }
-    return false;
+    return exists;
 }
 
 uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {
