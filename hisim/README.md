@@ -176,6 +176,10 @@ The config file is a JSON with three main sections:
   - `accelerator.name`: GPU model (e.g., `"H20"`)
   - `disk_*_bandwidth_gb`: L3 (disk) read/write bandwidth (GB/s)
   - `memory_*_bandwidth_gb`: L2 (memory) read/write bandwidth (GB/s)
+  - `num_nodes` / `num_device_per_node`: topology for multi-device simulation
+  - `interconnect_mode`: inter-device link type (e.g., `none`, `nvlink`, `ethernet`)
+  - `interconnect_bandwidth_gb`: inter-device bandwidth (GB/s)
+  - `interconnect_latency_us`: per-collective link latency (us)
 
 - **`predictor`**: Time prediction module  
   - `name`: predictor type (`"aiconfigurator"` or `"schedule_replay"`)
@@ -193,7 +197,12 @@ The config file is a JSON with three main sections:
     "disk_read_bandwidth_gb": 4,
     "disk_write_bandwidth_gb": 4,
     "memory_read_bandwidth_gb": 64,
-    "memory_write_bandwidth_gb": 64
+    "memory_write_bandwidth_gb": 64,
+    "num_nodes": 1,
+    "num_device_per_node": 1,
+    "interconnect_mode": "none",
+    "interconnect_bandwidth_gb": 0,
+    "interconnect_latency_us": 0
   },
   "predictor": {
     "name": "aiconfigurator",

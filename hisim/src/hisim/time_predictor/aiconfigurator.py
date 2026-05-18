@@ -24,6 +24,7 @@ from aiconfigurator.sdk.perf_database import get_database, get_system_config_pat
 
 from hisim.simulation.types import (
     SchedulerConfig,
+    PlatformConfig,
 )
 from hisim.time_predictor import (
     InferTimePredictor,
@@ -365,6 +366,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         model: ModelInfo,
         hw: AcceleratorInfo,
         config: SchedulerConfig,
+        platform_config: Optional[PlatformConfig] = None,
         database_path: Optional[str] = None,
         database_mode: DatabaseMode | str = DatabaseMode.SILICON,
         xgb_model_path: Optional[str] = None,
@@ -373,6 +375,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
     ):
         super().__init__(model, hw, config)
 
+        self.platform_config = platform_config
         self.prefill_scale_factor = prefill_scale_factor
         self.decode_scale_factor = decode_scale_factor
 
@@ -417,6 +420,34 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         self.xgb_bucket_models = []
         if xgb_model_path is not None:
             self.xgb_bucket_models = _load_bucket_models(xgb_model_path)
+
+    def _estimate_tp_comm_time_ms(self, batch: ScheduleBatch) -> float:
+        if self.platform_config is None or self.config.tp_size <= 1:
+            return 0.0
+
+        bandwidth = self.platform_config.interconnect_bandwidth
+        latency_us = self.platform_config.interconnect_latency_us or 0.0
+        if bandwidth is None or bandwidth <= 0:
+            return 0.0
+
+        hidden_size = getattr(self.model, "hidden_size", 0) or 0
+        num_layers = getattr(self.model, "num_hidden_layers", 0) or 0
+        if hidden_size <= 0 or num_layers <= 0:
+            return 0.0
+
+        tokens = batch.batch_size if batch.is_decode() else batch.num_context_tokens
+        if tokens <= 0:
+            return 0.0
+
+        # Approximate TP communication as two ring collectives per transformer layer.
+        collective_count = 2 * num_layers
+        dtype_bytes = self.config.data_type.bytes if self.config.data_type else 2
+        payload_bytes = tokens * hidden_size * dtype_bytes
+        ring_factor = 2 * (self.config.tp_size - 1) / self.config.tp_size
+
+        transfer_ms = collective_count * payload_bytes * ring_factor / bandwidth * 1e3
+        launch_ms = collective_count * 2 * (self.config.tp_size - 1) * latency_us / 1e3
+        return transfer_ms + launch_ms
 
     def _get_database_mode(self, mode: str) -> DatabaseMode:
         return {
@@ -508,11 +539,14 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             summary = self._session.run_static(runtime_config, mode="static_ctx")
             latency_dict = summary.get_context_latency_dict()
         infer_time = sum(latency_dict.values())
-        if summary.check_oom():
+        is_oom = summary.check_oom()
+        if is_oom:
             logger.warning("Out of memory detected during estimation.")
-            infer_time = -infer_time
         if batch.is_decode():
             infer_time *= self.decode_scale_factor
         else:
             infer_time *= self.prefill_scale_factor
+        if is_oom:
+            return -abs(infer_time) / 1e3
+        infer_time += self._estimate_tp_comm_time_ms(batch)
         return infer_time / 1e3

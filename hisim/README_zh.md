@@ -164,6 +164,10 @@ Max ITL (ms):                            21.47
   - `accelerator.name`：GPU 型号（如 `H20`）
   - `disk_*_bandwidth_gb`：L3 层数据读写带宽（GB/s）
   - `memory_*_bandwidth_gb`：L2 层数据读写带宽（GB/s）
+  - `num_nodes` / `num_device_per_node`：多设备仿真的拓扑结构
+  - `interconnect_mode`：设备间链路类型（如 `none`、`nvlink`、`ethernet`）
+  - `interconnect_bandwidth_gb`：设备间带宽（GB/s）
+  - `interconnect_latency_us`：每次 collective 的链路时延（us）
 
 - `predictor`：执行时间预测器（TimePredictor）  
   - `name`：预测器类型，可选 `aiconfigurator` / `schedule_replay`
@@ -181,7 +185,12 @@ Max ITL (ms):                            21.47
     "disk_read_bandwidth_gb": 4,
     "disk_write_bandwidth_gb": 4,
     "memory_read_bandwidth_gb": 64,
-    "memory_write_bandwidth_gb": 64
+    "memory_write_bandwidth_gb": 64,
+    "num_nodes": 1,
+    "num_device_per_node": 1,
+    "interconnect_mode": "none",
+    "interconnect_bandwidth_gb": 0,
+    "interconnect_latency_us": 0
   },
   "predictor": {
     "name": "aiconfigurator",

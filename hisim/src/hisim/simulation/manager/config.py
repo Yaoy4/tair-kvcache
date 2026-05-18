@@ -74,7 +74,16 @@ class ConfigManager:
                 memory_write_bandwidth_gb=platform_config.get(
                     "memory_write_bandwidth_gb"
                 ),
-                num_device_per_node=platform_config.get("num_device_per_node"),
+                num_nodes=platform_config.get("num_nodes", 1),
+                num_device_per_node=platform_config.get("num_device_per_node", 8),
+                interconnect_mode=platform_config.get("interconnect_mode", "none"),
+                interconnect_bandwidth_gb=platform_config.get(
+                    "interconnect_bandwidth_gb",
+                    platform_config.get("interconnect_bandwidth_gbps"),
+                ),
+                interconnect_latency_us=platform_config.get(
+                    "interconnect_latency_us"
+                ),
             )
 
             logger.info(
@@ -194,6 +203,7 @@ class ConfigManager:
                 model,
                 hw=hw,
                 config=sched_config,
+                platform_config=cls.get_platform_config(),
                 database_path=predictor_config.get("database_path"),
                 database_mode=database_mode,
                 prefill_scale_factor=prefill_scale_factor,

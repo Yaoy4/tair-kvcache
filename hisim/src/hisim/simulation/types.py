@@ -74,7 +74,12 @@ class PlatformConfig:
     memory_capacity_gb: Optional[float] = None
     memory_read_bandwidth_gb: Optional[float] = None
     memory_write_bandwidth_gb: Optional[float] = None
+    num_nodes: int = 1
     num_device_per_node: int = 8
+    interconnect_mode: str = "none"
+    # Interconnect bandwidth follows the existing *_bandwidth_gb convention (GB/s).
+    interconnect_bandwidth_gb: Optional[float] = None
+    interconnect_latency_us: Optional[float] = None
 
     @property
     def disk_read_bandwidth(self):
@@ -101,5 +106,13 @@ class PlatformConfig:
         return (
             self.memory_write_bandwidth_gb * 1e9
             if self.memory_write_bandwidth_gb
+            else None
+        )
+
+    @property
+    def interconnect_bandwidth(self):
+        return (
+            self.interconnect_bandwidth_gb * 1e9
+            if self.interconnect_bandwidth_gb
             else None
         )
