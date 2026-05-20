@@ -61,15 +61,15 @@ This example runs inference simulation using real-world trace data. You may also
 Run the following command from the project root directory (the folder containing this `README.md`):
 
 ```bash
-python3 -m hisim.simulation.sglang.launch_server \
-  --model-path "Qwen/Qwen3-32B-FP8" \
-  --sim-config-path test/assets/mock/config.json \
-  --skip-server-warmup
+PYTHONPATH=src python3 -m hisim.simulation.sglang.launch_server \
+  --model-path "/mnt/nfs02/users/tjiang/Gitrepo/models/Qwen3-8B/" \
+  --sim-config-path test/assets/mock/config.demo.rtx_pro_6000_server_pcie.json
 ```
 
 > **Notes**:
 > - Parameters prefixed with `--sim-` are simulation-specific; others are passed to the SGLang framework.
 > - Use `--sim-config-path` to specify the simulation configuration file.
+> - When running directly from a local checkout, set `PYTHONPATH=src` (or reinstall with `pip install -e .`) so Python imports the modified source tree instead of an older copy from `site-packages`.
 > - In pure CPU simulation environments, you may need to install the CPU-compatible version of vLLM (a dependency of SGLang CPU mode) and set the following environment variables:
 >   ```bash
 >   export SGLANG_USE_CPU_ENGINE=1
@@ -83,27 +83,29 @@ Open a new terminal and run the benchmark client. **Important**: Use `--bench-mo
 
 - **Replay from user dataset** (`user_replay_requests.jsonl`):
   ```bash
-  python3 -m hisim.simulation.bench_serving \
-      --warmup-requests 0 \
-      --bench-mode simulation \
-      --model "Qwen/Qwen3-32B-FP8" \
-      --backend sglang \
-      --dataset-name hisim-collection \
-      --dataset-path user_replay_requests.jsonl
+  PYTHONPATH=src python3 -m hisim.simulation.bench_serving \
+    --warmup-requests 0 \
+    --bench-mode simulation \
+    --model "Qwen/Qwen3-32B-FP8" \
+    --backend sglang \
+    --dataset-name hisim-collection \
+    --dataset-path user_replay_requests.jsonl
   ```
 
 - **Synthetic random workload**:
   ```bash
-  python3 -m hisim.simulation.bench_serving \
-      --warmup-requests 0 \
-      --model "Qwen/Qwen3-32B-FP8" \
-      --bench-mode simulation \
-      --dataset-name random \
-      --request-rate 4 \
-      --random-input-len 1024 \
-      --random-output-len 1024 \
-      --random-range-ratio 1 \
-      --num-prompts 50
+  PYTHONPATH=src python3 -m hisim.simulation.bench_serving \
+    --host 127.0.0.1 \
+    --warmup-requests 0 \
+    --bench-mode simulation \
+    --model "/mnt/nfs02/users/tjiang/Gitrepo/models/Qwen3-8B/" \
+    --backend sglang \
+    --dataset-name random \
+    --request-rate 4 \
+    --random-input-len 1024 \
+    --random-output-len 1024 \
+    --random-range-ratio 1 \
+    --num-prompts 5
   ```
 
 You have now completed a framework-intercepted inference simulation.
@@ -173,11 +175,11 @@ Hisim uses **dynamic interception** to hijack the execution flow of the inferenc
 The config file is a JSON with three main sections:
 
 - **`platform`**: Hardware and bandwidth settings  
-  - `accelerator.name`: GPU model (e.g., `"H20"`)
+  - `accelerator.name`: GPU model (e.g., `"H100"`, `"Intel B60"`, `"RTX 6000 PRO"`)
   - `disk_*_bandwidth_gb`: L3 (disk) read/write bandwidth (GB/s)
   - `memory_*_bandwidth_gb`: L2 (memory) read/write bandwidth (GB/s)
   - `num_nodes` / `num_device_per_node`: topology for multi-device simulation
-  - `interconnect_mode`: inter-device link type (e.g., `none`, `nvlink`, `ethernet`)
+  - `interconnect_mode`: inter-device link type (e.g., `none`, `pcie`, `nvlink`, `ethernet`)
   - `interconnect_bandwidth_gb`: inter-device bandwidth (GB/s)
   - `interconnect_latency_us`: per-collective link latency (us)
 
@@ -193,7 +195,7 @@ The config file is a JSON with three main sections:
 ```json
 {
   "platform": {
-    "accelerator": { "name": "H20" },
+    "accelerator": { "name": "H100" },
     "disk_read_bandwidth_gb": 4,
     "disk_write_bandwidth_gb": 4,
     "memory_read_bandwidth_gb": 64,
@@ -207,7 +209,7 @@ The config file is a JSON with three main sections:
   "predictor": {
     "name": "aiconfigurator",
     "database_path": "path/to/aiconfigurator/data",
-    "device_name": "h20_sxm",
+    "device_name": "h100_sxm",
     "prefill_scale_factor": 1.02040816,
     "decode_scale_factor": 1.01010101
   },
@@ -239,7 +241,7 @@ The config file is a JSON with three main sections:
 {
   "name": "aiconfigurator",
   "database_path": "path/to/aiconfigurator/data",
-  "device_name": "h20_sxm",
+  "device_name": "h100_sxm",
   "prefill_scale_factor": 1.02040816,
   "decode_scale_factor": 1.01010101
 }
@@ -255,12 +257,16 @@ Here is the English translation of your Markdown content, polished for clarity a
 
 **Configuration**
 
-In the `hisim/test/assets/mock` directory, we provide simulation configuration files for running Qwen3-8B and Qwen3-32B-FP8 on H20:  
+In the `hisim/test/assets/mock` directory, we provide simulation configuration files for running Qwen3-8B and Qwen3-32B-FP8 on H100:  
 - `config.qwen8b.aic.json`  
 - `config.qwen32b.aic.json`
 
+For an Intel B60 PCIe demo based on AIConfigurator's `b60` system data, see `config.demo.b60_pcie.json`.
+
+For an RTX PRO 6000 Blackwell Server Edition dual-GPU PCIe demo based on AIConfigurator's `rtx_pro_6000_server` system data, see `config.demo.rtx_pro_6000_server_pcie.json`.
+
 The base hardware specifications and operator interpolation data package for **aiconfigurator** can be obtained from the `Hisim` directory in the [LatencyPrism/hisim](https://github.com/kunluninsight/LatencyPrism/tree/hisim) repository.  
-To use these configurations, download `H20_AIC.zip`, extract it to your `download_path`, and you're ready to run simulations.
+To use these configurations, extract the matching AIConfigurator data package for your target device (for example H100 or B60) into your `download_path`.
 
 **Accuracy**
 

@@ -71,9 +71,15 @@ class C_TokenizerManagerHook(BaseHook):
                     tokenized_obj.sampling_params.custom_params is not None
                     and "simulation" in tokenized_obj.sampling_params.custom_params
                 ):
-                    tokenized_obj.sampling_params.custom_params["simulation"][
-                        "server_created_time"
-                    ] = created_time
+                    simulation = tokenized_obj.sampling_params.custom_params[
+                        "simulation"
+                    ]
+                    if not isinstance(simulation, dict):
+                        simulation = {"enabled": bool(simulation)}
+                        tokenized_obj.sampling_params.custom_params[
+                            "simulation"
+                        ] = simulation
+                    simulation["server_created_time"] = created_time
             return original_send_one_request(self, obj, tokenized_obj, created_time)
 
         target._send_one_request = wrapped_send_one_request
@@ -669,15 +675,26 @@ class C_SchedulerHook(BaseHook):
                                 "Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request."
                             )
                             continue
-                        if sim_params.get("queue_start"):
+                        queue_start = sim_params.get("queue_start")
+                        created_time = sim_params.get("created_time")
+                        server_created_time = sim_params.get(
+                            "server_created_time"
+                        )
+                        if queue_start is not None:
                             logger.debug(
                                 "Add request to waiting queue with custom queue start timestamp."
                             )
+                        enqueue_time = time.time()
+                        if queue_start is not None:
+                            enqueue_time = queue_start
+                        elif created_time is not None:
+                            enqueue_time = created_time
+                        elif server_created_time is not None:
+                            enqueue_time = server_created_time
 
                         C_SchedulerHook.FUTURE_QUEUE.append(
                             (
-                                sim_params.get("queue_start")
-                                or sim_params["created_time"],
+                                enqueue_time,
                                 time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
                                 req,
                             )
@@ -685,11 +702,18 @@ class C_SchedulerHook(BaseHook):
 
                     if len(C_SchedulerHook.FUTURE_QUEUE) != 0:
                         _, _, gen_req = C_SchedulerHook.FUTURE_QUEUE[-1]
-                        total_request = gen_req.sampling_params.custom_params[
-                            "simulation"
-                        ]["total_request"]
+                        simulation_args = gen_req.sampling_params.custom_params.get(
+                            "simulation", {}
+                        )
+                        total_request = (
+                            simulation_args.get("total_request")
+                            if isinstance(simulation_args, dict)
+                            else None
+                        )
 
-                        if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
+                        if total_request is not None and len(
+                            C_SchedulerHook.FUTURE_QUEUE
+                        ) == total_request:
                             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
                             heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
                             logger.info(

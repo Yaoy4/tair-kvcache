@@ -19,5 +19,6 @@ logs/
 outputs/
 dist/
 dump*/
+awesome-copilot-agents/
 
 test/hisim

@@ -1,4 +1,5 @@
 from pathlib import Path
+from copy import deepcopy
 from hisim.spec.accelerator import AcceleratorInfo
 from hisim.spec.model import ModelInfo
 
@@ -13,10 +14,15 @@ from hisim.simulation.types import SchedulerConfig
 cur_dir = Path(__file__).parent
 
 
+def _get_h100_aic_hw():
+    hw = deepcopy(AcceleratorInfo.find_by_hw_name("H100"))
+    hw.name = "h100_sxm"
+    return hw
+
+
 def test_aic_xgb_predictor():
     model = ModelInfo.from_modelscope_id("Qwen/Qwen3-8B")
-    hw = AcceleratorInfo.find_by_hw_name("H20")
-    hw.name = "h100_sxm"  # AIConfigurator internal device name
+    hw = _get_h100_aic_hw()
     config = SchedulerConfig(
         model=model, backend_name="sglang", backend_version="0.5.6.post2"
     )

@@ -34,6 +34,12 @@ class ConfigManager:
                 logger.error(
                     f"Failed to initialize model information with configuration: {hf_config}"
                 )
+            else:
+                model_path = hf_config.get("model_path") or hf_config.get("_name_or_path")
+                if model_path:
+                    model.model_path = model_path
+                    if not model.name or model.name.startswith("_"):
+                        model.name = model_path
         else:
             with open(Envs.config_path()) as f:
                 config: dict = json.load(f)
@@ -64,6 +70,14 @@ class ConfigManager:
             with open(Envs.config_path()) as f:
                 config: dict = json.load(f)
             platform_config = config.get("platform", {})
+            interconnect_bandwidth_gb = platform_config.get("interconnect_bandwidth_gb")
+            if interconnect_bandwidth_gb is None:
+                legacy_interconnect_bandwidth_gbps = platform_config.get(
+                    "interconnect_bandwidth_gbps"
+                )
+                if legacy_interconnect_bandwidth_gbps is not None:
+                    # Backward compatibility: the legacy field was expressed in Gbps.
+                    interconnect_bandwidth_gb = legacy_interconnect_bandwidth_gbps / 8
             cls._platform_config = PlatformConfig(
                 device=hw,
                 disk_read_bandwidth_gb=platform_config.get("disk_read_bandwidth_gb"),
@@ -77,10 +91,7 @@ class ConfigManager:
                 num_nodes=platform_config.get("num_nodes", 1),
                 num_device_per_node=platform_config.get("num_device_per_node", 8),
                 interconnect_mode=platform_config.get("interconnect_mode", "none"),
-                interconnect_bandwidth_gb=platform_config.get(
-                    "interconnect_bandwidth_gb",
-                    platform_config.get("interconnect_bandwidth_gbps"),
-                ),
+                interconnect_bandwidth_gb=interconnect_bandwidth_gb,
                 interconnect_latency_us=platform_config.get(
                     "interconnect_latency_us"
                 ),

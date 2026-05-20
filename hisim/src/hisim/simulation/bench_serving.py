@@ -131,6 +131,19 @@ def get_auth_headers() -> Dict[str, str]:
         return {}
 
 
+def get_sglang_server_info(base_url: str) -> Optional[dict]:
+    for endpoint in ("/server_info", "/get_server_info"):
+        try:
+            resp = requests.get(
+                base_url + endpoint, headers=get_auth_headers(), timeout=5
+            )
+        except requests.RequestException:
+            continue
+        if resp.status_code == 200:
+            return resp.json()
+    return None
+
+
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
@@ -2010,6 +2023,16 @@ def load_simulation_metrics() -> BenchmarkMetrics | None:
     return BenchmarkMetrics(**kwargs)
 
 
+def clear_simulation_output_artifacts() -> None:
+    out_dir = os.getenv("HISIM_OUTPUT_DIR", "/tmp/hisim/output/")
+    for artifact in ("metrics.json", "iteration.jsonl", "request.jsonl"):
+        artifact_path = os.path.join(out_dir, artifact)
+        try:
+            os.remove(artifact_path)
+        except FileNotFoundError:
+            continue
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -2149,11 +2172,16 @@ async def benchmark(
                 print("Profiler started")
 
     if args.bench_mode == "simulation":
+        clear_simulation_output_artifacts()
         profile_output = await async_request_profile(
             api_url=base_url + "/start_profile"
         )
         if profile_output.success:
             print("Simulation triggered")
+        else:
+            raise RuntimeError(
+                f"Failed to trigger simulation start: {profile_output.error}"
+            )
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
@@ -2240,20 +2268,21 @@ async def benchmark(
 
     if args.bench_mode == "simulation":
         profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
+            api_url=base_url + "/stop_profile"
         )
         if profile_output.success:
             print("Simulation stop triggered")
+        else:
+            raise RuntimeError(
+                f"Failed to trigger simulation stop: {profile_output.error}"
+            )
 
     if pbar is not None:
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
+        server_info_json = get_sglang_server_info(base_url)
+        if server_info_json is not None:
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
             if (
@@ -2284,6 +2313,10 @@ async def benchmark(
     if args.bench_mode == "simulation":
         # Get the real metrics from the server, because the server metrics are not reliable during simulation.
         metrics = load_simulation_metrics()
+        if metrics is None:
+            raise RuntimeError(
+                "Simulation metrics were not generated. Check the server logs and HISIM_OUTPUT_DIR."
+            )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Benchmark Mode:", metrics.bench_mode))
@@ -2374,8 +2407,7 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    server_info = get_sglang_server_info(base_url)
 
     if (
         metrics.median_ttft_ms is not None

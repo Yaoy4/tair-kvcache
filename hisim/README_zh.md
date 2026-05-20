@@ -53,14 +53,15 @@ pip install .
 
 请在项目根目录（即包含本 `README.md` 的目录）中运行以下命令
 ``` bash
-python3 -m hisim.simulation.sglang.launch_server \
-  --model-path "Qwen/Qwen3-32B-FP8" \
-  --sim-config-path test/assets/mock/config.json
+PYTHONPATH=src python3 -m hisim.simulation.sglang.launch_server \
+  --model-path "/mnt/nfs02/users/tjiang/Gitrepo/models/Qwen3-8B/" \
+  --sim-config-path test/assets/mock/config.demo.rtx_pro_6000_server_pcie.json
 ```
 
 > **Notes**:
 > - 详细参数参考[详细参数与环境变量设置说明](#mock-simulation推理仿真)。
 > - 命令行参数中，`sim` 开头的参数为仿真参数，其他参数为服务框架（SGLang）的参数，通过指定 `--sim-config-path` 设置仿真配置。
+> - 如果直接在本地仓库源码上运行，请先设置 `PYTHONPATH=src`（或者重新执行 `pip install -e .`），否则 Python 可能会优先加载虚拟环境 `site-packages` 里的旧版本。
 > - 如果在纯CPU仿真环境中，可能需要安装vllm(sglang cpu版本依赖)，同时需要指定环境变量
 >   ``` bash
 >   export SGLANG_USE_CPU_ENGINE=1
@@ -74,26 +75,28 @@ python3 -m hisim.simulation.sglang.launch_server \
 
 - **基于用户数据集重放**
 ``` bash
-python3 -m hisim.simulation.bench_serving \
-    --warmup-request 0 \
-    --bench-mode simulation \
-    --model "Qwen/Qwen3-32B-FP8" \
-    --backend sglang \
-    --dataset-name hisim-collection \
-    --dataset-path user_replay_requests.jsonl
+PYTHONPATH=src python3 -m hisim.simulation.bench_serving \
+  --warmup-requests 0 \
+  --bench-mode simulation \
+  --model "Qwen/Qwen3-32B-FP8" \
+  --backend sglang \
+  --dataset-name hisim-collection \
+  --dataset-path user_replay_requests.jsonl
 ```
 - **基于随机构造的特征数据集压测**:
 ``` bash
-python3 -m hisim.simulation.bench_serving \
-    --warmup-requests 0 \
-    --model "Qwen/Qwen3-32B-FP8" \
-    --bench-mode simulation \
-    --dataset-name random \
-    --request-rate 4 \
-    --random-input-len 1024 \
-    --random-output-len 1024 \
-    --random-range-ratio 1 \
-    --num-prompts 50
+PYTHONPATH=src python3 -m hisim.simulation.bench_serving \
+  --host 127.0.0.1 \
+  --warmup-requests 0 \
+  --bench-mode simulation \
+  --model "/mnt/nfs02/users/tjiang/Gitrepo/models/Qwen3-8B/" \
+  --backend sglang \
+  --dataset-name random \
+  --request-rate 4 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --random-range-ratio 1 \
+  --num-prompts 5
 ```
 
 至此,已经完成了基于框架劫持的推理仿真。
@@ -161,11 +164,11 @@ Max ITL (ms):                            21.47
 配置文件为 JSON，包含三个部分：
 
 - `platform`：硬件与带宽配置  
-  - `accelerator.name`：GPU 型号（如 `H20`）
+  - `accelerator.name`：GPU 型号（如 `H100`、`Intel B60`、`RTX 6000 PRO`）
   - `disk_*_bandwidth_gb`：L3 层数据读写带宽（GB/s）
   - `memory_*_bandwidth_gb`：L2 层数据读写带宽（GB/s）
   - `num_nodes` / `num_device_per_node`：多设备仿真的拓扑结构
-  - `interconnect_mode`：设备间链路类型（如 `none`、`nvlink`、`ethernet`）
+  - `interconnect_mode`：设备间链路类型（如 `none`、`pcie`、`nvlink`、`ethernet`）
   - `interconnect_bandwidth_gb`：设备间带宽（GB/s）
   - `interconnect_latency_us`：每次 collective 的链路时延（us）
 
@@ -181,7 +184,7 @@ Max ITL (ms):                            21.47
 ```json
 {
   "platform": {
-    "accelerator": { "name": "H20" },
+    "accelerator": { "name": "H100" },
     "disk_read_bandwidth_gb": 4,
     "disk_write_bandwidth_gb": 4,
     "memory_read_bandwidth_gb": 64,
@@ -195,7 +198,7 @@ Max ITL (ms):                            21.47
   "predictor": {
     "name": "aiconfigurator",
     "database_path": "path/to/aiconfigurator/data",
-    "device_name": "h20_sxm",
+    "device_name": "h100_sxm",
     "prefill_scale_factor": 1.02040816,
     "decode_scale_factor": 1.01010101
   },
@@ -228,7 +231,7 @@ Max ITL (ms):                            21.47
 {
   "name": "aiconfigurator",
   "database_path": "path/to/aiconfigurator/data",
-  "device_name": "h20_sxm",
+  "device_name": "h100_sxm",
   "prefill_scale_factor": 1.02040816,
   "decode_scale_factor": 1.01010101
 }
@@ -242,11 +245,15 @@ Max ITL (ms):                            21.47
 
 **Configuration**
 
-在`hisim/test/assets/mock`目录中，我们提供了在H20上运行Qwen3-8B和Qwen3-32B-FP8的仿真配置文件: 
+在`hisim/test/assets/mock`目录中，我们提供了在H100上运行Qwen3-8B和Qwen3-32B-FP8的仿真配置文件: 
 - `config.qwen8b.aic.json`  
 - `config.qwen32b.aic.json`
 
-其中**aiconfigurator** 的硬件配置信息和算子插值数据包可以从[LatencyPrism/hisim](https://github.com/kunluninsight/LatencyPrism/tree/hisim) 的`Hisim`目录获取，将 `H20_AIC.zip`解压至 `download_path`，即可使用上述配置文件进行仿真
+如果需要基于 AIConfigurator `b60` 系统数据的 Intel B60 PCIe demo，可直接使用 `config.demo.b60_pcie.json`。
+
+如果需要基于 AIConfigurator `rtx_pro_6000_server` 系统数据的 RTX PRO 6000 Blackwell Server Edition 双卡 PCIe demo，可直接使用 `config.demo.rtx_pro_6000_server_pcie.json`。
+
+其中**aiconfigurator** 的硬件配置信息和算子插值数据包可以从[LatencyPrism/hisim](https://github.com/kunluninsight/LatencyPrism/tree/hisim) 的`Hisim`目录获取，将目标设备对应的 AIConfigurator 数据包（例如 H100 或 B60）解压至 `download_path`，即可使用上述配置文件进行仿真
 
 **Accuracy**
 

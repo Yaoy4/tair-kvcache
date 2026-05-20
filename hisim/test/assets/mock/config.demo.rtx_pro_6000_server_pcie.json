@@ -1,0 +1,31 @@
+{
+    "platform": {
+        "accelerator": {
+            "name": "RTX 6000 PRO"
+        },
+        "disk_read_bandwidth_gb": 4,
+        "disk_write_bandwidth_gb": 4,
+        "memory_read_bandwidth_gb": 64,
+        "memory_write_bandwidth_gb": 64,
+        "num_nodes": 1,
+        "num_device_per_node": 2,
+        "interconnect_mode": "pcie",
+        "interconnect_bandwidth_gb": 64,
+        "interconnect_latency_us": 10
+    },
+    "predictor": {
+        "name": "aiconfigurator",
+        "database_path": "/mnt/nfs02/users/tjiang/Gitrepo/aiconfigurator/src/aiconfigurator/systems",
+        "device_name": "rtx_pro_6000_server",
+        "prefill_scale_factor": 1.0,
+        "decode_scale_factor": 1.0
+    },
+    "scheduler": {
+        "tp_size": 2,
+        "ep_size": 1,
+        "data_type": "FP8",
+        "kv_cache_data_type": "FP8",
+        "backend_name": "sglang",
+        "backend_version": "0.5.10"
+    }
+}

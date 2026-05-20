@@ -1,6 +1,8 @@
 from hisim.spec.data_type import DataType
 from hisim.spec.accelerator import AcceleratorInfo
 from hisim.spec.model import ModelInfo
+import inspect
+import math
 import numpy as np
 import os
 import re
@@ -16,11 +18,21 @@ from aiconfigurator.sdk.common import (
     KVCacheQuantMode,
     MoEQuantMode,
     DatabaseMode,
-    SupportedModels,
 )
+try:
+    from aiconfigurator.sdk.common import SupportedModels
+except ImportError:
+    SupportedModels = None
 from aiconfigurator.sdk.config import RuntimeConfig, ModelConfig
 from aiconfigurator.sdk.inference_session import InferenceSession
-from aiconfigurator.sdk.perf_database import get_database, get_system_config_path
+try:
+    from aiconfigurator.sdk.perf_database import get_database, get_system_config_path
+except ImportError:
+    from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
+
+    def get_system_config_path():
+        systems_paths = get_systems_paths()
+        return systems_paths[0] if systems_paths else None
 
 from hisim.simulation.types import (
     SchedulerConfig,
@@ -34,38 +46,67 @@ from hisim.time_predictor import (
 from hisim.utils import get_logger
 
 
+logger = get_logger("hisim")
+
+
+def _first_available_enum_member(enum_cls, *member_names):
+    for member_name in member_names:
+        member = getattr(enum_cls, member_name, None)
+        if member is not None:
+            return member
+    raise AttributeError(
+        f"{enum_cls.__name__} does not provide any of: {', '.join(member_names)}"
+    )
+
+
+_GET_DATABASE_SUPPORTS_SYSTEMS_PATHS = (
+    "systems_paths" in inspect.signature(get_database).parameters
+)
+_GEMM_FLOAT16_MODE = _first_available_enum_member(
+    GEMMQuantMode, "float16", "bfloat16"
+)
+_GEMM_FP8_MODE = _first_available_enum_member(GEMMQuantMode, "fp8", "fp8_block")
+_KV_FLOAT16_MODE = _first_available_enum_member(
+    KVCacheQuantMode, "float16", "bfloat16"
+)
+_FMHA_FLOAT16_MODE = _first_available_enum_member(
+    FMHAQuantMode, "float16", "bfloat16"
+)
+_MOE_FLOAT16_MODE = _first_available_enum_member(MoEQuantMode, "float16", "bfloat16")
+
+
 # Map the common data types to AIConfigurator data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
-    DataType.FP16: GEMMQuantMode.float16,
-    DataType.BF16: GEMMQuantMode.float16,
-    DataType.FP8: GEMMQuantMode.fp8_block,
+    DataType.FP16: _GEMM_FLOAT16_MODE,
+    DataType.BF16: _GEMM_FLOAT16_MODE,
+    DataType.FP8: _GEMM_FP8_MODE,
     DataType.INT8: GEMMQuantMode.int8_wo,
     DataType.FP4: GEMMQuantMode.nvfp4,
     DataType.INT4: GEMMQuantMode.int4_wo,
-    DataType.FP16_TENSOR: GEMMQuantMode.float16,
-    DataType.BF16_TENSOR: GEMMQuantMode.float16,
-    DataType.FP8_TENSOR: GEMMQuantMode.fp8,
+    DataType.FP16_TENSOR: _GEMM_FLOAT16_MODE,
+    DataType.BF16_TENSOR: _GEMM_FLOAT16_MODE,
+    DataType.FP8_TENSOR: _GEMM_FP8_MODE,
     DataType.INT8_TENSOR: GEMMQuantMode.int8_wo,
     DataType.FP4_TENSOR: GEMMQuantMode.nvfp4,
     DataType.INT4_TENSOR: GEMMQuantMode.int4_wo,
 }
 
 MAP_DTYPE_TO_KVCacheQuantMode = {
-    DataType.FP16: KVCacheQuantMode.float16,
-    DataType.BF16: KVCacheQuantMode.float16,
+    DataType.FP16: _KV_FLOAT16_MODE,
+    DataType.BF16: _KV_FLOAT16_MODE,
     DataType.FP8: KVCacheQuantMode.fp8,
     DataType.INT8: KVCacheQuantMode.int8,
 }
 
 MAP_DTYPE_TO_FMHAQuantMode = {
-    DataType.FP16: FMHAQuantMode.float16,
-    DataType.BF16: FMHAQuantMode.float16,
+    DataType.FP16: _FMHA_FLOAT16_MODE,
+    DataType.BF16: _FMHA_FLOAT16_MODE,
     DataType.FP8: FMHAQuantMode.fp8,
 }
 
 MAP_DTYPE_TO_MoEQuantMode = {
-    DataType.FP16: MoEQuantMode.float16,
-    DataType.BF16: MoEQuantMode.float16,
+    DataType.FP16: _MOE_FLOAT16_MODE,
+    DataType.BF16: _MOE_FLOAT16_MODE,
     DataType.FP8: MoEQuantMode.fp8,
     DataType.INT8: MoEQuantMode.fp8,
     DataType.FP4: MoEQuantMode.nvfp4,
@@ -80,7 +121,47 @@ MAP_DTYPE_TO_CommQunatMode = {
 }
 
 
-logger = get_logger("hisim")
+def _load_perf_database(
+    system: str,
+    backend: str,
+    version: str,
+    systems_path: str,
+    database_mode: DatabaseMode,
+):
+    if _GET_DATABASE_SUPPORTS_SYSTEMS_PATHS:
+        return get_database(
+            system=system,
+            backend=backend,
+            version=version,
+            systems_paths=systems_path,
+            database_mode=database_mode.name,
+        )
+    return get_database(
+        system=system,
+        backend=backend,
+        version=version,
+        systems_dir=systems_path,
+    )
+
+INTERCONNECT_MODE_DEFAULT_LATENCY_US = {
+    "none": 0.0,
+    "nvlink": 1.0,
+    "pcie": 3.0,
+    "ib": 5.0,
+    "infiniband": 5.0,
+    "roce": 7.0,
+    "ethernet": 10.0,
+}
+
+INTERCONNECT_MODE_BANDWIDTH_EFFICIENCY = {
+    "none": 1.0,
+    "nvlink": 1.0,
+    "pcie": 0.9,
+    "ib": 0.9,
+    "infiniband": 0.9,
+    "roce": 0.85,
+    "ethernet": 0.8,
+}
 
 
 # XGBoost
@@ -273,16 +354,16 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
         moe_ep_size=sched_config.ep_size,
         attention_dp_size=sched_config.dp_size,  # FIXME
         gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
-            sched_config.data_type, GEMMQuantMode.float16
+            sched_config.data_type, _GEMM_FLOAT16_MODE
         ),
         moe_quant_mode=MAP_DTYPE_TO_MoEQuantMode.get(
-            sched_config.data_type, MoEQuantMode.float16
+            sched_config.data_type, _MOE_FLOAT16_MODE
         ),
         kvcache_quant_mode=MAP_DTYPE_TO_KVCacheQuantMode.get(
-            sched_config.kv_cache_data_type, KVCacheQuantMode.float16
+            sched_config.kv_cache_data_type, _KV_FLOAT16_MODE
         ),
         fmha_quant_mode=MAP_DTYPE_TO_FMHAQuantMode.get(
-            sched_config.kv_cache_data_type, FMHAQuantMode.float16
+            sched_config.kv_cache_data_type, _FMHA_FLOAT16_MODE
         ),
         comm_quant_mode=MAP_DTYPE_TO_CommQunatMode.get(
             sched_config.data_type, CommQuantMode.half
@@ -290,7 +371,23 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
         workload_distribution="power_law_1.2",
     )
 
-    if model.model_type in ["qwen", "qwen2", "qwen3", "llama", "chatglm"]:
+    if SupportedModels is None:
+        model_source = model.model_path or model.name
+        if not model_source:
+            raise ValueError("Model path is required for the installed AIConfigurator version.")
+        return models.get_model(
+            model_source,
+            model_config,
+            sched_config.backend_name,
+        )
+
+    if model.model_type in [
+        "qwen",
+        "qwen2",
+        "qwen3",
+        "llama",
+        "chatglm",
+    ]:
         # aiconfigurator.sdk.backends.trtllm_backend._get_memory_usage() requires the SupportedModels.
         SupportedModels.update(
             {
@@ -382,13 +479,15 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
 
-        database = get_database(
+        systems_path = (
+            database_path if database_path is not None else get_system_config_path()
+        )
+        database = _load_perf_database(
             system=hw.name,
             backend=config.backend_name,
             version=config.backend_version,
-            systems_dir=database_path
-            if database_path is not None
-            else get_system_config_path(),
+            systems_path=systems_path,
+            database_mode=database_mode,
         )
 
         if database is None:
@@ -425,11 +524,6 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         if self.platform_config is None or self.config.tp_size <= 1:
             return 0.0
 
-        bandwidth = self.platform_config.interconnect_bandwidth
-        latency_us = self.platform_config.interconnect_latency_us or 0.0
-        if bandwidth is None or bandwidth <= 0:
-            return 0.0
-
         hidden_size = getattr(self.model, "hidden_size", 0) or 0
         num_layers = getattr(self.model, "num_hidden_layers", 0) or 0
         if hidden_size <= 0 or num_layers <= 0:
@@ -443,11 +537,112 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         collective_count = 2 * num_layers
         dtype_bytes = self.config.data_type.bytes if self.config.data_type else 2
         payload_bytes = tokens * hidden_size * dtype_bytes
-        ring_factor = 2 * (self.config.tp_size - 1) / self.config.tp_size
+        tp_size = self.config.tp_size
 
-        transfer_ms = collective_count * payload_bytes * ring_factor / bandwidth * 1e3
-        launch_ms = collective_count * 2 * (self.config.tp_size - 1) * latency_us / 1e3
+        num_nodes = max(int(self.platform_config.num_nodes or 1), 1)
+        num_device_per_node = max(int(self.platform_config.num_device_per_node or 1), 1)
+        total_devices = num_nodes * num_device_per_node
+
+        if total_devices < tp_size:
+            bandwidth, latency_us = self._get_link_profile(cross_node=num_nodes > 1)
+            return collective_count * self._estimate_collective_time_ms(
+                tp_size, payload_bytes, bandwidth, latency_us
+            )
+
+        nodes_used = max(1, math.ceil(tp_size / num_device_per_node))
+        local_group_size = min(tp_size, num_device_per_node)
+        local_bandwidth, local_latency_us = self._get_link_profile(cross_node=False)
+
+        total_ms = self._estimate_collective_time_ms(
+            local_group_size, payload_bytes, local_bandwidth, local_latency_us
+        )
+
+        if nodes_used > 1:
+            inter_bandwidth, inter_latency_us = self._get_link_profile(cross_node=True)
+            total_ms += self._estimate_collective_time_ms(
+                nodes_used, payload_bytes, inter_bandwidth, inter_latency_us
+            )
+            total_ms += self._estimate_collective_time_ms(
+                local_group_size, payload_bytes, local_bandwidth, local_latency_us
+            )
+
+        return collective_count * total_ms
+
+    def _estimate_collective_time_ms(
+        self,
+        participants: int,
+        payload_bytes: float,
+        bandwidth: Optional[float],
+        latency_us: float,
+    ) -> float:
+        if participants <= 1 or bandwidth is None or bandwidth <= 0:
+            return 0.0
+
+        ring_factor = 2 * (participants - 1) / participants
+        transfer_ms = payload_bytes * ring_factor / bandwidth * 1e3
+        launch_ms = 2 * (participants - 1) * latency_us / 1e3
         return transfer_ms + launch_ms
+
+    def _get_link_profile(self, *, cross_node: bool) -> tuple[Optional[float], float]:
+        mode = self._get_interconnect_mode()
+        configured_bandwidth = self.platform_config.interconnect_bandwidth
+        configured_latency_us = self.platform_config.interconnect_latency_us
+        device = self.platform_config.device
+        hw = device if isinstance(device, AcceleratorInfo) else None
+
+        if cross_node:
+            bandwidth = configured_bandwidth
+            if bandwidth is None and hw is not None:
+                bandwidth = hw.inter_node_bw
+            bandwidth = self._apply_interconnect_mode_efficiency(
+                bandwidth, cross_node=True
+            )
+            latency_us = (
+                configured_latency_us
+                if configured_latency_us is not None
+                else INTERCONNECT_MODE_DEFAULT_LATENCY_US.get(mode, 5.0)
+            )
+            return bandwidth, latency_us
+
+        if self.platform_config.num_nodes <= 1:
+            bandwidth = configured_bandwidth
+            if bandwidth is None and hw is not None:
+                bandwidth = hw.intra_node_bw or hw.inter_node_bw
+            bandwidth = self._apply_interconnect_mode_efficiency(
+                bandwidth, cross_node=False
+            )
+            latency_us = (
+                configured_latency_us
+                if configured_latency_us is not None
+                else INTERCONNECT_MODE_DEFAULT_LATENCY_US.get(mode, 1.0)
+            )
+            return bandwidth, latency_us
+
+        bandwidth = hw.intra_node_bw if hw is not None else None
+        if bandwidth is None:
+            bandwidth = configured_bandwidth
+        latency_us = 1.0 if bandwidth is not None else (
+            configured_latency_us
+            if configured_latency_us is not None
+            else INTERCONNECT_MODE_DEFAULT_LATENCY_US.get(mode, 1.0)
+        )
+        return bandwidth, latency_us
+
+    def _apply_interconnect_mode_efficiency(
+        self, bandwidth: Optional[float], *, cross_node: bool
+    ) -> Optional[float]:
+        if bandwidth is None:
+            return None
+        if not cross_node and self.platform_config.num_nodes > 1:
+            return bandwidth
+
+        mode = self._get_interconnect_mode()
+        efficiency = INTERCONNECT_MODE_BANDWIDTH_EFFICIENCY.get(mode, 1.0)
+        return bandwidth * efficiency
+
+    def _get_interconnect_mode(self) -> str:
+        mode = self.platform_config.interconnect_mode or "none"
+        return mode.lower()
 
     def _get_database_mode(self, mode: str) -> DatabaseMode:
         return {
