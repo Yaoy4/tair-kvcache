@@ -30,6 +30,38 @@ export PYTHONPATH="${SCRIPT_DIR}/src:${AICONFIG_ROOT}/src"
 export SGLANG_USE_CPU_ENGINE=1
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
+echo "[demo] preflight check: validating Python package resolution..."
+if ! AICONFIG_ROOT="${AICONFIG_ROOT}" "${PYTHON_BIN}" - <<'PY'
+import os
+import sys
+
+expected_aic_src = os.path.abspath(os.path.join(os.environ["AICONFIG_ROOT"], "src"))
+
+import hisim  # noqa: F401
+import aiconfigurator
+import aiconfigurator.sdk.common as common
+
+aic_file = os.path.abspath(aiconfigurator.__file__)
+if expected_aic_src not in aic_file:
+    raise RuntimeError(
+        "aiconfigurator is not imported from local source. "
+        f"expected path containing '{expected_aic_src}', got '{aic_file}'."
+    )
+
+if not (hasattr(common, "SupportedSystems") or hasattr(common, "SupportedModels")):
+    raise RuntimeError(
+        "aiconfigurator.sdk.common missing both SupportedSystems and SupportedModels."
+    )
+
+print("[demo] preflight OK: hisim/aiconfigurator imports look compatible")
+PY
+then
+  echo "[demo] preflight failed." >&2
+  echo "[demo] hint: reinstall local aiconfigurator into this venv:" >&2
+  echo "[demo]   cd ${AICONFIG_ROOT} && ${PYTHON_BIN} -m pip install -e ." >&2
+  exit 1
+fi
+
 SERVER_LOG="${SCRIPT_DIR}/.hisim_server.log"
 rm -f "${SERVER_LOG}"
 
