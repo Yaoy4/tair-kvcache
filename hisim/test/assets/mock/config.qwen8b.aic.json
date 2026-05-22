@@ -11,11 +11,11 @@
     },
     "predictor": {
         "name": "aiconfigurator",
-        "database_path": "download_path/Hisim/Data/aic",
-        "device_name": "h20_sxm",
+        "database_path": "/home/cjia/projects/aiconfigurator/src/aiconfigurator/systems",
+        "device_name": "h100_sxm",
         "prefill_scale_factor": 1.045,
         "decode_scale_factor": 1.0,
-        "xgb_model_path": "download_path/Hisim/Data/aic/xgb_models/qwen3_8B"
+        "xgb_model_path": null
     },
     "scheduler": {
         "tp_size": 1,
