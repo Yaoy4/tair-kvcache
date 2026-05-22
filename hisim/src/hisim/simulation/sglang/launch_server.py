@@ -4,15 +4,19 @@ import sys
 import argparse
 import torch
 import hisim.hook as hisim_hook
-from hisim.simulation.sglang import sgl_kernel_hook, sglang_hook
+from hisim.simulation.sglang import sgl_kernel_hook
 from hisim.simulation.sim_args import SimulationArgs
 from hisim.utils import get_logger
 
 
 # hook the sglang implementation
+# NOTE: Module hooks must be installed BEFORE importing sglang_hook,
+# because sglang_hook transitively imports sgl_kernel via sglang_mock_class.
 if not torch.cuda.is_available():
     # CPU Platform
     hisim_hook.install_module_hooks([sgl_kernel_hook.M_SGLangKernelLoadUtilHook])
+
+from hisim.simulation.sglang import sglang_hook
 hisim_hook.install_class_hooks(
     [
         sglang_hook.C_SchedulerHook,
