@@ -3,6 +3,7 @@ from hisim.spec.accelerator import AcceleratorInfo
 from hisim.spec.model import ModelInfo
 import inspect
 import math
+from functools import wraps
 import numpy as np
 import os
 import re
@@ -25,6 +26,7 @@ except ImportError:
     SupportedModels = None
 from aiconfigurator.sdk.config import RuntimeConfig, ModelConfig
 from aiconfigurator.sdk.inference_session import InferenceSession
+import aiconfigurator.sdk.perf_database as aic_perf_database
 try:
     from aiconfigurator.sdk.perf_database import get_database, get_system_config_path
 except ImportError:
@@ -52,11 +54,61 @@ logger = get_logger("hisim")
 def _first_available_enum_member(enum_cls, *member_names):
     for member_name in member_names:
         member = getattr(enum_cls, member_name, None)
+        if member is None:
+            member = enum_cls.__members__.get(member_name)
         if member is not None:
             return member
     raise AttributeError(
         f"{enum_cls.__name__} does not provide any of: {', '.join(member_names)}"
     )
+
+
+def _install_enum_alias(enum_cls, alias_name: str, canonical_name: str) -> bool:
+    members = enum_cls.__members__
+    if alias_name in members:
+        return False
+
+    canonical_member = members.get(canonical_name)
+    if canonical_member is None:
+        return False
+
+    enum_cls._member_map_[alias_name] = canonical_member
+    return True
+
+
+def _install_aic_legacy_dtype_aliases() -> None:
+    # Older AIConfigurator SDK builds expose float16 but not bfloat16, while newer perf
+    # database files may use "bfloat16" as the dtype token. Alias them before database load.
+    for enum_cls in (
+        GEMMQuantMode,
+        KVCacheQuantMode,
+        FMHAQuantMode,
+        MoEQuantMode,
+    ):
+        _install_enum_alias(enum_cls, "bfloat16", "float16")
+
+
+def _backfill_aic_system_spec(system_spec: dict) -> None:
+    gpu_spec = system_spec.get("gpu")
+    if not isinstance(gpu_spec, dict):
+        return
+
+    if "float16_tc_flops" not in gpu_spec and "bfloat16_tc_flops" in gpu_spec:
+        gpu_spec["float16_tc_flops"] = gpu_spec["bfloat16_tc_flops"]
+
+
+def _install_aic_system_spec_compatibility() -> None:
+    original_correct_data = aic_perf_database.PerfDatabase._correct_data
+    if getattr(original_correct_data, "_hisim_system_spec_compat", False):
+        return
+
+    @wraps(original_correct_data)
+    def wrapped_correct_data(self, *args, **kwargs):
+        _backfill_aic_system_spec(self.system_spec)
+        return original_correct_data(self, *args, **kwargs)
+
+    wrapped_correct_data._hisim_system_spec_compat = True
+    aic_perf_database.PerfDatabase._correct_data = wrapped_correct_data
 
 
 _GET_DATABASE_SUPPORTS_SYSTEMS_PATHS = (
@@ -128,6 +180,9 @@ def _load_perf_database(
     systems_path: str,
     database_mode: DatabaseMode,
 ):
+    _install_aic_legacy_dtype_aliases()
+    _install_aic_system_spec_compatibility()
+
     if _GET_DATABASE_SUPPORTS_SYSTEMS_PATHS:
         return get_database(
             system=system,
