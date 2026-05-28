@@ -16,3 +16,10 @@ __pycache__/
 !.aoneci
 compile_commands.json
 stub_source
+
+# Local Python environment
+venv/
+
+# HiSim generated artifacts
+hisim/output/
+hisim/*.jsonl
