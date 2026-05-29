@@ -167,6 +167,63 @@ def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# V7: Comparison tray
+# ---------------------------------------------------------------------------
+
+
+def _render_comparison(
+    sweep_df: pd.DataFrame, single_rows: list[dict[str, Any]]
+) -> None:
+    st.caption(
+        "Pick any combination of sweep rows and single runs to overlay on the "
+        "same Pareto / stage-breakdown charts."
+    )
+    labels, candidates = sweep_data.build_comparison_candidates(sweep_df, single_rows)
+    if not labels:
+        st.info("Nothing to compare yet — load a sweep or run a single sim first.")
+        return
+
+    # Persist selection across reruns.
+    if "comparison_pins" not in st.session_state:
+        st.session_state["comparison_pins"] = []
+    valid_defaults = [
+        x for x in st.session_state["comparison_pins"] if x in candidates
+    ]
+    selected = st.multiselect(
+        "Pinned configurations",
+        options=labels,
+        default=valid_defaults,
+        key="comparison_select",
+    )
+    st.session_state["comparison_pins"] = selected
+
+    if not selected:
+        st.info("Select two or more configurations to compare.")
+        return
+
+    chosen_rows = [candidates[lbl] for lbl in selected]
+    compare_df = pd.DataFrame(chosen_rows)
+    if "is_pareto_optimal" not in compare_df.columns:
+        compare_df["is_pareto_optimal"] = False
+
+    col_p, col_s = st.columns(2)
+    with col_p:
+        st.markdown("**Pareto (pinned only)**")
+        st.plotly_chart(
+            sweep_figures.pareto_scatter(compare_df), use_container_width=True
+        )
+    with col_s:
+        st.markdown("**Stage breakdown (pinned only)**")
+        st.plotly_chart(
+            sweep_figures.stage_breakdown_bar(compare_df, top_k=len(compare_df)),
+            use_container_width=True,
+        )
+
+    st.markdown("**Pinned rows**")
+    st.dataframe(compare_df, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
 # Main render
 # ---------------------------------------------------------------------------
 
@@ -242,8 +299,8 @@ def render(default_csv: Path | None) -> None:
         return
 
     # ---- figures ----
-    tab_pareto, tab_stages, tab_heat, tab_table = st.tabs(
-        ["Pareto", "Stage breakdown", "PD heatmap", "Table"]
+    tab_pareto, tab_stages, tab_heat, tab_table, tab_compare = st.tabs(
+        ["Pareto", "Stage breakdown", "PD heatmap", "Table", "Comparison"]
     )
     with tab_pareto:
         st.plotly_chart(sweep_figures.pareto_scatter(filtered), use_container_width=True)
@@ -257,6 +314,8 @@ def render(default_csv: Path | None) -> None:
         st.plotly_chart(sweep_figures.pd_resource_heatmap(filtered), use_container_width=True)
     with tab_table:
         st.dataframe(filtered, use_container_width=True)
+    with tab_compare:
+        _render_comparison(filtered, single_rows)
 
 
 def main() -> None:

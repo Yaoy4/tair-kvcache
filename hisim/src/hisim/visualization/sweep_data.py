@@ -285,4 +285,37 @@ def add_derived_columns(
     return out
 
 
-__all__: Iterable[str] = ("load_sweep", "add_derived_columns")
+def build_comparison_candidates(
+    sweep_df: pd.DataFrame, single_rows: list[dict[str, Any]]
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """Build labels for the dashboard comparison tray.
+
+    Combines rows from the loaded sweep ``DataFrame`` with ad-hoc
+    single-run rows (same schema) into a stable label list plus a
+    label -> row-dict mapping. Pure pandas/stdlib so it is unit-testable
+    without streamlit.
+    """
+    candidates: dict[str, dict[str, Any]] = {}
+    labels: list[str] = []
+
+    def _label(source: str, idx: int, row: dict[str, Any]) -> str:
+        topo = str(row.get("topology", "?"))
+        return f"{source}#{idx} \u00b7 {topo}"
+
+    if sweep_df is not None and not sweep_df.empty:
+        for i, row in enumerate(sweep_df.to_dict(orient="records")):
+            lbl = _label("sweep", i, row)
+            candidates[lbl] = row
+            labels.append(lbl)
+    for i, row in enumerate(single_rows or []):
+        lbl = _label("single", i, row)
+        candidates[lbl] = row
+        labels.append(lbl)
+    return labels, candidates
+
+
+__all__: Iterable[str] = (
+    "load_sweep",
+    "add_derived_columns",
+    "build_comparison_candidates",
+)

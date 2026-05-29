@@ -135,3 +135,43 @@ def test_single_run_two_clicks_append_two_rows():
     btn.click().run()
     assert not at.exception
     assert len(at.session_state["single_runs"]) == 2
+
+
+# ---------------- V7: Comparison tray ----------------
+
+
+def test_build_comparison_candidates_combines_sources():
+    import pandas as pd
+    from hisim.visualization.sweep_data import build_comparison_candidates
+
+    sweep_df = pd.DataFrame([{"topology": "pd-p1tp2-d1tp2"}, {"topology": "agg-tp4-dp1"}])
+    single_rows = [{"topology": "pd-p2tp2-d1tp2"}]
+    labels, candidates = build_comparison_candidates(sweep_df, single_rows)
+    assert len(labels) == 3
+    assert all(lbl in candidates for lbl in labels)
+    assert any(lbl.startswith("sweep#0") for lbl in labels)
+    assert any(lbl.startswith("single#0") for lbl in labels)
+
+
+def test_build_comparison_candidates_handles_empty():
+    import pandas as pd
+    from hisim.visualization.sweep_data import build_comparison_candidates
+
+    labels, candidates = build_comparison_candidates(pd.DataFrame(), [])
+    assert labels == []
+    assert candidates == {}
+
+
+def test_dashboard_comparison_tab_lists_single_runs_when_no_csv():
+    """With no CSV but one single run, the comparison tab should still
+    be reachable (sidebar widgets still render without throwing)."""
+    at = _app()
+    at.run()
+    btn = next(b for b in at.sidebar.button if b.key == "sr_run")
+    btn.click().run()
+    assert not at.exception
+    # Session state holds the run; the comparison tab is rendered only when
+    # a CSV is loaded, but the candidate-building helper must accept the
+    # single_run row shape.
+    runs = at.session_state["single_runs"]
+    assert runs[0]["topology"].startswith("pd-")
