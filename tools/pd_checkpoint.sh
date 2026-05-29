@@ -49,6 +49,7 @@ paths=(
   "hisim/src/hisim/simulation/pd_metrics.py"
   "hisim/src/hisim/simulation/pd_ab_harness.py"
   "hisim/src/hisim/simulation/pd_ab_compare.py"
+  "hisim/src/hisim/simulation/pd_ab_check.py"
   "hisim/src/hisim/simulation/manager/config.py"
   "hisim/src/hisim/simulation/types.py"
   "hisim/tools/pd_demo.py"
@@ -63,6 +64,7 @@ paths=(
   "hisim/tools/aic_to_hisim_bridge.py"
   "hisim/tools/aic_topn_to_hisim_sweep.py"
   "hisim/docs/pd_ab_equivalence_spec.md"
+  "tools/pd_ab_check.sh"
 )
 
 existing=()
