@@ -34,6 +34,8 @@ class DisaggPredictors:
     kv_bytes_per_token: int
     kv_model_config: KVModelConfig
     transfer_model: BandwidthTransferModel
+    prefill_replicas: int = 1
+    decode_replicas: int = 1
 
 
 def _as_dtype(value) -> Optional[DataType]:
@@ -171,4 +173,6 @@ def build_disagg(
         kv_bytes_per_token=kv_bytes,
         kv_model_config=kv_model_cfg,
         transfer_model=transfer,
+        prefill_replicas=disagg_config.prefill.replicas,
+        decode_replicas=disagg_config.decode.replicas,
     )
