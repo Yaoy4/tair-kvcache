@@ -189,6 +189,57 @@ def build_pd_backend(
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle helper (Phase 5c.2)
+# ---------------------------------------------------------------------------
+
+
+def shutdown_pd_backend(backend) -> None:
+    """Idempotent shutdown for any PD backend.
+
+    * BackendA has no workers — no-op.
+    * BackendB joins/terminates all workers; safe to call multiple times.
+
+    Designed to be registered with :mod:`atexit` so leaked worker processes
+    can't survive an unexpected interpreter exit.
+    """
+    if backend is None:
+        return
+    shutdown = getattr(backend, "shutdown", None)
+    if shutdown is None:
+        return
+    try:
+        shutdown()
+    except Exception:
+        # Best-effort: an atexit handler that raises would crash other
+        # registered handlers. Swallow and rely on process death.
+        pass
+
+
+def start_pd_backend(backend: PDBackendProtocol) -> PDBackendProtocol:
+    """Start ``backend`` (if needed) and register an atexit shutdown.
+
+    * BackendA: no-op start, no shutdown to register.
+    * BackendB: calls ``.start()`` and registers ``shutdown_pd_backend(backend)``
+      via :mod:`atexit` so spawned workers can't leak past interpreter exit.
+
+    Returns the same backend for fluent chaining. Safe to call multiple
+    times on the same backend (start() and atexit registration both
+    idempotent).
+    """
+    import atexit
+
+    start = getattr(backend, "start", None)
+    shutdown = getattr(backend, "shutdown", None)
+    if start is not None:
+        start()
+    if shutdown is not None:
+        # atexit will execute handlers in LIFO order; per-backend registration
+        # is fine because shutdown_pd_backend is idempotent.
+        atexit.register(shutdown_pd_backend, backend)
+    return backend
+
+
+# ---------------------------------------------------------------------------
 # Hook glue (Phase 2b.4a)
 # ---------------------------------------------------------------------------
 

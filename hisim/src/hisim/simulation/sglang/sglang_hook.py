@@ -640,26 +640,24 @@ class C_SchedulerHook(BaseHook):
                 )
                 raise e
 
-            # Phase 2b.3 / 5c.1: optionally build the PD disagg backend.
+            # Phase 2b.3 / 5c.1 / 5c.2: optionally build the PD disagg backend.
             # Dispatches on disagg.backend ("single_process" → BackendA,
-            # "two_process" → BackendB). BackendB workers are spawned here.
+            # "two_process" → BackendB). start_pd_backend handles BackendB's
+            # start() + atexit shutdown so workers can't leak.
             try:
                 disagg_cfg = ConfigManager.get_disagg_config()
                 if disagg_cfg.enabled:
-                    from hisim.simulation.pd_runtime import build_pd_backend
+                    from hisim.simulation.pd_runtime import (
+                        build_pd_backend,
+                        start_pd_backend,
+                    )
 
                     backend = build_pd_backend(
                         model=model,
                         base_sched_config=sched_config,
                         disagg_config=disagg_cfg,
                     )
-                    # BackendB needs an explicit start() to spawn workers;
-                    # BackendA has no lifecycle. 5c.2 will own atexit/profile
-                    # cleanup; for now the existing wrapped_profile path
-                    # remains the shutdown hook.
-                    if disagg_cfg.backend == "two_process":
-                        backend.start()
-                    C_SchedulerHook.PD_BACKEND = backend
+                    C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
                     logger.info(
                         "PD disaggregation enabled (backend=%s, prefill_replicas=%d, "
                         "decode_replicas=%d).",
@@ -1114,6 +1112,14 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
+
+            # Phase 5c.2: tear down PD backend workers (BackendB only).
+            # atexit also fires shutdown_pd_backend; idempotent.
+            if C_SchedulerHook.PD_BACKEND is not None:
+                from hisim.simulation.pd_runtime import shutdown_pd_backend
+
+                shutdown_pd_backend(C_SchedulerHook.PD_BACKEND)
+                C_SchedulerHook.PD_BACKEND = None
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),
