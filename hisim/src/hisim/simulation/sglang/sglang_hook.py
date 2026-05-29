@@ -579,6 +579,8 @@ class C_SchedulerHook(BaseHook):
     # PD disaggregation (Phase 2b): populated in wrapped_init when the
     # config's `disagg.enabled` is True. Stays None for the aggregated path.
     PD_BACKEND = None  # Optional[BackendA]
+    # rid -> PDRequestState; populated lazily as sglang surfaces requests.
+    PD_REQUEST_STATES: dict = {}
 
     SIM_MODE = MockSimulationMode(Envs.simulation_mode())
     OFFLINE_RECV_ALL_REQUEST: bool = False
@@ -853,6 +855,55 @@ class C_SchedulerHook(BaseHook):
                         )
                     )
                     predicted_latency = float(predicted_latency)
+
+                    # Phase 2b.4a: when PD is active, override prefill latency
+                    # with the BackendA prefill pool clock. Decode path still
+                    # uses the aggregated predictor (covered in 2b.4b).
+                    if (
+                        C_SchedulerHook.PD_BACKEND is not None
+                        and batch.forward_mode.is_extend()
+                    ):
+                        from hisim.simulation.pd_runtime import (
+                            admit_prefill_batch_latency,
+                        )
+                        from hisim.simulation.pd_types import (
+                            PDRequestState,
+                            RequestPhase,
+                        )
+
+                        now_clock = StateManager.get_global_clock()
+                        states = []
+                        for req in batch.reqs:
+                            s = C_SchedulerHook.PD_REQUEST_STATES.get(req.rid)
+                            if s is None:
+                                s = PDRequestState(
+                                    rid=req.rid,
+                                    arrival_time=now_clock,
+                                    phase=RequestPhase.WAITING_PREFILL,
+                                    input_length=int(req.extend_input_len),
+                                    output_length=int(
+                                        getattr(
+                                            req.sampling_params,
+                                            "max_new_tokens",
+                                            0,
+                                        )
+                                        or 0
+                                    ),
+                                )
+                                C_SchedulerHook.PD_REQUEST_STATES[req.rid] = s
+                            states.append(s)
+
+                        pd_latency = admit_prefill_batch_latency(
+                            C_SchedulerHook.PD_BACKEND, states, now_clock
+                        )
+                        logger.debug(
+                            "[PD] extend batch: %d reqs, agg_pred=%.6fs, "
+                            "pd_pred=%.6fs",
+                            len(states),
+                            predicted_latency,
+                            pd_latency,
+                        )
+                        predicted_latency = pd_latency
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:

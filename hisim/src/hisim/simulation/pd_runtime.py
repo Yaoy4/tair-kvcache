@@ -52,3 +52,24 @@ def build_backend_a(
         hw_factory=hw_factory,
     )
     return BackendA(bundle)
+
+
+# ---------------------------------------------------------------------------
+# Hook glue (Phase 2b.4a)
+# ---------------------------------------------------------------------------
+
+
+def admit_prefill_batch_latency(backend, states, now: float) -> float:
+    """Admit every request in `states` onto the backend's prefill pool.
+
+    Returns the predicted batch latency = (max prefill end time) - now.
+    Returns 0.0 for an empty batch.
+    """
+    if not states:
+        return 0.0
+    max_end = now
+    for s in states:
+        _, end_t = backend.try_admit_prefill(s, now)
+        if end_t > max_end:
+            max_end = end_t
+    return max_end - now
