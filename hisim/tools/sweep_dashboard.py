@@ -22,6 +22,7 @@ import pandas as pd
 import streamlit as st
 
 from hisim.visualization import sweep_data, sweep_figures
+from hisim.visualization.single_run import SingleRunConfig, run_single
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,34 @@ def _load(csv_path: str) -> pd.DataFrame:
     return sweep_data.add_derived_columns(df)
 
 
+@st.cache_data(show_spinner=False)
+def _run_single_cached(
+    prefill_device: str,
+    decode_device: str,
+    prefill_tp: int,
+    decode_tp: int,
+    prefill_replicas: int,
+    decode_replicas: int,
+    bw_gbps: float,
+    latency_us: float,
+    num_requests: int,
+    burst: bool,
+) -> dict[str, Any]:
+    cfg = SingleRunConfig(
+        prefill_device=prefill_device,
+        decode_device=decode_device,
+        prefill_tp=prefill_tp,
+        decode_tp=decode_tp,
+        prefill_replicas=prefill_replicas,
+        decode_replicas=decode_replicas,
+        bw_gbps=bw_gbps,
+        latency_us=latency_us,
+        num_requests=num_requests,
+        burst=burst,
+    )
+    return run_single(cfg)
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -72,6 +101,45 @@ def _sidebar(default_csv: Path | None) -> tuple[Path | None, dict[str, Any]]:
     filters["only_disagg"] = st.sidebar.checkbox("Disagg only", value=False)
     filters["only_agg"] = st.sidebar.checkbox("Aggregated only", value=False)
     return csv_path, filters
+
+
+_DEVICE_OPTIONS = ("h100_sxm", "h200_sxm", "h20", "a100_sxm")
+
+
+def _single_run_section() -> dict[str, Any] | None:
+    """Render the Single Run sidebar section. Returns a config dict if the
+    Run button was just clicked, else None."""
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("Single Run (BackendA)", expanded=False):
+        st.caption("Backend locked to single_process (BackendA). Analytic predictor.")
+        col1, col2 = st.columns(2)
+        with col1:
+            p_dev = st.selectbox("Prefill device", _DEVICE_OPTIONS, key="sr_p_dev")
+            p_tp = st.number_input("Prefill TP", 1, 16, 1, key="sr_p_tp")
+            p_repl = st.number_input("Prefill replicas", 1, 16, 1, key="sr_p_repl")
+        with col2:
+            d_dev = st.selectbox("Decode device", _DEVICE_OPTIONS, key="sr_d_dev")
+            d_tp = st.number_input("Decode TP", 1, 16, 1, key="sr_d_tp")
+            d_repl = st.number_input("Decode replicas", 1, 16, 1, key="sr_d_repl")
+        bw = st.number_input("KV bw (GB/s)", 1.0, 1000.0, 100.0, key="sr_bw")
+        lat = st.number_input("KV latency (us)", 0.0, 1000.0, 10.0, key="sr_lat")
+        nreq = st.number_input("Requests", 1, 64, 8, key="sr_nreq")
+        burst = st.checkbox("Burst (all arrive at t=0)", value=False, key="sr_burst")
+        run = st.button("Run simulation", key="sr_run", use_container_width=True)
+        if run:
+            return {
+                "prefill_device": str(p_dev),
+                "decode_device": str(d_dev),
+                "prefill_tp": int(p_tp),
+                "decode_tp": int(d_tp),
+                "prefill_replicas": int(p_repl),
+                "decode_replicas": int(d_repl),
+                "bw_gbps": float(bw),
+                "latency_us": float(lat),
+                "num_requests": int(nreq),
+                "burst": bool(burst),
+            }
+    return None
 
 
 def _column_filter(df: pd.DataFrame, col: str, label: str) -> Any:
@@ -106,8 +174,29 @@ def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
 def render(default_csv: Path | None) -> None:
     st.set_page_config(page_title="HiSim Sweep", layout="wide")
     csv_path, filters = _sidebar(default_csv)
+    pending_run = _single_run_section()
+
+    # Initialize session_state container for ad-hoc single runs.
+    if "single_runs" not in st.session_state:
+        st.session_state["single_runs"] = []
+
+    if pending_run is not None:
+        with st.spinner("Running BackendA simulation..."):
+            row = _run_single_cached(**pending_run)
+        st.session_state["single_runs"].append(row)
 
     st.title("HiSim Sweep Dashboard")
+
+    # Show single-run results (if any) above the sweep section.
+    single_rows = st.session_state.get("single_runs", [])
+    if single_rows:
+        with st.expander(f"Single runs ({len(single_rows)})", expanded=True):
+            sr_df = pd.DataFrame(single_rows)
+            st.dataframe(sr_df, use_container_width=True)
+            cols = st.columns([1, 4])
+            if cols[0].button("Clear", key="sr_clear"):
+                st.session_state["single_runs"] = []
+                st.rerun()
 
     if not csv_path:
         st.info("Enter a summary.csv path in the sidebar to begin.")

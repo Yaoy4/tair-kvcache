@@ -104,3 +104,34 @@ def test_dashboard_pareto_filter_reduces_rows(tmp_path):
     # Of the 3 rows above, only (38, 180) is pareto-optimal.
     rows_metric = at.metric[0].value
     assert int(rows_metric) <= 3
+
+
+# ---------------- V6: Single Run section ----------------
+
+
+def test_single_run_button_appends_session_row():
+    """Clicking 'Run simulation' in the sidebar expander adds one row."""
+    at = _app()
+    at.run()
+    assert not at.exception
+    # Single Run lives in an expander; widgets are still flat in at.sidebar.button
+    # The Run button has key 'sr_run'.
+    btns = [b for b in at.sidebar.button if b.key == "sr_run"]
+    assert btns, "Run button not found in sidebar"
+    btns[0].click().run()
+    assert not at.exception
+    runs = at.session_state["single_runs"]
+    assert len(runs) == 1
+    assert runs[0]["disagg_enabled"] is True
+    assert runs[0]["topology"].startswith("pd-")
+
+
+def test_single_run_two_clicks_append_two_rows():
+    at = _app()
+    at.run()
+    btn = next(b for b in at.sidebar.button if b.key == "sr_run")
+    btn.click().run()
+    btn = next(b for b in at.sidebar.button if b.key == "sr_run")
+    btn.click().run()
+    assert not at.exception
+    assert len(at.session_state["single_runs"]) == 2
