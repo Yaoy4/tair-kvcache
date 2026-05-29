@@ -10,13 +10,15 @@ fast unit tests.
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Iterable, List, Optional, Sequence
 
 from hisim.spec.model import ModelInfo
 from hisim.simulation.pd_aic_adapter import AICPredictorAdapter
 from hisim.simulation.pd_backend_a import BackendA
+from hisim.simulation.pd_backend_protocol import PDBackendProtocol
 from hisim.simulation.pd_config import DisaggConfig
 from hisim.simulation.pd_factory import build_disagg
+from hisim.simulation.pd_types import PDRequestState
 from hisim.simulation.types import SchedulerConfig
 
 PredictorFactory = Callable[..., object]
@@ -59,7 +61,11 @@ def build_backend_a(
 # ---------------------------------------------------------------------------
 
 
-def admit_prefill_batch_latency(backend, states, now: float) -> float:
+def admit_prefill_batch_latency(
+    backend: PDBackendProtocol,
+    states: Sequence[PDRequestState],
+    now: float,
+) -> float:
     """Admit every request in `states` onto the backend's prefill pool.
 
     Returns the predicted batch latency = (max prefill end time) - now.
@@ -75,7 +81,11 @@ def admit_prefill_batch_latency(backend, states, now: float) -> float:
     return max_end - now
 
 
-def decode_batch_latency(backend, states, now: float) -> float:
+def decode_batch_latency(
+    backend: PDBackendProtocol,
+    states: Sequence[PDRequestState],
+    now: float,
+) -> float:
     """Schedule one decode step for the whole batch via BackendA.
 
     Returns the predicted step latency = end_time - now. Empty batches yield 0.
@@ -86,7 +96,11 @@ def decode_batch_latency(backend, states, now: float) -> float:
     return end_t - now
 
 
-def finalize_prefill_batch(backend, states, now: float) -> None:
+def finalize_prefill_batch(
+    backend: PDBackendProtocol,
+    states: Iterable[PDRequestState],
+    now: float,
+) -> None:
     """After a prefill batch completes at virtual time `now`, move each
     request to KV_TRANSIT with its computed kv_ready_time.
     """
@@ -95,7 +109,9 @@ def finalize_prefill_batch(backend, states, now: float) -> None:
         backend.on_prefill_done(s, now, kv_ready)
 
 
-def drain_kv_ready_and_admit_decode(backend, now: float, capacity: int):
+def drain_kv_ready_and_admit_decode(
+    backend: PDBackendProtocol, now: float, capacity: int
+) -> List[PDRequestState]:
     """Promote any KV-ready requests to WAITING_DECODE, then admit up to
     `capacity` of them into RUNNING_DECODE. Returns the admitted list.
     """
