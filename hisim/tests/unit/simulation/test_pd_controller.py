@@ -70,19 +70,35 @@ def test_admit_prefill_with_zero_capacity_admits_nothing():
     assert ctrl.prefill_waiting_count() == 1
 
 
-def test_on_prefill_done_transitions_to_kv_transit_with_ready_time():
+def test_compute_kv_ready_time_uses_bandwidth_model():
+    ctrl = make_controller(bw_gbps=100.0, latency_us=10.0, kv_bytes_per_token=1024)
+    req = PDRequestState(rid="r1", arrival_time=0.0, input_length=2048)
+    expected = 1.0 + 10e-6 + (2048 * 1024) / (100.0 * 1e9)
+    assert ctrl.compute_kv_ready_time(req, now=1.0) == pytest.approx(expected, rel=1e-12)
+
+
+def test_on_prefill_done_uses_caller_supplied_kv_ready_time():
     ctrl = make_controller(bw_gbps=100.0, latency_us=10.0, kv_bytes_per_token=1024)
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=2048)
     ctrl.on_request_arrival(req, now=0.0)
     ctrl.admit_prefill(capacity=1, now=0.0)
 
-    ctrl.on_prefill_done(req, now=1.0)
-    expected_kv = 1.0 + 10e-6 + (2048 * 1024) / (100.0 * 1e9)
+    # Caller (backend) supplies the absolute ready time. The controller does NOT compute it.
+    ctrl.on_prefill_done(req, now=1.0, kv_ready_time=3.25)
 
     assert req.phase == RequestPhase.KV_TRANSIT
     assert req.prefill_end_time == 1.0
-    assert req.kv_ready_time == pytest.approx(expected_kv, rel=1e-12)
+    assert req.kv_ready_time == 3.25
     assert ctrl.kv_transit_count() == 1
+
+
+def test_on_prefill_done_rejects_kv_ready_time_before_now():
+    ctrl = make_controller()
+    req = PDRequestState(rid="r1", arrival_time=0.0, input_length=8)
+    ctrl.on_request_arrival(req, now=0.0)
+    ctrl.admit_prefill(capacity=1, now=0.0)
+    with pytest.raises(ValueError):
+        ctrl.on_prefill_done(req, now=1.0, kv_ready_time=0.5)
 
 
 def test_poll_kv_ready_returns_only_ready_requests_and_moves_to_waiting_decode():
@@ -90,14 +106,14 @@ def test_poll_kv_ready_returns_only_ready_requests_and_moves_to_waiting_decode()
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=2048)
     ctrl.on_request_arrival(req, now=0.0)
     ctrl.admit_prefill(capacity=1, now=0.0)
-    ctrl.on_prefill_done(req, now=1.0)
+    ready_at = ctrl.compute_kv_ready_time(req, now=1.0)
+    ctrl.on_prefill_done(req, now=1.0, kv_ready_time=ready_at)
 
     # Not yet ready.
     assert ctrl.poll_kv_ready(now=1.0) == []
     assert req.phase == RequestPhase.KV_TRANSIT
 
-    ready_time = req.kv_ready_time
-    ready = ctrl.poll_kv_ready(now=ready_time)
+    ready = ctrl.poll_kv_ready(now=ready_at)
     assert ready == [req]
     assert req.phase == RequestPhase.WAITING_DECODE
     assert ctrl.kv_transit_count() == 0
@@ -111,7 +127,7 @@ def test_admit_decode_respects_capacity_and_sets_decode_start_time():
         r = PDRequestState(rid=f"r{i}", arrival_time=0.0, input_length=8)
         ctrl.on_request_arrival(r, now=0.0)
         ctrl.admit_prefill(capacity=3, now=0.0)
-        ctrl.on_prefill_done(r, now=1.0)
+        ctrl.on_prefill_done(r, now=1.0, kv_ready_time=ctrl.compute_kv_ready_time(r, 1.0))
         reqs.append(r)
     ctrl.poll_kv_ready(now=10.0)
 
@@ -128,7 +144,7 @@ def test_on_decode_step_done_increments_state_and_finishes_when_done():
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=4, output_length=2)
     ctrl.on_request_arrival(req, now=0.0)
     ctrl.admit_prefill(capacity=1, now=0.0)
-    ctrl.on_prefill_done(req, now=1.0)
+    ctrl.on_prefill_done(req, now=1.0, kv_ready_time=ctrl.compute_kv_ready_time(req, 1.0))
     ctrl.poll_kv_ready(now=10.0)
     ctrl.admit_decode(capacity=1, now=10.0)
 
@@ -156,7 +172,8 @@ def test_full_state_flow_end_to_end():
     ctrl.admit_prefill(capacity=1, now=0.0)
     assert req.phase == RequestPhase.RUNNING_PREFILL
 
-    ctrl.on_prefill_done(req, now=0.5)
+    kv_ready = ctrl.compute_kv_ready_time(req, now=0.5)
+    ctrl.on_prefill_done(req, now=0.5, kv_ready_time=kv_ready)
     assert req.phase == RequestPhase.KV_TRANSIT
 
     ctrl.poll_kv_ready(now=req.kv_ready_time)

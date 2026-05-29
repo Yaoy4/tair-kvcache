@@ -67,14 +67,28 @@ class PDController:
             capacity -= 1
         return admitted
 
-    def on_prefill_done(self, req: PDRequestState, now: float) -> None:
+    def on_prefill_done(
+        self, req: PDRequestState, now: float, kv_ready_time: float
+    ) -> None:
+        if kv_ready_time < now:
+            raise ValueError(
+                f"kv_ready_time ({kv_ready_time}) must be >= now ({now}); "
+                "backend reported an inconsistent KV handoff time."
+            )
         req.phase = RequestPhase.KV_TRANSIT
         req.prefill_end_time = now
+        req.kv_ready_time = kv_ready_time
+        self._kv_transit.append(req)
+
+    def compute_kv_ready_time(self, req: PDRequestState, now: float) -> float:
+        """Helper for backends that use the bandwidth transfer model directly
+        (e.g., Backend A). Backend B should ignore this and report the real
+        handoff completion time from its transfer process.
+        """
         transfer_dur = self._transfer_model.estimate(
             req.input_length, self._kv_model_cfg
         )
-        req.kv_ready_time = now + transfer_dur
-        self._kv_transit.append(req)
+        return now + transfer_dur
 
     def poll_kv_ready(self, now: float) -> List[PDRequestState]:
         ready: List[PDRequestState] = []
