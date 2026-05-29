@@ -60,6 +60,7 @@ paths=(
   "hisim/tests/unit/simulation"
   "hisim/tools/aic_to_hisim_bridge.py"
   "hisim/tools/aic_topn_to_hisim_sweep.py"
+  "hisim/docs/pd_ab_equivalence_spec.md"
 )
 
 existing=()
