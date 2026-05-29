@@ -62,6 +62,9 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     total_reused_tokens = 0
     total_disk_hit_tokens = 0
     queue_durs = []
+    prefill_queue_waits = []
+    kv_transfer_times = []
+    decode_queue_waits = []
     for req in requests:
         if not req.is_complete():
             continue
@@ -78,6 +81,10 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         total_output += req.output_length
         total_reused_tokens += req.final_reused_tokens
         total_disk_hit_tokens += req.prefetch_complete_tokens
+        # PD stage durations (zero on non-disagg paths; safe to aggregate)
+        prefill_queue_waits.append(getattr(req, "prefill_queue_wait", 0.0))
+        kv_transfer_times.append(getattr(req, "kv_transfer_time", 0.0))
+        decode_queue_waits.append(getattr(req, "decode_queue_wait", 0.0))
     return {
         "num_requests": len(requests),
         "completed": completed,
@@ -120,5 +127,19 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "p90_e2e_latency_ms": np.percentile(e2e_latencies or 0, 90) * 1000,
         "p95_e2e_latency_ms": np.percentile(e2e_latencies or 0, 95) * 1000,
         "p99_e2e_latency_ms": np.percentile(e2e_latencies or 0, 99) * 1000,
+        # PD stage percentiles. Zero for non-disagg requests; populated for
+        # disagg via pd_metrics.populate_request_stats.
+        "mean_prefill_queue_ms": np.mean(prefill_queue_waits or [0.0]) * 1000,
+        "p50_prefill_queue_ms": np.percentile(prefill_queue_waits or [0.0], 50) * 1000,
+        "p95_prefill_queue_ms": np.percentile(prefill_queue_waits or [0.0], 95) * 1000,
+        "p99_prefill_queue_ms": np.percentile(prefill_queue_waits or [0.0], 99) * 1000,
+        "mean_kv_transfer_ms": np.mean(kv_transfer_times or [0.0]) * 1000,
+        "p50_kv_transfer_ms": np.percentile(kv_transfer_times or [0.0], 50) * 1000,
+        "p95_kv_transfer_ms": np.percentile(kv_transfer_times or [0.0], 95) * 1000,
+        "p99_kv_transfer_ms": np.percentile(kv_transfer_times or [0.0], 99) * 1000,
+        "mean_decode_queue_ms": np.mean(decode_queue_waits or [0.0]) * 1000,
+        "p50_decode_queue_ms": np.percentile(decode_queue_waits or [0.0], 50) * 1000,
+        "p95_decode_queue_ms": np.percentile(decode_queue_waits or [0.0], 95) * 1000,
+        "p99_decode_queue_ms": np.percentile(decode_queue_waits or [0.0], 99) * 1000,
         "time_cost": -1,  # Updated by external benchmark caller
     }

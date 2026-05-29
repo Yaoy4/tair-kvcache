@@ -59,6 +59,12 @@ class RequestStats:
     queue_end: float = -1
     created_time: float = -1
     gen_token_latencies: list[float] = field(default_factory=list)
+    # PD-disagg stage durations (seconds). Defaults of 0 keep non-disagg
+    # runs backward-compatible; populated by pd_metrics.populate_request_stats
+    # when a PDRequestState finishes.
+    prefill_queue_wait: float = 0.0
+    kv_transfer_time: float = 0.0
+    decode_queue_wait: float = 0.0
 
     def is_complete(self) -> bool:
         return True
