@@ -180,6 +180,54 @@ def _build_config_from_row(
     return cfg
 
 
+def _build_disagg_role_dict(
+    row: dict[str, str], prefix: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Build a RolePredictorConfig-shaped dict from a disagg AIC row.
+
+    prefix is '(p)' for prefill, '(d)' for decode. Keys produced must match
+    fields accepted by hisim.simulation.pd_config.RolePredictorConfig (i.e.
+    consumable by sim_args._disagg_from_dict).
+    """
+    role: dict[str, Any] = {
+        "device_name": (
+            _row_get(row, f"{prefix}system") or args.predictor_device_name or "h100_sxm"
+        ),
+        "tp_size": _to_int(_row_get(row, f"{prefix}tp"), 1),
+        "ep_size": _to_int(_row_get(row, f"{prefix}moe_ep"), 1),
+        "dp_size": _to_int(_row_get(row, f"{prefix}dp"), 1),
+        "pp_size": _to_int(_row_get(row, f"{prefix}pp"), 1),
+        "replicas": _to_int(_row_get(row, f"{prefix}workers"), 1),
+    }
+    data_type = _normalize_dtype(_row_get(row, f"{prefix}gemm"))
+    if data_type is not None:
+        role["data_type"] = data_type
+    kv_dtype = _normalize_dtype(_row_get(row, f"{prefix}kvcache"), data_type)
+    if kv_dtype is not None:
+        role["kv_cache_data_type"] = kv_dtype
+    backend_version = _row_get(row, f"{prefix}version") or args.backend_version
+    if backend_version is not None:
+        role["backend_version"] = backend_version
+    if args.database_path is not None:
+        role["database_path"] = args.database_path
+    return role
+
+
+def _build_disagg_block(
+    row: dict[str, str], args: argparse.Namespace
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "backend": args.disagg_backend,
+        "prefill": _build_disagg_role_dict(row, "(p)", args),
+        "decode": _build_disagg_role_dict(row, "(d)", args),
+        "kv_transfer": {
+            "bw_gbps": float(args.kv_transfer_bw_gbps),
+            "latency_us": float(args.kv_transfer_latency_us),
+        },
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert one AIConfigurator CSV row to a Hisim simulation config JSON"
@@ -225,6 +273,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-read-bandwidth-gb", type=float, default=16)
     parser.add_argument("--memory-write-bandwidth-gb", type=float, default=16)
     parser.add_argument("--num-device-per-node", type=int, default=8)
+
+    # --- Phase 1d: disagg emission ---
+    parser.add_argument(
+        "--emit-disagg",
+        action="store_true",
+        help="Emit a top-level `disagg` block (requires a disagg-shaped AIC CSV "
+             "with (p)tp / (d)tp columns and --kv-transfer-* flags).",
+    )
+    parser.add_argument(
+        "--disagg-backend",
+        choices=["single_process", "two_process"],
+        default="single_process",
+        help="DisaggConfig.backend value when --emit-disagg is set.",
+    )
+    parser.add_argument(
+        "--kv-transfer-bw-gbps",
+        type=float,
+        default=None,
+        help="KV-transfer bandwidth in GB/s. Required with --emit-disagg.",
+    )
+    parser.add_argument(
+        "--kv-transfer-latency-us",
+        type=float,
+        default=None,
+        help="KV-transfer fixed latency in microseconds. Required with --emit-disagg.",
+    )
     return parser.parse_args()
 
 
@@ -245,6 +319,17 @@ def main() -> int:
 
     row = _load_csv_row(aic_csv, args.row_index)
     out_cfg = _build_config_from_row(row, args.disagg_role, base_config, args)
+
+    if args.emit_disagg:
+        if "(p)tp" not in row or "(d)tp" not in row:
+            raise SystemExit(
+                "--emit-disagg requires a disagg-shaped CSV with (p)tp and (d)tp columns"
+            )
+        if args.kv_transfer_bw_gbps is None or args.kv_transfer_latency_us is None:
+            raise SystemExit(
+                "--emit-disagg requires --kv-transfer-bw-gbps and --kv-transfer-latency-us"
+            )
+        out_cfg["disagg"] = _build_disagg_block(row, args)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
