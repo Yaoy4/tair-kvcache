@@ -251,6 +251,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--random-range-ratio", type=float, default=1.0)
 
     parser.add_argument("--dry-run", action="store_true", help="Generate commands/configs only")
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Skip rendering the HTML sweep report after summary.csv is written.",
+    )
+    parser.add_argument(
+        "--plot-output",
+        default=None,
+        help="HTML report path. Defaults to <output-dir>/sweep_report.html.",
+    )
     return parser.parse_args()
 
 
@@ -466,6 +476,29 @@ def main() -> int:
     print(f"[sweep] rows_selected={len(summary_rows)} ok={ok_count}")
     print(f"[sweep] summary_csv={summary_csv}")
     print(f"[sweep] summary_json={summary_json}")
+
+    if not args.no_plot and summary_rows and not args.dry_run:
+        try:
+            from hisim.visualization import sweep_data, sweep_report
+        except ImportError as exc:
+            print(
+                f"[sweep] skip plot: visualization extras missing ({exc}). "
+                f"Install with: pip install -e '.[viz]'"
+            )
+        else:
+            plot_path = Path(args.plot_output) if args.plot_output else (output_dir / "sweep_report.html")
+            try:
+                df = sweep_data.load_sweep(summary_csv)
+                df = sweep_data.add_derived_columns(df)
+                sweep_report.render_report(
+                    df,
+                    plot_path,
+                    title=f"HiSim Sweep — {output_dir.name}",
+                    source=str(summary_csv),
+                )
+                print(f"[sweep] report={plot_path}")
+            except Exception as exc:  # pragma: no cover — best-effort
+                print(f"[sweep] skip plot: render failed ({exc})")
     return 0
 
 
