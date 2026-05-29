@@ -73,3 +73,32 @@ def admit_prefill_batch_latency(backend, states, now: float) -> float:
         if end_t > max_end:
             max_end = end_t
     return max_end - now
+
+
+def decode_batch_latency(backend, states, now: float) -> float:
+    """Schedule one decode step for the whole batch via BackendA.
+
+    Returns the predicted step latency = end_time - now. Empty batches yield 0.
+    """
+    if not states:
+        return 0.0
+    _, end_t = backend.try_admit_decode_batch(states, now)
+    return end_t - now
+
+
+def finalize_prefill_batch(backend, states, now: float) -> None:
+    """After a prefill batch completes at virtual time `now`, move each
+    request to KV_TRANSIT with its computed kv_ready_time.
+    """
+    for s in states:
+        kv_ready = backend.compute_kv_ready_time(s, now)
+        backend.on_prefill_done(s, now, kv_ready)
+
+
+def drain_kv_ready_and_admit_decode(backend, now: float, capacity: int):
+    """Promote any KV-ready requests to WAITING_DECODE, then admit up to
+    `capacity` of them into RUNNING_DECODE. Returns the admitted list.
+    """
+    ctrl = backend.controller()
+    ctrl.poll_kv_ready(now)
+    return ctrl.admit_decode(capacity=capacity, now=now)

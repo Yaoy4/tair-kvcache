@@ -865,6 +865,7 @@ class C_SchedulerHook(BaseHook):
                     ):
                         from hisim.simulation.pd_runtime import (
                             admit_prefill_batch_latency,
+                            finalize_prefill_batch,
                         )
                         from hisim.simulation.pd_types import (
                             PDRequestState,
@@ -896,6 +897,14 @@ class C_SchedulerHook(BaseHook):
                         pd_latency = admit_prefill_batch_latency(
                             C_SchedulerHook.PD_BACKEND, states, now_clock
                         )
+                        # Move each finished-prefill request into KV_TRANSIT
+                        # with its computed kv_ready_time, so the controller
+                        # is ready for the next iteration's KV-ready poll.
+                        finalize_prefill_batch(
+                            C_SchedulerHook.PD_BACKEND,
+                            states,
+                            now_clock + pd_latency,
+                        )
                         logger.debug(
                             "[PD] extend batch: %d reqs, agg_pred=%.6fs, "
                             "pd_pred=%.6fs",
@@ -904,6 +913,44 @@ class C_SchedulerHook(BaseHook):
                             pd_latency,
                         )
                         predicted_latency = pd_latency
+                    elif (
+                        C_SchedulerHook.PD_BACKEND is not None
+                        and batch.forward_mode.is_decode()
+                    ):
+                        from hisim.simulation.pd_runtime import (
+                            decode_batch_latency,
+                            drain_kv_ready_and_admit_decode,
+                        )
+
+                        now_clock = StateManager.get_global_clock()
+                        # Promote KV-ready requests to RUNNING_DECODE so the
+                        # controller's bookkeeping matches what sglang shows us.
+                        drain_kv_ready_and_admit_decode(
+                            C_SchedulerHook.PD_BACKEND,
+                            now=now_clock,
+                            capacity=len(batch.reqs),
+                        )
+                        states = [
+                            C_SchedulerHook.PD_REQUEST_STATES[req.rid]
+                            for req in batch.reqs
+                            if req.rid in C_SchedulerHook.PD_REQUEST_STATES
+                        ]
+                        if states:
+                            pd_latency = decode_batch_latency(
+                                C_SchedulerHook.PD_BACKEND, states, now_clock
+                            )
+                            # Bookkeeping: credit one decode step per request.
+                            C_SchedulerHook.PD_BACKEND.on_decode_step_done_batch(
+                                states, now_clock + pd_latency
+                            )
+                            logger.debug(
+                                "[PD] decode batch: %d reqs, agg_pred=%.6fs, "
+                                "pd_pred=%.6fs",
+                                len(states),
+                                predicted_latency,
+                                pd_latency,
+                            )
+                            predicted_latency = pd_latency
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
