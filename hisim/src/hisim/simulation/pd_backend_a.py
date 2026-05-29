@@ -24,7 +24,7 @@ real AIConfiguratorTimePredictor will need a thin adapter (added in 2b).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from hisim.simulation.pd_controller import PDController
 from hisim.simulation.pd_factory import DisaggPredictors
@@ -134,5 +134,33 @@ class BackendA:
         self._decode_pool.busy_until[idx] = end
         return idx, end
 
+    def try_admit_decode_batch(
+        self, reqs: Sequence[PDRequestState], now: float
+    ) -> Tuple[int, float]:
+        """Schedule one decode step for an entire batch on the earliest-free
+        decode replica.
+
+        Passes each request's ``current_past_kv_length`` to the predictor so
+        latency reflects real batch composition. Returns (replica_idx,
+        end_time). Caller is responsible for calling
+        :meth:`on_decode_step_done_batch` once the step completes.
+        """
+        if not reqs:
+            raise ValueError("try_admit_decode_batch requires at least one request")
+        idx, free_at = self._decode_pool.earliest_replica()
+        start = max(now, free_at)
+        past_kv = [int(r.current_past_kv_length) for r in reqs]
+        dur = self._bundle.decode.predict_decode_seconds(
+            batch_size=len(reqs), past_kv_length=past_kv
+        )
+        end = start + dur
+        self._decode_pool.busy_until[idx] = end
+        return idx, end
+
     def on_decode_step_done(self, req: PDRequestState, now: float) -> None:
         self._controller.on_decode_step_done([req], now)
+
+    def on_decode_step_done_batch(
+        self, reqs: Iterable[PDRequestState], now: float
+    ) -> None:
+        self._controller.on_decode_step_done(reqs, now)

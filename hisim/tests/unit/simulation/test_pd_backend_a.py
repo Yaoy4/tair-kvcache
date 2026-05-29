@@ -68,8 +68,14 @@ class _StubPredictor:
     def predict_prefill_seconds(self, batch_tokens: int) -> float:
         return batch_tokens * self._prefill_us * 1e-6
 
-    def predict_decode_seconds(self, batch_size: int) -> float:
-        return self._decode_us * 1e-6
+    def predict_decode_seconds(self, batch_size: int, past_kv_length=0) -> float:
+        # Cost grows with batch_size (linear) and (optionally) with past_kv.
+        if isinstance(past_kv_length, int):
+            pkv_total = past_kv_length * batch_size
+        else:
+            pkv_total = sum(int(x) for x in past_kv_length)
+        # 5 us per slot in batch + 0.001 us per past kv token (small)
+        return (self._decode_us * batch_size + 0.001 * pkv_total) * 1e-6
 
 
 class _StubHW:
@@ -240,3 +246,65 @@ def test_full_lifecycle_marks_request_finished():
         _, end_t = be.try_admit_decode_step(r, now=be.earliest_pool_time("decode"))
         be.on_decode_step_done(r, now=end_t)
     assert r.phase == RequestPhase.FINISHED
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b.2 — batch-aware decode (try_admit_decode_batch)
+# ---------------------------------------------------------------------------
+
+
+def _ready_decode_req(rid, input_len=100, output_len=4, past_kv=None):
+    r = _req(rid, input_len=input_len, output_len=output_len)
+    r.phase = RequestPhase.RUNNING_DECODE
+    r.current_past_kv_length = past_kv if past_kv is not None else input_len
+    return r
+
+
+def test_try_admit_decode_batch_passes_past_kv_to_predictor():
+    be = BackendA(_bundle(decode_device="fast", decode_replicas=1))
+    reqs = [
+        _ready_decode_req("a", past_kv=100),
+        _ready_decode_req("b", past_kv=200),
+        _ready_decode_req("c", past_kv=300),
+    ]
+    idx, end_t = be.try_admit_decode_batch(reqs, now=0.0)
+    # 5 us/slot * 3 + 0.001 us * (100+200+300) = 15 + 0.6 = 15.6 us
+    assert idx == 0
+    assert end_t == pytest.approx(15.6e-6)
+
+
+def test_try_admit_decode_batch_advances_one_replica_only():
+    be = BackendA(_bundle(decode_device="fast", decode_replicas=4))
+    reqs = [_ready_decode_req(f"r{i}", past_kv=0) for i in range(3)]
+    idx, end_t = be.try_admit_decode_batch(reqs, now=0.0)
+    # one replica advances; the other three stay at 0
+    busy = sorted(be._decode_pool.busy_until)
+    assert busy[:3] == [0.0, 0.0, 0.0]
+    assert busy[3] == pytest.approx(end_t)
+
+
+def test_try_admit_decode_batch_uses_earliest_replica():
+    be = BackendA(_bundle(decode_device="fast", decode_replicas=2))
+    # warm up replica 0 with a single step
+    be.try_admit_decode_step(_ready_decode_req("warm"), now=0.0)
+    # next batch should land on replica 1 (still free at t=0)
+    reqs = [_ready_decode_req(f"r{i}", past_kv=0) for i in range(2)]
+    idx, _ = be.try_admit_decode_batch(reqs, now=0.0)
+    assert idx == 1
+
+
+def test_try_admit_decode_batch_rejects_empty():
+    be = BackendA(_bundle())
+    with pytest.raises(ValueError):
+        be.try_admit_decode_batch([], now=0.0)
+
+
+def test_on_decode_batch_step_done_advances_all_requests():
+    be = BackendA(_bundle(decode_device="fast", decode_replicas=1))
+    reqs = [_ready_decode_req(f"r{i}", input_len=10, output_len=1, past_kv=10)
+            for i in range(3)]
+    _, end_t = be.try_admit_decode_batch(reqs, now=0.0)
+    be.on_decode_step_done_batch(reqs, now=end_t)
+    # each req gets one decode step credited; output_len=1 → FINISHED
+    for r in reqs:
+        assert r.phase == RequestPhase.FINISHED
