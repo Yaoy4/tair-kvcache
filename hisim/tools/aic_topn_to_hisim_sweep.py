@@ -83,6 +83,81 @@ def _pick_row_value(row: dict[str, str], agg_key: str, disagg_key: str) -> str:
     return ""
 
 
+def _build_bridge_cmd(
+    args: argparse.Namespace,
+    *,
+    bridge_script: Path,
+    csv_path: Path,
+    row_idx: int,
+    sim_config_path: Path,
+    database_path: Path,
+) -> list[str]:
+    """Build the aic_to_hisim_bridge subprocess argv for a single run.
+
+    Phase 3c: when --emit-disagg is set on the sweep, propagate the
+    disagg JSON-emission flags (--emit-disagg, --kv-transfer-bw-gbps,
+    --kv-transfer-latency-us, --disagg-backend) so the produced sim
+    config carries a `disagg` block consumable by Backend A.
+    """
+    cmd = [
+        args.python_bin,
+        str(bridge_script),
+        "--aic-csv",
+        str(csv_path),
+        "--row-index",
+        str(row_idx),
+        "--output",
+        str(sim_config_path),
+        "--base-config",
+        str(args.base_config),
+        "--disagg-role",
+        args.disagg_role,
+        "--database-path",
+        str(database_path),
+        "--database-mode",
+        args.database_mode,
+        "--platform-accelerator",
+        args.platform_accelerator,
+        "--disk-read-bandwidth-gb",
+        str(args.disk_read_bandwidth_gb),
+        "--disk-write-bandwidth-gb",
+        str(args.disk_write_bandwidth_gb),
+        "--memory-read-bandwidth-gb",
+        str(args.memory_read_bandwidth_gb),
+        "--memory-write-bandwidth-gb",
+        str(args.memory_write_bandwidth_gb),
+        "--num-device-per-node",
+        str(args.num_device_per_node),
+    ]
+    if args.predictor_device_name:
+        cmd.extend(["--predictor-device-name", args.predictor_device_name])
+    if args.backend_version:
+        cmd.extend(["--backend-version", args.backend_version])
+    if args.prefill_scale_factor is not None:
+        cmd.extend(["--prefill-scale-factor", str(args.prefill_scale_factor)])
+    if args.decode_scale_factor is not None:
+        cmd.extend(["--decode-scale-factor", str(args.decode_scale_factor)])
+    if args.xgb_model_path is not None:
+        cmd.extend(["--xgb-model-path", args.xgb_model_path])
+    if args.data_type is not None:
+        cmd.extend(["--data-type", args.data_type])
+    if args.kv_cache_data_type is not None:
+        cmd.extend(["--kv-cache-data-type", args.kv_cache_data_type])
+    if getattr(args, "emit_disagg", False):
+        cmd.extend(
+            [
+                "--emit-disagg",
+                "--kv-transfer-bw-gbps",
+                str(args.kv_transfer_bw_gbps),
+                "--kv-transfer-latency-us",
+                str(args.kv_transfer_latency_us),
+                "--disagg-backend",
+                args.disagg_backend,
+            ]
+        )
+    return cmd
+
+
 def _parse_args() -> argparse.Namespace:
     hisim_root = Path(__file__).resolve().parents[1]
     projects_root = Path(__file__).resolve().parents[3]
@@ -125,6 +200,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor-device-name", default=None)
     parser.add_argument("--backend-version", default=None)
     parser.add_argument("--disagg-role", choices=["decode", "prefill"], default="decode")
+
+    # Phase 3c: optional disagg JSON emission propagated to the bridge.
+    parser.add_argument(
+        "--emit-disagg",
+        action="store_true",
+        help="Ask the bridge to emit a DisaggConfig block in each sim config.",
+    )
+    parser.add_argument(
+        "--kv-transfer-bw-gbps",
+        type=float,
+        default=200.0,
+        help="KV transfer bandwidth (GB/s) used when --emit-disagg is set.",
+    )
+    parser.add_argument(
+        "--kv-transfer-latency-us",
+        type=float,
+        default=10.0,
+        help="KV transfer fixed latency (microseconds) used when --emit-disagg is set.",
+    )
+    parser.add_argument(
+        "--disagg-backend",
+        choices=["single_process", "two_process"],
+        default="single_process",
+        help="DisaggConfig.backend value propagated to the bridge.",
+    )
 
     parser.add_argument("--prefill-scale-factor", type=float, default=None)
     parser.add_argument("--decode-scale-factor", type=float, default=None)
@@ -201,50 +301,14 @@ def main() -> int:
         server_log = run_dir / "server.log"
         bench_log = run_dir / "bench.log"
 
-        bridge_cmd = [
-            args.python_bin,
-            str(bridge_script),
-            "--aic-csv",
-            str(csv_path),
-            "--row-index",
-            str(row_idx),
-            "--output",
-            str(sim_config_path),
-            "--base-config",
-            str(args.base_config),
-            "--disagg-role",
-            args.disagg_role,
-            "--database-path",
-            str(database_path),
-            "--database-mode",
-            args.database_mode,
-            "--platform-accelerator",
-            args.platform_accelerator,
-            "--disk-read-bandwidth-gb",
-            str(args.disk_read_bandwidth_gb),
-            "--disk-write-bandwidth-gb",
-            str(args.disk_write_bandwidth_gb),
-            "--memory-read-bandwidth-gb",
-            str(args.memory_read_bandwidth_gb),
-            "--memory-write-bandwidth-gb",
-            str(args.memory_write_bandwidth_gb),
-            "--num-device-per-node",
-            str(args.num_device_per_node),
-        ]
-        if args.predictor_device_name:
-            bridge_cmd.extend(["--predictor-device-name", args.predictor_device_name])
-        if args.backend_version:
-            bridge_cmd.extend(["--backend-version", args.backend_version])
-        if args.prefill_scale_factor is not None:
-            bridge_cmd.extend(["--prefill-scale-factor", str(args.prefill_scale_factor)])
-        if args.decode_scale_factor is not None:
-            bridge_cmd.extend(["--decode-scale-factor", str(args.decode_scale_factor)])
-        if args.xgb_model_path is not None:
-            bridge_cmd.extend(["--xgb-model-path", args.xgb_model_path])
-        if args.data_type is not None:
-            bridge_cmd.extend(["--data-type", args.data_type])
-        if args.kv_cache_data_type is not None:
-            bridge_cmd.extend(["--kv-cache-data-type", args.kv_cache_data_type])
+        bridge_cmd = _build_bridge_cmd(
+            args,
+            bridge_script=bridge_script,
+            csv_path=csv_path,
+            row_idx=row_idx,
+            sim_config_path=sim_config_path,
+            database_path=database_path,
+        )
 
         subprocess.run(bridge_cmd, check=True, env=env)
 
