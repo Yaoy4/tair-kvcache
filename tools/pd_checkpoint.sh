@@ -39,6 +39,7 @@ paths=(
   "hisim/src/hisim/simulation/pd_controller.py"
   "hisim/src/hisim/simulation/pd_transfer.py"
   "hisim/src/hisim/simulation/pd_config.py"
+  "hisim/src/hisim/simulation/pd_factory.py"
   "hisim/src/hisim/simulation/types.py"
   "hisim/src/hisim/simulation/sim_args.py"
   "hisim/src/hisim/simulation/utils.py"
