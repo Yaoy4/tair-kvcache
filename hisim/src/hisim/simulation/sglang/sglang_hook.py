@@ -576,6 +576,10 @@ class C_SchedulerHook(BaseHook):
 
     OVERLAP_SCHEDULE: bool = False
 
+    # PD disaggregation (Phase 2b): populated in wrapped_init when the
+    # config's `disagg.enabled` is True. Stays None for the aggregated path.
+    PD_BACKEND = None  # Optional[BackendA]
+
     SIM_MODE = MockSimulationMode(Envs.simulation_mode())
     OFFLINE_RECV_ALL_REQUEST: bool = False
     FUTURE_QUEUE: list[
@@ -632,6 +636,30 @@ class C_SchedulerHook(BaseHook):
                 logger.error(
                     f"Failed to initialize inference time predictor. Error: {e}"
                 )
+                raise e
+
+            # Phase 2b.3: optionally build the PD disagg backend.
+            try:
+                disagg_cfg = ConfigManager.get_disagg_config()
+                if disagg_cfg.enabled:
+                    from hisim.simulation.pd_runtime import build_backend_a
+
+                    C_SchedulerHook.PD_BACKEND = build_backend_a(
+                        model=model,
+                        base_sched_config=sched_config,
+                        disagg_config=disagg_cfg,
+                    )
+                    logger.info(
+                        "PD disaggregation enabled (backend=%s, prefill_replicas=%d, "
+                        "decode_replicas=%d).",
+                        disagg_cfg.backend,
+                        C_SchedulerHook.PD_BACKEND.prefill_pool_size(),
+                        C_SchedulerHook.PD_BACKEND.decode_pool_size(),
+                    )
+                else:
+                    C_SchedulerHook.PD_BACKEND = None
+            except Exception as e:
+                logger.error(f"Failed to initialize PD backend. Error: {e}")
                 raise e
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:

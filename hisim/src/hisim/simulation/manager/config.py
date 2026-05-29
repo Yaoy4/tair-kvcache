@@ -3,6 +3,7 @@ import json
 from hisim.spec import ModelInfo, AcceleratorInfo, DataType
 from hisim.simulation.types import PlatformConfig, SchedulerConfig
 from hisim.simulation.manager import Envs
+from hisim.simulation.pd_config import DisaggConfig
 from hisim.simulation.utils import (
     calc_kv_cache_cell_elems,
     calc_kv_cache_per_layer_elems,
@@ -202,3 +203,17 @@ class ConfigManager:
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")
+
+    @classmethod
+    def get_disagg_config(cls) -> DisaggConfig:
+        """Load the PD disaggregation config block from HISIM_CONFIG_PATH.
+
+        Returns a default (disabled) DisaggConfig when the block is missing.
+        """
+        # Imported lazily to keep the module dependency surface small.
+        from hisim.simulation.sim_args import _disagg_from_dict
+
+        with open(Envs.config_path()) as f:
+            config: dict = json.load(f)
+        return _disagg_from_dict(config.get("disagg", {}))
+
