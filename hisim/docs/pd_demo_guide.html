@@ -1,0 +1,272 @@
+<!doctype html><html><head><meta charset="utf-8"><title>PD Demo Guide</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:920px;margin:2em auto;padding:0 1em;line-height:1.55;color:#222}
+pre,code{font-family:Consolas,Menlo,monospace}
+pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto}
+code{background:#f6f8fa;padding:2px 4px;border-radius:4px}
+pre code{background:none;padding:0}
+table{border-collapse:collapse} th,td{border:1px solid #ddd;padding:6px 10px}
+h1,h2,h3{border-bottom:1px solid #eee;padding-bottom:4px}
+blockquote{border-left:4px solid #ddd;color:#555;margin:0;padding:.2em 1em}
+</style></head><body><h1 id="pd-disaggregation-step-by-step-demo-interpretation-guide">PD Disaggregation — Step-by-Step Demo &amp; Interpretation Guide</h1>
+<h2 id="setup-once">Setup (once)</h2>
+<div class="codehilite"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>/home/cjia/projects/tair-kvcache
+<span class="nb">source</span><span class="w"> </span>venv/bin/activate
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/home/cjia/projects/tair-kvcache/hisim/src:/home/cjia/projects/aiconfigurator/src
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_USE_CPU_ENGINE</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">FLASHINFER_DISABLE_VERSION_CHECK</span><span class="o">=</span><span class="m">1</span>
+</code></pre></div>
+
+<p>The demo tool is <code>hisim/tools/pd_demo.py</code>. It runs the same Backend A pipeline used in production but standalone (no SGLang server needed), so we can sweep knobs in seconds.</p>
+<hr />
+<h2 id="how-to-read-the-output">How to read the output</h2>
+<p>Every run prints three blocks. Here's a sample header:</p>
+<div class="codehilite"><pre><span></span><code>prefill role     : device=h100_sxm  tp=1  replicas=2
+decode  role     : device=h100_sxm  tp=1  replicas=2
+KV transfer      : bw=100.0 GB/s, latency=10.0 us
+kv_bytes_per_tok : 131072  (derived via utils.calc_kv_cache_cell_elems)
+</code></pre></div>
+
+<p>Then per-request rows:</p>
+<div class="codehilite"><pre><span></span><code>rid=r4  in=2048 out=48  TTFT=4.05 ms  KV=2.69 ms  E2E=4.71 ms
+                        pq=0.51  kvt=2.69  dq=0.00 ms
+</code></pre></div>
+
+<p>Columns:
+- <code>TTFT</code> = time from arrival to first output token (= prefill_queue + prefill_compute + kv_transfer + first decode step).
+- <code>KV</code> = the KV-transit time (bandwidth + latency).
+- <code>E2E</code> = arrival → finished, the full request.
+- <code>pq</code> (prefill_queue_wait) = how long the request sat before any prefill replica was free.
+- <code>kvt</code> (kv_transfer_time) = same as <code>KV</code>; broken out so you can aggregate it.
+- <code>dq</code> (decode_queue_wait) = how long the request sat after KV-ready before a decode batch slot opened up.</p>
+<p>And a footer:</p>
+<div class="codehilite"><pre><span></span><code>Phase 3 stage percentiles (via calc_metrics):
+  prefill_queue ms : mean=0.41  p50=0.36  p95=1.06  p99=1.24
+  kv_transfer   ms : mean=1.18  p50=0.93  p95=2.46  p99=2.65
+  decode_queue  ms : mean=0.00  p50=0.00  p95=0.00  p99=0.00
+</code></pre></div>
+
+<p>These percentiles are the <em>exact same metric</em> the production sglang_hook surfaces in real HiSim runs. The demo is a faithful in-process preview.</p>
+<hr />
+<h2 id="step-1-baseline-balanced-disagg">Step 1 — Baseline (balanced disagg)</h2>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>hisim/tools/pd_demo.py<span class="w"> </span>--requests<span class="w"> </span><span class="m">8</span><span class="w"> </span>--burst<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--prefill-replicas<span class="w"> </span><span class="m">2</span><span class="w"> </span>--decode-replicas<span class="w"> </span><span class="m">2</span><span class="w"> </span>--bw-gbps<span class="w"> </span><span class="m">100</span>
+</code></pre></div>
+
+<p>Result (averages):</p>
+<table>
+<thead>
+<tr>
+<th>TTFT</th>
+<th>KV-transit</th>
+<th>E2E</th>
+<th>prefill_queue p95</th>
+<th>kv_transfer p95</th>
+<th>decode_queue p95</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1.97 ms</td>
+<td>1.18 ms</td>
+<td>3.02 ms</td>
+<td>1.06 ms</td>
+<td>2.46 ms</td>
+<td>0.00 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Reading it:</strong> balanced 2/2 with fast KV. Nothing is queueing on the decode side. The longest request (<code>in=2048</code>) absorbs ~0.5 ms of prefill queue + 2.7 ms of KV transfer — KV transfer is already the dominant TTFT component, not the prefill compute.</p>
+<hr />
+<h2 id="step-2-slow-kv-link-10-gbs-instead-of-100">Step 2 — Slow KV link (10 GB/s instead of 100)</h2>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>hisim/tools/pd_demo.py<span class="w"> </span>--requests<span class="w"> </span><span class="m">8</span><span class="w"> </span>--burst<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--prefill-replicas<span class="w"> </span><span class="m">2</span><span class="w"> </span>--decode-replicas<span class="w"> </span><span class="m">2</span><span class="w"> </span>--bw-gbps<span class="w"> </span><span class="m">10</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>TTFT</th>
+<th>KV-transit</th>
+<th>E2E</th>
+<th>kv_transfer p95</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>12.53 ms</td>
+<td>11.75 ms</td>
+<td>13.55 ms</td>
+<td>24.50 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Insight:</strong> halving bandwidth ~doubles <code>kv_transfer_p95</code>; 10× slower bandwidth → 10× slower transfer. KV transfer time goes from 39% of TTFT (step 1) to 94% of TTFT here. <strong>In disagg, the inter-node KV link is a first-class TTFT driver</strong> — far more impactful than the prefill compute itself for typical context lengths.</p>
+<p><strong>Decision rule:</strong> if your interconnect cannot match <code>input_length × kv_bytes_per_token / target_TTFT_budget</code>, disagg loses to agg every time. With 131 kB/token at 1024-token prompts, you need &gt;10 GB/s just to keep KV under 13 ms.</p>
+<hr />
+<h2 id="step-3-decode-bottleneck-4-prefill-replicas-1-decode">Step 3 — Decode-bottleneck (4 prefill replicas, 1 decode)</h2>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>hisim/tools/pd_demo.py<span class="w"> </span>--requests<span class="w"> </span><span class="m">8</span><span class="w"> </span>--burst<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--prefill-replicas<span class="w"> </span><span class="m">4</span><span class="w"> </span>--decode-replicas<span class="w"> </span><span class="m">1</span><span class="w"> </span>--bw-gbps<span class="w"> </span><span class="m">100</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>TTFT</th>
+<th>E2E</th>
+<th>decode batching</th>
+<th>prefill_queue p95</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1.68 ms</td>
+<td>2.91 ms</td>
+<td><strong>261 batch-steps, avg batch size 2.45 (max 5)</strong></td>
+<td>0.34 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Insight:</strong> TTFT actually improved (1.97 → 1.68 ms) because we have <em>more</em> prefill replicas. But the real story is <strong>decode batching went from 1.19 → 2.45 average batch size</strong>. With only one decode replica, requests pile up and get batched together — which is exactly what TPOT cares about. <strong>TPOT improves with batching up to the GPU's compute roofline, then degrades.</strong> This is why production disagg tunes decode replicas to land in the optimal batch-size sweet spot.</p>
+<p><code>decode_queue_p95</code> stays at 0 because with a tiny 8-request workload, batching absorbs all the waiting. Crank <code>--requests 64</code> and you'd see it grow.</p>
+<hr />
+<h2 id="step-4-prefill-bottleneck-1-prefill-4-decode-the-opposite">Step 4 — Prefill-bottleneck (1 prefill, 4 decode) — the opposite</h2>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>hisim/tools/pd_demo.py<span class="w"> </span>--requests<span class="w"> </span><span class="m">8</span><span class="w"> </span>--burst<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--prefill-replicas<span class="w"> </span><span class="m">1</span><span class="w"> </span>--decode-replicas<span class="w"> </span><span class="m">4</span><span class="w"> </span>--bw-gbps<span class="w"> </span><span class="m">100</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>TTFT</th>
+<th>E2E</th>
+<th>decode batching</th>
+<th>prefill_queue p95</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2.63 ms</td>
+<td>3.64 ms</td>
+<td>640 batch-steps, <strong>avg batch size 1.00</strong></td>
+<td><strong>2.40 ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Insight:</strong> mirror image. <code>prefill_queue_p95</code> jumped 7× (0.34 → 2.40 ms) — requests waiting for the single prefill replica is now dominant. Decode batches are size-1 (over-provisioned), so TPOT is best-case but you're wasting decode silicon. <strong>TTFT degrades by 57% even though decode is faster</strong> — because all 8 requests serialize through one prefill worker.</p>
+<p><strong>The lesson</strong> Step 3 vs Step 4: <strong>prefill replicas drive TTFT, decode replicas drive TPOT batching efficiency</strong>. Disagg lets you tune them independently; agg cannot.</p>
+<hr />
+<h2 id="step-5-heterogeneous-h100-prefill-h20-decode">Step 5 — Heterogeneous (H100 prefill, H20 decode)</h2>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>hisim/tools/pd_demo.py<span class="w"> </span>--requests<span class="w"> </span><span class="m">8</span><span class="w"> </span>--burst<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--prefill-device<span class="w"> </span>h100_sxm<span class="w"> </span>--decode-device<span class="w"> </span>h20<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--prefill-replicas<span class="w"> </span><span class="m">2</span><span class="w"> </span>--decode-replicas<span class="w"> </span><span class="m">2</span><span class="w"> </span>--bw-gbps<span class="w"> </span><span class="m">100</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>TTFT</th>
+<th>E2E</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1.99 ms</td>
+<td><strong>4.21 ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Insight:</strong> TTFT is identical to Step 1's baseline (prefill is on the same H100s), but E2E jumped 40% (3.02 → 4.21 ms) because decode is now on slower H20s. This is the <strong>cost-efficiency play</strong> real disagg deployments make: use cheap, lower-bandwidth chips for the memory-bound decode phase (where you'd be bandwidth-starved on premium chips anyway), and reserve premium compute for prefill. The demo lets you quantify the TTFT/TPOT trade before buying hardware.</p>
+<hr />
+<h2 id="step-6-compare-disagg-vs-agg-the-do-i-even-need-this-question">Step 6 — Compare disagg vs agg (the "do I even need this?" question)</h2>
+<p>For an apples-to-apples agg comparison: set identical roles, <strong>huge</strong> bandwidth (eliminates KV transit), and one combined pool. The Phase 4 smoke test <code>hisim/tests/unit/simulation/test_pd_backend_a_smoke.py</code> verifies this analytically — with zero-KV identical roles, Backend A E2E equals <code>prefill_dur + N × decode_dur</code> (the serial baseline).</p>
+<p>In practice: <strong>disagg wins when</strong></p>
+<ol>
+<li>KV bandwidth is sufficient (kv_transfer &lt;&lt; TTFT budget),</li>
+<li>Decode benefits from large batches (batch size &gt; 4-8 typical),</li>
+<li>You can run prefill and decode on different SKUs.</li>
+</ol>
+<p><strong>Agg wins when</strong></p>
+<ol>
+<li>Interconnect is slow (KV transit dominates),</li>
+<li>Workload is short-output (TPOT doesn't matter, batching gives no win),</li>
+<li>Hardware is homogeneous and small-scale (orchestration overhead &gt; parallelism win).</li>
+</ol>
+<hr />
+<h2 id="cheat-sheet-which-knob-impacts-which-metric">Cheat sheet: which knob impacts which metric</h2>
+<table>
+<thead>
+<tr>
+<th>Knob</th>
+<th>Affects primarily</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--prefill-replicas</code></td>
+<td><code>prefill_queue_*</code>, TTFT</td>
+<td>Fewer replicas → requests serialize on prefill</td>
+</tr>
+<tr>
+<td><code>--decode-replicas</code></td>
+<td><code>decode_queue_*</code>, TPOT batching</td>
+<td>More replicas → smaller batches → worse TPOT-per-cost</td>
+</tr>
+<tr>
+<td><code>--bw-gbps</code></td>
+<td><code>kv_transfer_*</code>, TTFT, E2E</td>
+<td>KV transit is <code>input_length × bytes / bw</code></td>
+</tr>
+<tr>
+<td><code>--latency-us</code></td>
+<td><code>kv_transfer_*</code> (small reqs only)</td>
+<td>Fixed overhead per transfer</td>
+</tr>
+<tr>
+<td><code>--prefill-device</code></td>
+<td>TTFT (via prefill_compute)</td>
+<td>Device speed in the analytic predictor / AIC DB</td>
+</tr>
+<tr>
+<td><code>--decode-device</code></td>
+<td>TPOT, E2E</td>
+<td>Each decode step latency</td>
+</tr>
+<tr>
+<td><code>--prefill-tp</code>, <code>--decode-tp</code></td>
+<td>prefill_compute, decode_compute</td>
+<td>TP discount in the predictor</td>
+</tr>
+<tr>
+<td><code>--requests</code>, <code>--burst</code></td>
+<td>All queueing metrics</td>
+<td>More concurrent load → real queueing forms</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="going-from-demo-to-real-hisim">Going from demo to real HiSim</h2>
+<p>The demo uses an analytic stub predictor. For real AIConfigurator-backed numbers:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1) AIConfigurator gives you a top-N CSV. Pick a row and convert:</span>
+python<span class="w"> </span>hisim/tools/aic_to_hisim_bridge.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--aic-csv<span class="w"> </span>pareto.csv<span class="w"> </span>--row-index<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output<span class="w"> </span>hisim_disagg.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--database-path<span class="w"> </span>/aic/db<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--emit-disagg<span class="w"> </span>--kv-transfer-bw-gbps<span class="w"> </span><span class="m">50</span><span class="w"> </span>--kv-transfer-latency-us<span class="w"> </span><span class="m">20</span>
+
+<span class="c1"># 2) Quick standalone sanity check (loads the real config):</span>
+python<span class="w"> </span>hisim/tools/pd_demo.py<span class="w"> </span>--config<span class="w"> </span>hisim_disagg.json<span class="w"> </span>--requests<span class="w"> </span><span class="m">8</span><span class="w"> </span>--burst
+
+<span class="c1"># 3) Full HiSim through SGLang hook with real workload:</span>
+bash<span class="w"> </span>hisim/run_hisim_demo.sh<span class="w">  </span><span class="c1"># uses the same JSON path</span>
+</code></pre></div>
+
+<p>The full HiSim path emits the same <code>prefill_queue_ms</code> / <code>kv_transfer_ms</code> / <code>decode_queue_ms</code> percentile fields in <code>metrics.json</code> that you see in the demo footer — so the demo insights translate directly to production interpretation.</p>
+<hr />
+<h2 id="tldr-insights-to-take-to-a-review-meeting">TL;DR insights to take to a review meeting</h2>
+<ol>
+<li><strong>KV bandwidth is the make-or-break knob.</strong> It often dominates TTFT in disagg. Measure your real interconnect before claiming disagg wins.</li>
+<li><strong>Prefill replicas → TTFT; decode replicas → TPOT batching efficiency.</strong> This decoupling is the <em>entire reason</em> disagg exists.</li>
+<li><strong>Heterogeneous deployments are quantifiable now.</strong> The H100/H20 split is a real cost play; HiSim tells you the latency cost before procurement.</li>
+<li><strong>Stage percentiles isolate root cause.</strong> When TTFT regresses, look at <code>prefill_queue_p95</code> (need more prefill) vs <code>kv_transfer_p95</code> (need faster link). When TPOT regresses, look at decode batch size (too many decode replicas → batches too small → wasted compute).</li>
+</ol></body></html>

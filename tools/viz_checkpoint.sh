@@ -36,6 +36,8 @@ paths=(
   "hisim/tools/sweep_dashboard.py"
   "hisim/tests/unit/visualization"
   "hisim/tests/integration/test_sweep_plot_cli.py"
+  "hisim/tests/integration/test_sweep_tool_plot_wiring.py"
+  "hisim/tools/aic_topn_to_hisim_sweep.py"
 )
 
 existing=()

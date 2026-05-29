@@ -103,7 +103,41 @@ def _sidebar(default_csv: Path | None) -> tuple[Path | None, dict[str, Any]]:
     return csv_path, filters
 
 
-_DEVICE_OPTIONS = ("h100_sxm", "h200_sxm", "h20", "a100_sxm")
+_FALLBACK_DEVICE_OPTIONS = ("h100_sxm", "h200_sxm", "h20", "a100_sxm")
+
+
+def _discover_device_options() -> tuple[str, ...]:
+    """Auto-discover available devices from the AIConfigurator perf-db.
+
+    Looks under ``<aiconfigurator>/systems/data/`` for any sub-directory that
+    contains at least one backend sub-dir (vllm/sglang/trtllm/nccl/oneccl).
+    Falls back to a small hard-coded list if AIC isn't importable.
+
+    The result is intentionally backend-agnostic (a device may have only vLLM
+    data, e.g. b60). Callers needing real predictor numbers must still ensure
+    the chosen backend has data; the BackendA single-run path uses an
+    analytic predictor and treats the device name as a label.
+    """
+    try:
+        import aiconfigurator  # noqa: F401
+        from pathlib import Path as _P
+        root = _P(aiconfigurator.__file__).resolve().parent / "systems" / "data"
+        if not root.is_dir():
+            return _FALLBACK_DEVICE_OPTIONS
+        devs: list[str] = []
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            # Has at least one backend subdir → it's a device folder.
+            if any((entry / b).is_dir() for b in
+                   ("vllm", "sglang", "trtllm", "nccl", "oneccl")):
+                devs.append(entry.name)
+        return tuple(devs) if devs else _FALLBACK_DEVICE_OPTIONS
+    except Exception:
+        return _FALLBACK_DEVICE_OPTIONS
+
+
+_DEVICE_OPTIONS = _discover_device_options()
 
 
 def _single_run_section() -> dict[str, Any] | None:

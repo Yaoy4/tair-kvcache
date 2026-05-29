@@ -132,6 +132,11 @@ def _build_config_from_row(
     tp = _to_int(_row_get(row, f"{mode_prefix}tp"), 1)
     dp = _to_int(_row_get(row, f"{mode_prefix}dp"), 1)
     ep = _to_int(_row_get(row, f"{mode_prefix}moe_ep"), 1)
+    # AIC pareto rows carry both `moe_tp` and `moe_ep`. We forward both so
+    # HiSim's predictor builds a valid ModelConfig
+    # (tp_size * dp_size == moe_tp_size * ep_size). Fall back to tp for
+    # dense-style legacy rows that lack `moe_tp`.
+    moe_tp = _to_int(_row_get(row, f"{mode_prefix}moe_tp"), tp)
 
     row_system = _row_get(row, f"{mode_prefix}system", "system")
     row_backend_version = _row_get(row, f"{mode_prefix}version", "version")
@@ -164,6 +169,7 @@ def _build_config_from_row(
     scheduler["tp_size"] = tp
     scheduler["dp_size"] = dp
     scheduler["ep_size"] = ep
+    scheduler["moe_tp_size"] = moe_tp
 
     dtype = _normalize_dtype(args.data_type, _normalize_dtype(row_gemm))
     if dtype is not None:
@@ -345,6 +351,7 @@ def main() -> int:
         f"tp={out_cfg['scheduler'].get('tp_size')} "
         f"dp={out_cfg['scheduler'].get('dp_size')} "
         f"ep={out_cfg['scheduler'].get('ep_size')} "
+        f"moe_tp={out_cfg['scheduler'].get('moe_tp_size')} "
         f"dtype={out_cfg['scheduler'].get('data_type')} "
         f"kv_dtype={out_cfg['scheduler'].get('kv_cache_data_type')}"
     )

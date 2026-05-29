@@ -131,6 +131,7 @@ class ConfigManager:
         dp_size = scheduler_config.get("dp_size")
         if dp_size is None:
             dp_size = internal_config.dp_size
+        moe_tp_size = scheduler_config.get("moe_tp_size")
         dtype = scheduler_config.get("data_type")
         if dtype is not None:
             dtype = DataType(dtype.upper())
@@ -151,6 +152,7 @@ class ConfigManager:
             tp_size=tp_size,
             ep_size=ep_size,
             dp_size=dp_size,
+            moe_tp_size=moe_tp_size,
             # TODO: initialize with the runtime data type.
             data_type=dtype,
             kv_cache_data_type=kv_cache_dtype,

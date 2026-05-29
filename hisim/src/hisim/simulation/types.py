@@ -34,6 +34,10 @@ class SchedulerConfig:
     ep_size: int = 1
     dp_size: int = 1
     pp_size: int = 1
+    # MoE tensor-parallel size. AIConfigurator enforces
+    # tp_size * dp_size == moe_tp_size * ep_size. When left as None we fall
+    # back to tp_size (legacy dense-style behaviour).
+    moe_tp_size: Optional[int] = None
     max_running_requests: int = (1 << 31) - 1
     page_size: Optional[int] = None
 

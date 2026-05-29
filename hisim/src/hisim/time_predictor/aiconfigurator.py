@@ -306,12 +306,14 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
     model_path = model.model_path if getattr(model, "model_path", None) else model.name
     model_path = re.sub(r"_\d{14}$", "", model_path)
 
+    moe_tp_eff = getattr(sched_config, "moe_tp_size", None) or sched_config.tp_size
+
     model_config = ModelConfig(
         pp_size=sched_config.pp_size,
         tp_size=sched_config.tp_size,
-        moe_tp_size=sched_config.tp_size,  # FIXME
+        moe_tp_size=moe_tp_eff,
         moe_ep_size=sched_config.ep_size,
-        attention_dp_size=sched_config.dp_size,  # FIXME
+        attention_dp_size=sched_config.dp_size,
         gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
             sched_config.data_type, _GEMM_DEFAULT
         ),
