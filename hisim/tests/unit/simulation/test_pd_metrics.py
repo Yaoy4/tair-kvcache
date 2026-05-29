@@ -15,6 +15,7 @@ import pytest
 
 from hisim.simulation.pd_metrics import (
     compute_stage_durations,
+    flush_finished_states,
     populate_request_stats,
 )
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
@@ -177,3 +178,40 @@ def test_calc_metrics_stage_percentiles_zero_when_unpopulated():
     assert m["mean_prefill_queue_ms"] == 0.0
     assert m["p95_kv_transfer_ms"] == 0.0
     assert m["p99_decode_queue_ms"] == 0.0
+
+
+def test_flush_finished_states_populates_stats_and_gcs():
+    finished = _make_finished_state(
+        "r1", arrival=1.0, prefill_start=1.5, prefill_end=2.0,
+        kv_ready=2.25, decode_start=2.4,
+    )
+    in_flight = PDRequestState(
+        rid="r2", arrival_time=1.0, phase=RequestPhase.RUNNING_DECODE,
+    )
+    pd_states = {"r1": finished, "r2": in_flight}
+    stats_r1 = RequestStats(rid="r1")
+    stats_r2 = RequestStats(rid="r2")
+    request_stats = {"r1": stats_r1, "r2": stats_r2}
+
+    flushed = flush_finished_states(pd_states, request_stats)
+    assert flushed == 1
+    # r1 removed, r2 kept.
+    assert "r1" not in pd_states
+    assert "r2" in pd_states
+    # r1 stats populated; r2 untouched.
+    assert stats_r1.prefill_queue_wait == pytest.approx(0.5)
+    assert stats_r1.decode_queue_wait == pytest.approx(0.15)
+    assert stats_r2.prefill_queue_wait == 0.0
+
+
+def test_flush_finished_states_no_op_when_stats_missing():
+    """Hook may flush a state for which RequestStats was never created
+    (e.g. warmup); should drop PD state without raising."""
+    finished = _make_finished_state(
+        "r1", arrival=1.0, prefill_start=1.0, prefill_end=2.0,
+        kv_ready=2.0, decode_start=2.0,
+    )
+    pd_states = {"r1": finished}
+    flushed = flush_finished_states(pd_states, request_stats={})
+    assert flushed == 1
+    assert pd_states == {}

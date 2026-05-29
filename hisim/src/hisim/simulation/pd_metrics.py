@@ -45,3 +45,35 @@ def populate_request_stats(
     stats.prefill_queue_wait = d["prefill_queue_wait"]
     stats.kv_transfer_time = d["kv_transfer_time"]
     stats.decode_queue_wait = d["decode_queue_wait"]
+
+
+def flush_finished_states(
+    pd_states: dict,
+    request_stats: dict,
+) -> int:
+    """Move stage durations from FINISHED PDRequestStates onto matching
+    RequestStats entries and drop the PD state from `pd_states`.
+
+    Returns the number of states flushed. Callers should invoke this at
+    natural boundaries (after a decode step in the hook, at profile flush)
+    to keep PD_REQUEST_STATES from growing unbounded.
+
+    Both arguments are typed as `dict` rather than the concrete dataclasses
+    so unit tests can pass plain dicts without dragging SGLang in.
+    """
+    # Local import keeps this module SGLang-free at import time.
+    from hisim.simulation.pd_types import RequestPhase
+
+    finished_rids = [
+        rid
+        for rid, state in pd_states.items()
+        if getattr(state, "phase", None) == RequestPhase.FINISHED
+    ]
+    flushed = 0
+    for rid in finished_rids:
+        state = pd_states.pop(rid)
+        stats = request_stats.get(rid)
+        if stats is not None:
+            populate_request_stats(stats, state)
+        flushed += 1
+    return flushed

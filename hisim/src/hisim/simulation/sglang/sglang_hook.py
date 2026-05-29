@@ -951,6 +951,21 @@ class C_SchedulerHook(BaseHook):
                                 pd_latency,
                             )
                             predicted_latency = pd_latency
+                            # Phase 3: GC FINISHED states and copy stage
+                            # durations onto RequestStats so calc_metrics
+                            # can aggregate prefill/kv/decode-queue percentiles.
+                            from hisim.simulation.pd_metrics import (
+                                flush_finished_states,
+                            )
+
+                            flushed = flush_finished_states(
+                                C_SchedulerHook.PD_REQUEST_STATES,
+                                C_SchedulerHook.REQUEST_STATS,
+                            )
+                            if flushed:
+                                logger.debug(
+                                    "[PD] flushed %d finished states", flushed
+                                )
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
@@ -1026,6 +1041,16 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_profile(self, req, *args, **kwargs):
+            # Final safety-net flush so any FINISHED PD states whose decode
+            # tick fired after the last GC point still contribute stage
+            # percentiles to the metrics dump.
+            if C_SchedulerHook.PD_REQUEST_STATES:
+                from hisim.simulation.pd_metrics import flush_finished_states
+
+                flush_finished_states(
+                    C_SchedulerHook.PD_REQUEST_STATES,
+                    C_SchedulerHook.REQUEST_STATS,
+                )
             stats: list[RequestStats] = []
             for item in C_SchedulerHook.REQUEST_STATS.values():
                 if item.rid is not None and item.input_length > 0:
@@ -1076,6 +1101,7 @@ class C_SchedulerHook(BaseHook):
             StateManager.reset()
             C_SchedulerHook.REQUEST_STATS.clear()
             C_SchedulerHook.ITERATION_STATS.clear()
+            C_SchedulerHook.PD_REQUEST_STATES.clear()
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
