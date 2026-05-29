@@ -44,6 +44,12 @@ from hisim.simulation.pd_config import (
 )
 from hisim.simulation.pd_factory import DisaggPredictors, build_disagg
 from hisim.simulation.pd_backend_a import BackendA
+from hisim.simulation.pd_runtime import (
+    admit_prefill_batch_latency,
+    decode_batch_latency,
+    drain_kv_ready_and_admit_decode,
+    finalize_prefill_batch,
+)
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
 from hisim.simulation.sim_args import SimulationArgs
 
@@ -99,9 +105,15 @@ class _AnalyticPredictor:
     def predict_prefill_seconds(self, batch_tokens: int) -> float:
         return batch_tokens * self.prefill_us_per_tok * 1e-6
 
-    def predict_decode_seconds(self, batch_size: int) -> float:
-        # weak super-linearity; demo only
-        return self.decode_us_per_step * (1 + 0.05 * max(0, batch_size - 1)) * 1e-6
+    def predict_decode_seconds(self, batch_size: int, past_kv_length=0) -> float:
+        # weak super-linearity in batch + linear in total past_kv (demo only)
+        if isinstance(past_kv_length, int):
+            total_past_kv = past_kv_length * batch_size
+        else:
+            total_past_kv = sum(int(x) for x in past_kv_length)
+        base = self.decode_us_per_step * (1 + 0.05 * max(0, batch_size - 1))
+        # 0.001 us per past-kv token (cheap but visible at long context)
+        return (base + 0.001 * total_past_kv) * 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +227,7 @@ def run_demo(args) -> None:
         reqs.append(
             PDRequestState(
                 rid=f"r{i}",
-                arrival_time=i * 0.002,  # 2 ms apart
+                arrival_time=0.0 if args.burst else i * 0.002,
                 phase=RequestPhase.WAITING_PREFILL,
                 input_length=rng_inputs[i % len(rng_inputs)],
                 output_length=rng_outputs[i % len(rng_outputs)],
@@ -224,6 +236,7 @@ def run_demo(args) -> None:
 
     # ---- run a simple two-clock simulation via BackendA --------------------
     backend = BackendA(bundle)
+    decode_replicas = backend.decode_pool_size()
 
     # event queue of (time, seq, kind, payload)
     events = []
@@ -241,42 +254,82 @@ def run_demo(args) -> None:
     ttft = {}
     kv_seconds = {}
     e2e = {}
+    # In-flight per-replica batches: replica_idx -> list[PDRequestState]
+    decode_inflight: dict[int, list] = {}
+    decode_step_counts = 0
+    decode_batch_sizes: list[int] = []
+
+    def _maybe_launch_decode_tick(now):
+        """Pull WAITING_DECODE → RUNNING_DECODE, then split across all
+        currently-idle replicas, batching reqs on each one."""
+        nonlocal decode_step_counts
+        ctrl = backend.controller()
+        # Admit everything that is ready; replicas + batching gate throughput.
+        drain_kv_ready_and_admit_decode(backend, now=now, capacity=10**6)
+        # snapshot RUNNING_DECODE that aren't already in an in-flight batch
+        in_flight_rids = {r.rid for batch in decode_inflight.values() for r in batch}
+        pending = [
+            s for s in pd_states.values()
+            if s.phase == RequestPhase.RUNNING_DECODE and s.rid not in in_flight_rids
+        ]
+        if not pending:
+            return
+        # Round-robin pending across idle replicas
+        idle_replicas = [i for i in range(decode_replicas) if i not in decode_inflight]
+        if not idle_replicas:
+            return
+        buckets: list[list] = [[] for _ in idle_replicas]
+        for j, req in enumerate(pending):
+            buckets[j % len(idle_replicas)].append(req)
+        for slot, replica_idx in enumerate(idle_replicas):
+            batch = buckets[slot]
+            if not batch:
+                continue
+            # decode_batch_latency advances the earliest-free replica's clock;
+            # since we know which are idle, we can rely on that being one of them.
+            lat = decode_batch_latency(backend, batch, now)
+            end_t = now + lat
+            decode_inflight[replica_idx] = batch
+            decode_batch_sizes.append(len(batch))
+            decode_step_counts += 1
+            # First-token latency: record on first decode step
+            for r in batch:
+                if r.rid not in ttft:
+                    ttft[r.rid] = end_t - r.arrival_time
+            push(end_t, "decode_step_done", replica_idx)
+
+    # All-state index for lookup in the decode-tick helper.
+    pd_states = {r.rid: r for r in reqs}
 
     while events:
         now, _, kind, payload = heapq.heappop(events)
 
         if kind == "arrive":
             req = payload
-            _, end = backend.try_admit_prefill(req, now)
-            push(end, "prefill_done", req)
+            lat = admit_prefill_batch_latency(backend, [req], now)
+            end_t = now + lat
+            push(end_t, "prefill_done", [req])
 
         elif kind == "prefill_done":
-            req = payload
-            kv_ready = backend.compute_kv_ready_time(req, now)
-            kv_seconds[req.rid] = kv_ready - now
-            backend.on_prefill_done(req, now, kv_ready)
-            push(kv_ready, "kv_ready", req)
+            batch = payload
+            finalize_prefill_batch(backend, batch, now)
+            for req in batch:
+                kv_seconds[req.rid] = req.kv_ready_time - now
+                push(req.kv_ready_time, "kv_ready", req)
 
         elif kind == "kv_ready":
-            req = payload
-            backend.advance_to_kv_ready(req, now)
-            # admit one decode slot via the controller, then schedule one step
-            admitted = backend.controller().admit_decode(capacity=1, now=now)
-            if not admitted:
-                continue
-            req = admitted[0]
-            idx, end = backend.try_admit_decode_step(req, now)
-            ttft[req.rid] = (end - bundle.decode.predict_decode_seconds(1)) - req.arrival_time
-            push(end, "decode_step", (req, idx))
+            # Try to start (or join) a decode batch now that this req is ready.
+            _maybe_launch_decode_tick(now)
 
-        elif kind == "decode_step":
-            req, idx = payload
-            backend.on_decode_step_done(req, now)
-            if req.phase == RequestPhase.FINISHED:
-                e2e[req.rid] = now - req.arrival_time
-                continue
-            _, end = backend.try_admit_decode_step(req, now)
-            push(end, "decode_step", (req, idx))
+        elif kind == "decode_step_done":
+            replica_idx = payload
+            batch = decode_inflight.pop(replica_idx, [])
+            backend.on_decode_step_done_batch(batch, now)
+            for r in batch:
+                if r.phase == RequestPhase.FINISHED:
+                    e2e[r.rid] = now - r.arrival_time
+            # Schedule the next tick at `now` so any unfinished reqs continue
+            _maybe_launch_decode_tick(now)
 
     # ---- print -------------------------------------------------------------
     print("Per-request results:")
@@ -311,6 +364,13 @@ def run_demo(args) -> None:
         f"kv_transit={backend.controller().kv_transit_count()}  "
         f"decode_waiting={backend.controller().decode_waiting_count()}"
     )
+    if decode_batch_sizes:
+        avg_bs = sum(decode_batch_sizes) / len(decode_batch_sizes)
+        print(
+            f"decode batching    : {decode_step_counts} batch-steps, "
+            f"avg batch size={avg_bs:.2f}  "
+            f"(max={max(decode_batch_sizes)}, min={min(decode_batch_sizes)})"
+        )
     print("=" * 78)
     print(
         "Try:   --bw-gbps 25      (slower KV link → KV-transit grows)\n"
@@ -332,6 +392,8 @@ def main():
     p.add_argument("--decode-replicas", type=int, default=2)
     p.add_argument("--bw-gbps", type=float, default=100.0)
     p.add_argument("--latency-us", type=float, default=10.0)
+    p.add_argument("--burst", action="store_true",
+                   help="All requests arrive at t=0 (shows decode batching effects)")
     args = p.parse_args()
     run_demo(args)
 
