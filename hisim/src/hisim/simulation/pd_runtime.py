@@ -57,6 +57,138 @@ def build_backend_a(
 
 
 # ---------------------------------------------------------------------------
+# BackendB construction (Phase 5c.1)
+# ---------------------------------------------------------------------------
+
+
+# Type aliases for the BackendB build path.
+RoleFactory = Callable[[ModelInfo, SchedulerConfig, object], Callable[[], object]]
+"""Builds a picklable per-role predictor factory.
+
+Signature: ``(model, base_sched_config, role_cfg) -> picklable_factory``.
+The returned factory must be top-level / picklable so it can be sent into a
+spawned worker, and calling it must produce an object satisfying the
+adapter protocol used by ``BackendB`` workers (``predict_prefill_seconds`` /
+``predict_decode_seconds``).
+"""
+
+
+def _noop_bundle_predictor(*_args, **_kwargs):
+    """BackendB never calls the bundle's prefill/decode predictors — workers
+    build their own. Returning ``None`` here avoids a wasteful AIC DB load in
+    the parent process while still letting ``build_disagg`` populate the
+    transfer model, KV bytes-per-token, and replica counts.
+    """
+    return None
+
+
+def _default_role_factory(
+    model: ModelInfo,
+    base_sched_config: SchedulerConfig,
+    role,
+):
+    # Lazy import: AICPredictorFactory pulls hisim.spec which is heavy.
+    from hisim.simulation.pd_aic_factory import AICPredictorFactory
+
+    return AICPredictorFactory(
+        model=model,
+        base_sched_config=base_sched_config,
+        role=role,
+    )
+
+
+def build_backend_b(
+    *,
+    model: ModelInfo,
+    base_sched_config: SchedulerConfig,
+    disagg_config: DisaggConfig,
+    role_factory: Optional[RoleFactory] = None,
+    hw_factory: Optional[HWFactory] = None,
+    mp_context=None,
+):
+    """Build a BackendB from the given configs.
+
+    The returned BackendB is **not** started; the caller must invoke
+    ``.start()`` (and own ``.shutdown()`` cleanup — see 5c.2).
+
+    Raises ValueError if ``disagg_config.enabled`` is False.
+    """
+    # Lazy import to keep test envs that never touch multiprocessing clean.
+    from hisim.simulation.pd_backend_b import BackendB
+
+    bundle = build_disagg(
+        model=model,
+        base_sched_config=base_sched_config,
+        disagg_config=disagg_config,
+        predictor_factory=_noop_bundle_predictor,
+        hw_factory=hw_factory,
+    )
+    role_factory = role_factory or _default_role_factory
+    prefill_factory = role_factory(model, base_sched_config, disagg_config.prefill)
+    decode_factory = role_factory(model, base_sched_config, disagg_config.decode)
+    return BackendB(
+        bundle=bundle,
+        prefill_predictor_factory=prefill_factory,
+        decode_predictor_factory=decode_factory,
+        mp_context=mp_context,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backend dispatcher (Phase 5c.1)
+# ---------------------------------------------------------------------------
+
+
+def build_pd_backend(
+    *,
+    model: ModelInfo,
+    base_sched_config: SchedulerConfig,
+    disagg_config: DisaggConfig,
+    predictor_factory: Optional[PredictorFactory] = None,
+    hw_factory: Optional[HWFactory] = None,
+    role_factory: Optional[RoleFactory] = None,
+    mp_context=None,
+) -> PDBackendProtocol:
+    """Build the PD backend selected by ``disagg_config.backend``.
+
+    * ``single_process`` → :func:`build_backend_a` (uses ``predictor_factory``).
+    * ``two_process``    → :func:`build_backend_b` (uses ``role_factory``).
+
+    The returned backend is not started — caller owns lifecycle. This split
+    keeps ``sglang_hook`` agnostic to which backend was selected, while
+    letting it call ``.start()`` only when needed (BackendB).
+
+    Raises ValueError if ``disagg_config.enabled`` is False or
+    ``disagg_config.backend`` is unrecognized.
+    """
+    if not disagg_config.enabled:
+        raise ValueError("build_pd_backend called with DisaggConfig.enabled=False")
+
+    backend_name = disagg_config.backend
+    if backend_name == "single_process":
+        return build_backend_a(
+            model=model,
+            base_sched_config=base_sched_config,
+            disagg_config=disagg_config,
+            predictor_factory=predictor_factory,
+            hw_factory=hw_factory,
+        )
+    if backend_name == "two_process":
+        return build_backend_b(
+            model=model,
+            base_sched_config=base_sched_config,
+            disagg_config=disagg_config,
+            role_factory=role_factory,
+            hw_factory=hw_factory,
+            mp_context=mp_context,
+        )
+    raise ValueError(
+        f"unknown disagg.backend: {backend_name!r} "
+        f"(expected 'single_process' or 'two_process')"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Hook glue (Phase 2b.4a)
 # ---------------------------------------------------------------------------
 

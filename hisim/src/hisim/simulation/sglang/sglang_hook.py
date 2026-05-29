@@ -640,17 +640,26 @@ class C_SchedulerHook(BaseHook):
                 )
                 raise e
 
-            # Phase 2b.3: optionally build the PD disagg backend.
+            # Phase 2b.3 / 5c.1: optionally build the PD disagg backend.
+            # Dispatches on disagg.backend ("single_process" → BackendA,
+            # "two_process" → BackendB). BackendB workers are spawned here.
             try:
                 disagg_cfg = ConfigManager.get_disagg_config()
                 if disagg_cfg.enabled:
-                    from hisim.simulation.pd_runtime import build_backend_a
+                    from hisim.simulation.pd_runtime import build_pd_backend
 
-                    C_SchedulerHook.PD_BACKEND = build_backend_a(
+                    backend = build_pd_backend(
                         model=model,
                         base_sched_config=sched_config,
                         disagg_config=disagg_cfg,
                     )
+                    # BackendB needs an explicit start() to spawn workers;
+                    # BackendA has no lifecycle. 5c.2 will own atexit/profile
+                    # cleanup; for now the existing wrapped_profile path
+                    # remains the shutdown hook.
+                    if disagg_cfg.backend == "two_process":
+                        backend.start()
+                    C_SchedulerHook.PD_BACKEND = backend
                     logger.info(
                         "PD disaggregation enabled (backend=%s, prefill_replicas=%d, "
                         "decode_replicas=%d).",
