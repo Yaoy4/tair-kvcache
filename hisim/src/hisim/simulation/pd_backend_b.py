@@ -52,7 +52,8 @@ class _DecodeJob:
 @dataclass(frozen=True)
 class _Result:
     job_id: int
-    duration: float
+    duration: float = 0.0
+    error: Optional[str] = None  # repr of exception type + str + traceback
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,10 @@ class _Shutdown:
 _SHUTDOWN = _Shutdown()
 
 
+class BackendBWorkerError(RuntimeError):
+    """Raised in the parent when a BackendB worker reports an exception."""
+
+
 # ---------------------------------------------------------------------------
 # Worker entry points — must be top-level so multiprocessing 'spawn' can
 # import them in the child interpreter.
@@ -70,26 +75,54 @@ _SHUTDOWN = _Shutdown()
 
 
 def _prefill_worker_main(predictor_factory, in_q, out_q):
-    predictor = predictor_factory()
+    import traceback
+    try:
+        predictor = predictor_factory()
+    except BaseException as e:
+        # Boot failed. Forward error on the NEXT job request so the parent
+        # surfaces it instead of blocking forever.
+        err = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        while True:
+            msg = in_q.get()
+            if isinstance(msg, _Shutdown):
+                return
+            out_q.put(_Result(job_id=msg.job_id, error=err))
     while True:
         msg = in_q.get()
         if isinstance(msg, _Shutdown):
             return
-        dur = predictor.predict_prefill_seconds(msg.batch_tokens)
-        out_q.put(_Result(job_id=msg.job_id, duration=float(dur)))
+        try:
+            dur = predictor.predict_prefill_seconds(msg.batch_tokens)
+            out_q.put(_Result(job_id=msg.job_id, duration=float(dur)))
+        except BaseException as e:
+            err = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            out_q.put(_Result(job_id=msg.job_id, error=err))
 
 
 def _decode_worker_main(predictor_factory, in_q, out_q):
-    predictor = predictor_factory()
+    import traceback
+    try:
+        predictor = predictor_factory()
+    except BaseException as e:
+        err = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        while True:
+            msg = in_q.get()
+            if isinstance(msg, _Shutdown):
+                return
+            out_q.put(_Result(job_id=msg.job_id, error=err))
     while True:
         msg = in_q.get()
         if isinstance(msg, _Shutdown):
             return
-        dur = predictor.predict_decode_seconds(
-            batch_size=msg.batch_size,
-            past_kv_length=list(msg.past_kv),
-        )
-        out_q.put(_Result(job_id=msg.job_id, duration=float(dur)))
+        try:
+            dur = predictor.predict_decode_seconds(
+                batch_size=msg.batch_size,
+                past_kv_length=list(msg.past_kv),
+            )
+            out_q.put(_Result(job_id=msg.job_id, duration=float(dur)))
+        except BaseException as e:
+            err = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            out_q.put(_Result(job_id=msg.job_id, error=err))
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +254,22 @@ class BackendB:
         if not self._started:
             raise RuntimeError("BackendB.start() must be called before use")
 
+    def _await_result(
+        self, worker: _WorkerHandle, expected_job_id: int, *, role: str, idx: int
+    ) -> _Result:
+        """Block until the worker returns; re-raise worker exceptions."""
+        res = worker.out_q.get()
+        if res.job_id != expected_job_id:
+            raise RuntimeError(
+                f"{role} worker {idx} returned job {res.job_id}, "
+                f"expected {expected_job_id}"
+            )
+        if res.error is not None:
+            raise BackendBWorkerError(
+                f"{role} worker {idx} raised:\n{res.error}"
+            )
+        return res
+
     # ---- scheduling primitives ----
     def try_admit_prefill(
         self, req: PDRequestState, now: float
@@ -230,11 +279,7 @@ class BackendB:
         start = max(now, worker.busy_until)
         job_id = self._next_id()
         worker.in_q.put(_PrefillJob(job_id=job_id, batch_tokens=req.input_length))
-        res = worker.out_q.get()
-        if res.job_id != job_id:
-            raise RuntimeError(
-                f"prefill worker {idx} returned job {res.job_id}, expected {job_id}"
-            )
+        res = self._await_result(worker, job_id, role="prefill", idx=idx)
         end = start + res.duration
         worker.busy_until = end
         self._controller.on_request_arrival(req, now)
@@ -268,11 +313,7 @@ class BackendB:
                 past_kv=(int(req.current_past_kv_length),),
             )
         )
-        res = worker.out_q.get()
-        if res.job_id != job_id:
-            raise RuntimeError(
-                f"decode worker {idx} returned job {res.job_id}, expected {job_id}"
-            )
+        res = self._await_result(worker, job_id, role="decode", idx=idx)
         end = start + res.duration
         worker.busy_until = end
         return idx, end
@@ -290,11 +331,7 @@ class BackendB:
         worker.in_q.put(
             _DecodeJob(job_id=job_id, batch_size=len(reqs), past_kv=past_kv)
         )
-        res = worker.out_q.get()
-        if res.job_id != job_id:
-            raise RuntimeError(
-                f"decode worker {idx} returned job {res.job_id}, expected {job_id}"
-            )
+        res = self._await_result(worker, job_id, role="decode", idx=idx)
         end = start + res.duration
         worker.busy_until = end
         return idx, end
