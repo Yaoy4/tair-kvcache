@@ -41,6 +41,7 @@ paths=(
   "hisim/src/hisim/simulation/pd_config.py"
   "hisim/src/hisim/simulation/pd_factory.py"
   "hisim/src/hisim/simulation/pd_backend_a.py"
+  "hisim/src/hisim/simulation/pd_backend_b.py"
   "hisim/src/hisim/simulation/pd_aic_adapter.py"
   "hisim/src/hisim/simulation/pd_runtime.py"
   "hisim/src/hisim/simulation/pd_metrics.py"
