@@ -51,6 +51,12 @@ from hisim.simulation.pd_runtime import (
     finalize_prefill_batch,
 )
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
+from hisim.simulation.pd_metrics import (
+    compute_stage_durations,
+    populate_request_stats,
+)
+from hisim.simulation.types import RequestStats
+from hisim.simulation.utils import calc_metrics
 from hisim.simulation.sim_args import SimulationArgs
 
 
@@ -122,10 +128,15 @@ class _AnalyticPredictor:
 
 
 def _format_row(req: PDRequestState, ttft, kv_ms, e2e) -> str:
+    d = compute_stage_durations(req)
     return (
         f"  rid={req.rid:<6} in={req.input_length:<5} out={req.output_length:<4} "
         f"TTFT={ttft*1000:7.2f} ms   KV={kv_ms:6.2f} ms   "
-        f"E2E={e2e*1000:8.2f} ms   phase={req.phase.name}"
+        f"E2E={e2e*1000:8.2f} ms   "
+        f"pq={d['prefill_queue_wait']*1000:6.2f} "
+        f"kvt={d['kv_transfer_time']*1000:6.2f} "
+        f"dq={d['decode_queue_wait']*1000:6.2f} ms   "
+        f"phase={req.phase.name}"
     )
 
 
@@ -370,6 +381,49 @@ def run_demo(args) -> None:
             f"decode batching    : {decode_step_counts} batch-steps, "
             f"avg batch size={avg_bs:.2f}  "
             f"(max={max(decode_batch_sizes)}, min={min(decode_batch_sizes)})"
+        )
+
+    # Phase 3 stage percentiles: feed PDRequestStates into RequestStats via
+    # populate_request_stats, then aggregate through calc_metrics. This is
+    # the same path the sglang_hook now uses to surface PD stage metrics.
+    completed = [r for r in reqs if r.phase == RequestPhase.FINISHED]
+    if completed:
+        stats_list = []
+        for r in completed:
+            tpot = (e2e[r.rid] - ttft[r.rid]) / max(1, r.output_length - 1)
+            s = RequestStats(
+                rid=r.rid,
+                last_event_time=r.arrival_time + e2e[r.rid],
+                input_length=r.input_length,
+                output_length=r.output_length,
+                queue_start=r.arrival_time,
+                queue_end=r.arrival_time,
+                created_time=r.arrival_time,
+                gen_token_latencies=[ttft[r.rid]]
+                + [tpot] * max(0, r.output_length - 1),
+            )
+            populate_request_stats(s, r)
+            stats_list.append(s)
+        m = calc_metrics(stats_list)
+        print("-" * 78)
+        print("Phase 3 stage percentiles (via calc_metrics):")
+        print(
+            f"  prefill_queue ms : mean={m['mean_prefill_queue_ms']:.2f}  "
+            f"p50={m['p50_prefill_queue_ms']:.2f}  "
+            f"p95={m['p95_prefill_queue_ms']:.2f}  "
+            f"p99={m['p99_prefill_queue_ms']:.2f}"
+        )
+        print(
+            f"  kv_transfer   ms : mean={m['mean_kv_transfer_ms']:.2f}  "
+            f"p50={m['p50_kv_transfer_ms']:.2f}  "
+            f"p95={m['p95_kv_transfer_ms']:.2f}  "
+            f"p99={m['p99_kv_transfer_ms']:.2f}"
+        )
+        print(
+            f"  decode_queue  ms : mean={m['mean_decode_queue_ms']:.2f}  "
+            f"p50={m['p50_decode_queue_ms']:.2f}  "
+            f"p95={m['p95_decode_queue_ms']:.2f}  "
+            f"p99={m['p99_decode_queue_ms']:.2f}"
         )
     print("=" * 78)
     print(
