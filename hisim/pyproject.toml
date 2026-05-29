@@ -12,3 +12,10 @@ dependencies = [
     "xgboost",
     "aiconfigurator @ git+https://github.com/ai-dynamo/aiconfigurator.git@h20e-higher-acc"
 ]
+
+[project.optional-dependencies]
+viz = [
+    "pandas>=2.0",
+    "plotly>=5.0",
+    "jinja2>=3.0",
+]
