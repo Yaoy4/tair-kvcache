@@ -17,6 +17,7 @@ class PDRequestState:
     rid: str
     arrival_time: float
     phase: RequestPhase = RequestPhase.WAITING_PREFILL
+    input_length: int = 0
     prefill_start_time: Optional[float] = None
     prefill_end_time: Optional[float] = None
     kv_ready_time: Optional[float] = None
