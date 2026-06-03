@@ -1,5 +1,6 @@
 import torch
 import time
+import numpy as np
 from dataclasses import asdict
 from collections import defaultdict
 import json
@@ -911,6 +912,55 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request: nothing to do
                         pass
+                # PD disaggregation: simulate KV cache transfer latency after prefill.
+                # Clock is advanced AFTER request stats so that TTFT = pure prefill time.
+                # The transfer time will be absorbed into the first decode ITL, making
+                # gen_token_latencies[1] = kv_transfer_dur + first_decode_time.
+                #
+                # Chunked prefill: only requests completing their FINAL chunk
+                # (is_chunked == 0) should trigger KV transfer. Mid-chunk requests
+                # (is_chunked == 1) are still accumulating KV; transfer is deferred.
+                kv_transfer_dur = 0.0
+                sched_config = ConfigManager.get_cached_scheduler_config()
+                if (
+                    sched_config is not None
+                    and sched_config.pd_disagg_enabled
+                    and C_SchedulerHook.HISIM_BATCH is not None
+                    and not C_SchedulerHook.HISIM_BATCH.is_empty()
+                    and C_SchedulerHook.HISIM_BATCH.is_prefill()
+                ):
+                    # Count tokens only for requests completing their final prefill.
+                    # Cross-reference SGLang reqs (has is_chunked) with HISIM_BATCH
+                    # reqs (has input_length). They are built in the same order.
+                    hisim_reqs = C_SchedulerHook.HISIM_BATCH.reqs
+                    if len(batch.reqs) == len(hisim_reqs):
+                        final_prefill_tokens = sum(
+                            hreq.input_length
+                            for sreq, hreq in zip(batch.reqs, hisim_reqs)
+                            if sreq.is_chunked == 0 and hreq.input_length > 1
+                        )
+                    else:
+                        # Fallback when sizes diverge (should not happen in practice)
+                        final_prefill_tokens = C_SchedulerHook.HISIM_BATCH.num_context_tokens
+
+                    if final_prefill_tokens > 0:
+                        if not sched_config.pd_kv_transfer_bandwidth_gb:
+                            logger.warning(
+                                "pd_disagg_enabled is True but pd_kv_transfer_bandwidth_gb "
+                                "is not set. KV transfer latency will not be simulated."
+                            )
+                        else:
+                            kv_bytes_per_token = ConfigManager.get_kv_cache_bytes()
+                            kv_transfer_dur = final_prefill_tokens * kv_bytes_per_token / (
+                                sched_config.pd_kv_transfer_bandwidth_gb * 1e9
+                            )
+                            StateManager.step_global_clock(kv_transfer_dur)
+                            logger.debug(
+                                f"PD disagg KV transfer: {final_prefill_tokens} tokens, "
+                                f"{kv_bytes_per_token}B/token, "
+                                f"{sched_config.pd_kv_transfer_bandwidth_gb}GB/s -> "
+                                f"{kv_transfer_dur * 1000:.3f}ms"
+                            )
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
@@ -918,6 +968,7 @@ class C_SchedulerHook(BaseHook):
                         "forward_latency": current_inference_dur,
                         "l2_load_latency": hicache_l2_load_dur,
                         "l2_backup_latency": hicache_l2_backup_dur,
+                        "kv_transfer_latency": kv_transfer_dur,
                     }
                 )
             C_SchedulerHook.LAST_CPU_TS = time.time()
@@ -951,6 +1002,22 @@ class C_SchedulerHook(BaseHook):
 
                 metrics = calc_metrics(metrics_stats)
                 metrics["time_cost"] = time.time() - C_SchedulerHook.LAST_FLUSH_TS
+                # Aggregate KV transfer latency across all iterations
+                kv_transfer_latencies = [
+                    item.get("kv_transfer_latency", 0.0)
+                    for item in C_SchedulerHook.ITERATION_STATS
+                    if item.get("kv_transfer_latency", 0.0) > 0.0
+                ]
+                metrics["mean_kv_transfer_ms"] = (
+                    float(np.mean(kv_transfer_latencies)) * 1000
+                    if kv_transfer_latencies
+                    else 0.0
+                )
+                metrics["total_kv_transfer_ms"] = (
+                    float(np.sum(kv_transfer_latencies)) * 1000
+                    if kv_transfer_latencies
+                    else 0.0
+                )
 
                 try:
                     with open(f"{output_dir}/metrics.json", "w") as f:

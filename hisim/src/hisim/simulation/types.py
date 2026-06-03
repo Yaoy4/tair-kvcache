@@ -41,6 +41,12 @@ class SchedulerConfig:
     backend_name: str = "sglang"
     backend_version: Optional[str] = None
 
+    # PD disaggregation
+    pd_disagg_enabled: bool = False
+    # KV cache network transfer bandwidth between P and D nodes in GB/s.
+    # Required when pd_disagg_enabled is True.
+    pd_kv_transfer_bandwidth_gb: Optional[float] = None
+
 
 class MockSimulationMode(Enum):
     BLOCKING = "BLOCKING"

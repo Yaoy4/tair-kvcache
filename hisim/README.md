@@ -190,6 +190,13 @@ The config file is a JSON with three main sections:
 - **`scheduler`**: Parallelism and backend metadata  
   > ⚠️ **Note**: Multi-GPU parallelism (TP/EP) should **not** be configured at the framework level during server launch. Instead, specify `tp_size` and `ep_size` here—the predictor will simulate parallel execution overhead accordingly.
   - When `predictor.name = "aiconfigurator"`, `backend_version` must be provided.
+  - `pd_disagg_enabled` *(optional, default `false`)*: Enable Prefill-Decode disaggregation simulation. When enabled, after each prefill batch completes, the KV cache P→D transfer latency is injected into the global clock. This is absorbed into the first decode ITL (`gen_token_latencies[1]`); TTFT remains equal to pure prefill time.
+  - `pd_kv_transfer_bandwidth_gb` *(optional)*: P→D KV transfer bandwidth in GB/s. Required when `pd_disagg_enabled = true`; a warning is emitted and no transfer latency is simulated if left unset.
+
+  > **Metric semantics in PD disagg mode**  
+  > - `TTFT` = pure prefill time (KV transfer is NOT included)  
+  > - `ITL[0]` (first decode token latency) = KV transfer time + first decode time  
+  > - `mean_kv_transfer_ms` and `total_kv_transfer_ms` are added to `metrics.json`
 
 **Example Config**:
 ```json

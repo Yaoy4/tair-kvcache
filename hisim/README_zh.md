@@ -179,6 +179,13 @@ Max ITL (ms):                            21.47
 - `scheduler`：并行/数据类型/后端信息  
    > ⚠️ **注意**: 为了简化仿真流程，启动推理服务时**无需**设置多卡并行；并行方式（TP/EP）通过该配置指定，并由预测器模拟并行时间。
   - 当 `predictor.name=aiconfigurator` 时，需额外提供 `backend_version`。
+  - `pd_disagg_enabled`（可选，默认 `false`）：是否启用 PD 分离仿真。启用后，每次 prefill batch 完成后会模拟一次 KV Cache 的 P→D 传输，传输时延加入全局时钟，体现在首个 decode ITL（即 `gen_token_latencies[1]`）中，TTFT 保持不变（= 纯 prefill 时间）。
+  - `pd_kv_transfer_bandwidth_gb`（可选）：PD 分离时 P→D 的 KV 传输带宽（GB/s）。启用 `pd_disagg_enabled` 时必须设置，否则会打出警告且不做传输时延仿真。
+
+  > **PD 分离模式下的指标语义**  
+  > - `TTFT` = 纯 prefill 时间（不含 KV 传输）  
+  > - `ITL[0]`（首个 decode token 时延）= KV 传输时间 + 首次 decode 时间  
+  > - `mean_kv_transfer_ms` / `total_kv_transfer_ms` 会额外输出到 `metrics.json`
 
 **示例**:
 ```json

@@ -176,8 +176,16 @@ class ConfigManager:
             page_size=internal_config.page_size,
             backend_name=backend,
             backend_version=scheduler_config.get("backend_version"),
+            pd_disagg_enabled=scheduler_config.get("pd_disagg_enabled", False),
+            pd_kv_transfer_bandwidth_gb=scheduler_config.get(
+                "pd_kv_transfer_bandwidth_gb"
+            ),
         )
         return sched_config
+
+    @classmethod
+    def get_cached_scheduler_config(cls) -> "SchedulerConfig | None":
+        return cls._scheduler_config
 
     @classmethod
     def _parse_server_args(cls, server_args: dict, backend: str) -> SchedulerConfig:
