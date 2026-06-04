@@ -92,10 +92,10 @@ export PYTHONPATH=/home/cjia/projects/aiconfigurator/src
 python -m aiconfigurator.cli.main default \
   --model        <hf_model_or_path> \
   --total-gpus   <N> \
-  --system       <device_name>         # e.g. h200_sxm, b60
+  --system       <device_name>         # e.g. h100_sxm, h200_sxm
   --backend      <trtllm|sglang|vllm|auto> \
   --backend-version <ver> \
-  --database-mode HYBRID \
+  --database-mode SILICON \
   --top-n        5 \
   --isl 4000 --osl 500 --ttft 600 --tpot 50 \
   --save-dir     <out_dir>
@@ -110,11 +110,7 @@ Output (use `pareto.csv` as the AIC top-N CSV for §5b):
 └── …
 ```
 
-#### Example: 8× B60, Qwen3-30B-A3B-FP8, SGLang
-
-> Prerequisite: `aiconfigurator/src/aiconfigurator/systems/data/b60/sglang`
-> symlink → `b60/vllm` (B60 ships with vLLM perf data only; reusing it for
-> SGLang is acceptable for relative ranking).
+#### Example: 8x H100, Qwen3-30B-A3B-FP8, SGLang
 
 ```bash
 cd /home/cjia/projects && source tair-kvcache/venv/bin/activate
@@ -123,13 +119,13 @@ export PYTHONPATH=/home/cjia/projects/aiconfigurator/src
 python -m aiconfigurator.cli.main default \
   --model Qwen/Qwen3-30B-A3B-FP8 \
   --total-gpus 8 \
-  --system b60 \
+  --system h100_sxm \
   --backend sglang \
   --backend-version 0.12.0 \
-  --database-mode HYBRID \
+  --database-mode SILICON \
   --top-n 5 \
   --isl 4000 --osl 500 --ttft 600 --tpot 50 \
-  --save-dir /home/cjia/projects/tair-kvcache/hisim/output/aic_b60_qwen30b
+  --save-dir /home/cjia/projects/tair-kvcache/hisim/output/aic_h100_qwen30b
 ```
 
 If you don't have any AIC CSV yet, you can smoke-test §5b with the AIC CSV
@@ -150,7 +146,7 @@ python hisim/tools/aic_topn_to_hisim_sweep.py \
   --request-rate  4
 ```
 
-#### Example continued: B60 Qwen3-30B-A3B-FP8
+#### Example continued: H100 Qwen3-30B-A3B-FP8
 
 ```bash
 cd /home/cjia/projects/tair-kvcache
@@ -158,11 +154,11 @@ export SGLANG_USE_CPU_ENGINE=1 FLASHINFER_DISABLE_VERSION_CHECK=1
 export PYTHONPATH=/home/cjia/projects/tair-kvcache/hisim/src:/home/cjia/projects/aiconfigurator/src
 
 python hisim/tools/aic_topn_to_hisim_sweep.py \
-  --aic-csv   hisim/output/aic_b60_qwen30b/pareto.csv \
+  --aic-csv   hisim/output/aic_h100_qwen30b/pareto.csv \
   --top-n     5 \
-  --output-dir hisim/output/my_b60_sweep \
+  --output-dir hisim/output/my_h100_sweep \
   --model-path Qwen/Qwen3-30B-A3B-FP8 \
-  --predictor-device-name b60 \
+  --predictor-device-name h100_sxm \
   --backend-version 0.12.0 \
   --data-type fp8 \
   --kv-cache-data-type fp8 \
@@ -170,6 +166,35 @@ python hisim/tools/aic_topn_to_hisim_sweep.py \
   --cache-scenario no_cache \
   --request-rate 4
 ```
+
+#### Tight-SLA fallback: force agg vs disagg matrix on H100
+
+If AIC returns only aggregated rows under your SLA (for example, disagg is
+filtered out of Pareto), run the sweep from an agg CSV and synthesize disagg
+replica splits in HiSim.
+
+```bash
+cd /home/cjia/projects/tair-kvcache
+export SGLANG_USE_CPU_ENGINE=1 FLASHINFER_DISABLE_VERSION_CHECK=1
+export PYTHONPATH=/home/cjia/projects/tair-kvcache/hisim/src:/home/cjia/projects/aiconfigurator/src
+
+python hisim/tools/aic_topn_to_hisim_sweep.py \
+  --aic-csv hisim/output/aic_h100_qwen30b/pareto_agg.csv \
+  --top-n 5 \
+  --output-dir hisim/output/my_h100_sweep_matrix \
+  --model-path Qwen/Qwen3-30B-A3B-FP8 \
+  --predictor-device-name h100_sxm \
+  --backend-version 0.12.0 \
+  --database-mode SILICON \
+  --cache-scenario no_cache \
+  --request-rate 4 \
+  --synth-disagg-from-agg \
+  --synth-disagg-profiles 1:7,2:6,4:4,6:2,7:1 \
+  --disagg-backend single_process
+```
+
+This produces one agg baseline plus multiple disagg rows per AIC row, so the
+dashboard can render a meaningful PD heatmap and Pareto/throughput comparison.
 
 Useful flags:
 
@@ -182,12 +207,10 @@ Useful flags:
 - `--no-plot` — skip the HTML auto-report (default it writes
   `<output-dir>/sweep_report.html`).
 
-> **B60 caveat**: the B60 perf db is vLLM-only. Reusing it for SGLang via the
-> `b60/sglang → b60/vllm` symlink works for **relative ranking and what-if**
-> but not for absolute SLO certification. Pick `--data-type fp8` for
-> Qwen3-30B-A3B-FP8; B60 MoE coverage is only `(2048,768,topk=8,128 experts)`
-> and `(2048,1408,topk=4,60 experts)`, so other MoE models will hit
-> extrapolation.
+> **H100 note**: if your SLA is very tight, AIC Pareto may still choose only
+> agg rows. In that case, keep the same AIC output and run HiSim with
+> `--synth-disagg-from-agg` to create PD disagg candidates for feasibility
+> analysis under the same workload assumptions.
 
 ### 5c. Inspect output
 

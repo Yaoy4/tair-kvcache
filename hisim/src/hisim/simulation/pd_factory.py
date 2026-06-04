@@ -59,14 +59,42 @@ def calc_kv_bytes_per_token(
     return int(cell_elems * _as_dtype(kv_cache_dtype).bytes)
 
 
+_HW_FACTORY_WARNED: set[str] = set()
+
+
 def _default_hw_factory(name: str):
     hw = AcceleratorInfo.find_by_hw_name(name)
-    if hw is None:
+    if hw is not None:
+        return hw
+
+    # Some perf-db device names (for example "b60" or any newly-added device
+    # under aiconfigurator/systems/data/) may not be present in HiSim's static
+    # accelerator registry. For predictor-only simulation, fall back to a known
+    # hw profile and preserve the requested device name so AIConfigurator still
+    # queries the intended perf database. To register the device first-class in
+    # HiSim, add it to hisim/src/hisim/spec/accelerator/info.py.
+    all_hws = AcceleratorInfo.list_all_hws()
+    fallback = AcceleratorInfo.find_by_hw_name("h20_sxm")
+    if fallback is None and all_hws:
+        fallback = next(iter(all_hws.values()))
+    if fallback is None:
         raise ValueError(
             f"Unknown accelerator name {name!r}. Available: "
-            f"{sorted(AcceleratorInfo.list_all_hws().keys())}"
+            f"{sorted(all_hws.keys())}"
         )
-    return hw
+    if name not in _HW_FACTORY_WARNED:
+        _HW_FACTORY_WARNED.add(name)
+        import warnings
+        warnings.warn(
+            f"Accelerator {name!r} not in HiSim AcceleratorInfo registry;"
+            f" using {fallback.name!r} profile as hw label. AIC perf-db lookup"
+            f" still uses {name!r}. To remove this warning, register the"
+            f" device in hisim/spec/accelerator/info.py.",
+            stacklevel=2,
+        )
+    cloned = copy.deepcopy(fallback)
+    cloned.name = name
+    return cloned
 
 
 def _build_role_sched_config(

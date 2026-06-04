@@ -23,6 +23,18 @@ from pathlib import Path
 from typing import Any
 
 
+DTYPE_MAP = {
+    "float16": "FP16",
+    "bfloat16": "BF16",
+    "fp8": "FP8",
+    "fp8_block": "FP8",
+    "int8": "INT8",
+    "int8_wo": "INT8",
+    "nvfp4": "FP4",
+    "int4_wo": "INT4",
+}
+
+
 def _read_rows(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
@@ -83,6 +95,155 @@ def _pick_row_value(row: dict[str, str], agg_key: str, disagg_key: str) -> str:
     return ""
 
 
+def _normalize_dtype(value: str | None, default: str | None = None) -> str | None:
+    if value is None:
+        return default
+    raw = value.strip()
+    if not raw:
+        return default
+    upper_raw = raw.upper()
+    if upper_raw in {"FP16", "BF16", "FP8", "INT8", "FP4", "INT4"}:
+        return upper_raw
+    return DTYPE_MAP.get(raw.lower(), default)
+
+
+def _to_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    s = str(value).strip()
+    if not s:
+        return default
+    try:
+        return int(float(s))
+    except ValueError:
+        return default
+
+
+def _is_disagg_row(row: dict[str, str]) -> bool:
+    return "(p)tp" in row and "(d)tp" in row
+
+
+def _parse_synth_disagg_profiles(raw: str) -> list[tuple[int, int]]:
+    profiles: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for token in raw.split(","):
+        item = token.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"Invalid --synth-disagg-profiles entry '{item}'. Expected 'prefill:decode'."
+            )
+        prefill_raw, decode_raw = item.split(":", 1)
+        prefill_replicas = _to_int(prefill_raw, -1)
+        decode_replicas = _to_int(decode_raw, -1)
+        if prefill_replicas <= 0 or decode_replicas <= 0:
+            raise ValueError(
+                f"Invalid --synth-disagg-profiles entry '{item}'. Replica counts must be > 0."
+            )
+        pair = (prefill_replicas, decode_replicas)
+        if pair not in seen:
+            seen.add(pair)
+            profiles.append(pair)
+    if not profiles:
+        raise ValueError("--synth-disagg-profiles produced no valid replica pairs.")
+    return profiles
+
+
+def _build_synth_disagg_block(
+    row: dict[str, str],
+    args: argparse.Namespace,
+    *,
+    database_path: Path,
+    prefill_replicas: int,
+    decode_replicas: int,
+) -> dict[str, Any]:
+    device_name = args.predictor_device_name or _pick_row_value(row, "system", "(d)system")
+    if not device_name:
+        import warnings
+        device_name = "h100_sxm"
+        warnings.warn(
+            "Synth disagg block: no `system` column in AIC row and no"
+            f" --predictor-device-name provided; defaulting to {device_name!r}."
+            " Pass --predictor-device-name <aic_device_name> to override.",
+            stacklevel=2,
+        )
+    tp_size = _to_int(row.get("tp"), 1)
+    ep_size = _to_int(row.get("moe_ep"), 1)
+    dp_size = _to_int(row.get("dp"), 1)
+    pp_size = _to_int(row.get("pp"), 1)
+
+    data_type = _normalize_dtype(args.data_type, _normalize_dtype(row.get("gemm")))
+    kv_cache_data_type = _normalize_dtype(
+        args.kv_cache_data_type,
+        _normalize_dtype(row.get("kvcache"), data_type),
+    )
+    backend_version = args.backend_version or row.get("version")
+
+    row_moe_tp = _to_int(row.get("moe_tp"), tp_size)
+    width = tp_size * dp_size
+
+    synth_moe_tp = getattr(args, "synth_moe_tp_size", None)
+    synth_moe_ep = getattr(args, "synth_ep_size", None)
+    if synth_moe_tp is None and synth_moe_ep is None:
+        moe_tp_size = row_moe_tp
+        role_ep_size = ep_size
+    elif synth_moe_tp is not None and synth_moe_ep is not None:
+        if synth_moe_tp <= 0 or synth_moe_ep <= 0:
+            raise ValueError("--synth-moe-tp-size/--synth-ep-size must be > 0")
+        if synth_moe_tp * synth_moe_ep != width:
+            raise ValueError(
+                f"Invalid synthetic MoE parallelism: {synth_moe_tp}*{synth_moe_ep}!={width} (tp*dp)"
+            )
+        moe_tp_size = synth_moe_tp
+        role_ep_size = synth_moe_ep
+    elif synth_moe_tp is not None:
+        if synth_moe_tp <= 0 or width % synth_moe_tp != 0:
+            raise ValueError(
+                f"--synth-moe-tp-size={synth_moe_tp} is invalid for tp*dp={width}"
+            )
+        moe_tp_size = synth_moe_tp
+        role_ep_size = width // synth_moe_tp
+    else:
+        if synth_moe_ep is None or synth_moe_ep <= 0 or width % synth_moe_ep != 0:
+            raise ValueError(
+                f"--synth-ep-size={synth_moe_ep} is invalid for tp*dp={width}"
+            )
+        role_ep_size = synth_moe_ep
+        moe_tp_size = width // synth_moe_ep
+
+    def _role(replicas: int) -> dict[str, Any]:
+        role: dict[str, Any] = {
+            "device_name": device_name,
+            "tp_size": tp_size,
+            "ep_size": role_ep_size,
+            "dp_size": dp_size,
+            "pp_size": pp_size,
+            "replicas": replicas,
+            "max_running_per_replica": args.synth_max_running_per_replica,
+            "database_path": str(database_path),
+        }
+        if data_type is not None:
+            role["data_type"] = data_type
+        if kv_cache_data_type is not None:
+            role["kv_cache_data_type"] = kv_cache_data_type
+        if backend_version is not None and str(backend_version).strip():
+            role["backend_version"] = str(backend_version).strip()
+        return role
+
+    return {
+        "enabled": True,
+        "backend": args.disagg_backend,
+        "prefill": _role(prefill_replicas),
+        "decode": _role(decode_replicas),
+        "_resolved_moe_tp_size": moe_tp_size,
+        "kv_transfer": {
+            "bw_gbps": float(args.kv_transfer_bw_gbps),
+            "latency_us": float(args.kv_transfer_latency_us),
+        },
+    }
+
+
 def _build_bridge_cmd(
     args: argparse.Namespace,
     *,
@@ -91,6 +252,7 @@ def _build_bridge_cmd(
     row_idx: int,
     sim_config_path: Path,
     database_path: Path,
+    emit_disagg: bool,
 ) -> list[str]:
     """Build the aic_to_hisim_bridge subprocess argv for a single run.
 
@@ -143,7 +305,7 @@ def _build_bridge_cmd(
         cmd.extend(["--data-type", args.data_type])
     if args.kv_cache_data_type is not None:
         cmd.extend(["--kv-cache-data-type", args.kv_cache_data_type])
-    if getattr(args, "emit_disagg", False):
+    if emit_disagg:
         cmd.extend(
             [
                 "--emit-disagg",
@@ -225,6 +387,46 @@ def _parse_args() -> argparse.Namespace:
         default="single_process",
         help="DisaggConfig.backend value propagated to the bridge.",
     )
+    parser.add_argument(
+        "--synth-disagg-from-agg",
+        action="store_true",
+        help=(
+            "When selected AIC rows are agg-only, synthesize additional disagg runs "
+            "from each row so agg vs disagg can still be compared in HiSim."
+        ),
+    )
+    parser.add_argument(
+        "--synth-disagg-profiles",
+        default="2:6,4:4,6:2",
+        help=(
+            "Replica splits for synthetic disagg runs in 'prefill:decode' format, "
+            "comma-separated (for example: 2:6,4:4,6:2)."
+        ),
+    )
+    parser.add_argument(
+        "--synth-max-running-per-replica",
+        type=int,
+        default=8,
+        help="max_running_per_replica for each synthetic disagg role.",
+    )
+    parser.add_argument(
+        "--synth-moe-tp-size",
+        type=int,
+        default=None,
+        help=(
+            "Optional synthetic MoE tp-size override for agg rows. If set with "
+            "--synth-ep-size, product must equal tp*dp."
+        ),
+    )
+    parser.add_argument(
+        "--synth-ep-size",
+        type=int,
+        default=None,
+        help=(
+            "Optional synthetic MoE ep-size override for agg rows. If set with "
+            "--synth-moe-tp-size, product must equal tp*dp."
+        ),
+    )
 
     parser.add_argument("--prefill-scale-factor", type=float, default=None)
     parser.add_argument("--decode-scale-factor", type=float, default=None)
@@ -301,9 +503,52 @@ def main() -> int:
     summary_rows: list[dict[str, Any]] = []
     bridge_script = Path(args.bridge_script)
 
+    synth_profiles = (
+        _parse_synth_disagg_profiles(args.synth_disagg_profiles)
+        if args.synth_disagg_from_agg
+        else []
+    )
+
+    run_plans: list[dict[str, Any]] = []
     for row_idx in range(start, end):
-        run_rank = row_idx - start + 1
-        run_dir = output_dir / f"top{run_rank:02d}_row{row_idx}"
+        row = rows[row_idx]
+        row_is_disagg = _is_disagg_row(row)
+
+        if args.emit_disagg and not row_is_disagg and not args.synth_disagg_from_agg:
+            raise ValueError(
+                "--emit-disagg requires disagg-shaped CSV rows ((p)/(d) columns). "
+                "For agg-only rows, pass --synth-disagg-from-agg."
+            )
+
+        run_plans.append(
+            {
+                "row_idx": row_idx,
+                "variant": "agg",
+                "run_mode": "agg",
+                "emit_disagg": bool(args.emit_disagg and row_is_disagg),
+            }
+        )
+
+        if args.synth_disagg_from_agg and not row_is_disagg:
+            for prefill_replicas, decode_replicas in synth_profiles:
+                run_plans.append(
+                    {
+                        "row_idx": row_idx,
+                        "variant": f"syn_p{prefill_replicas}_d{decode_replicas}",
+                        "run_mode": "disagg_synth",
+                        "emit_disagg": False,
+                        "prefill_replicas": prefill_replicas,
+                        "decode_replicas": decode_replicas,
+                    }
+                )
+
+    for run_rank, plan in enumerate(run_plans, start=1):
+        row_idx = int(plan["row_idx"])
+        variant = str(plan["variant"])
+        run_dir_name = f"top{run_rank:02d}_row{row_idx}"
+        if variant != "agg":
+            run_dir_name += f"_{variant}"
+        run_dir = output_dir / run_dir_name
         run_dir.mkdir(parents=True, exist_ok=True)
 
         sim_config_path = run_dir / "sim_config.json"
@@ -318,9 +563,30 @@ def main() -> int:
             row_idx=row_idx,
             sim_config_path=sim_config_path,
             database_path=database_path,
+            emit_disagg=bool(plan.get("emit_disagg", False)),
         )
 
         subprocess.run(bridge_cmd, check=True, env=env)
+
+        if plan.get("run_mode") == "disagg_synth":
+            row = rows[row_idx]
+            prefill_replicas = int(plan["prefill_replicas"])
+            decode_replicas = int(plan["decode_replicas"])
+            with sim_config_path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg["disagg"] = _build_synth_disagg_block(
+                row,
+                args,
+                database_path=database_path,
+                prefill_replicas=prefill_replicas,
+                decode_replicas=decode_replicas,
+            )
+            resolved_moe_tp = cfg["disagg"].pop("_resolved_moe_tp_size", None)
+            if resolved_moe_tp is not None:
+                cfg.setdefault("scheduler", {})["moe_tp_size"] = int(resolved_moe_tp)
+            with sim_config_path.open("w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+                f.write("\n")
 
         server_cmd = [
             args.python_bin,
@@ -369,6 +635,13 @@ def main() -> int:
                 {
                     "row_index": row_idx,
                     "run_rank": run_rank,
+                    "run_mode": plan.get("run_mode"),
+                    "variant": variant,
+                    "synthetic_profile": (
+                        f"p{plan['prefill_replicas']}:d{plan['decode_replicas']}"
+                        if plan.get("run_mode") == "disagg_synth"
+                        else ""
+                    ),
                     "status": "dry_run",
                     "sim_config": str(sim_config_path),
                     "result_file": str(result_path),
@@ -435,6 +708,13 @@ def main() -> int:
             {
                 "row_index": row_idx,
                 "run_rank": run_rank,
+                "run_mode": plan.get("run_mode"),
+                "variant": variant,
+                "synthetic_profile": (
+                    f"p{plan['prefill_replicas']}:d{plan['decode_replicas']}"
+                    if plan.get("run_mode") == "disagg_synth"
+                    else ""
+                ),
                 "status": status,
                 "error": error,
                 "elapsed_s": round(elapsed_s, 3),

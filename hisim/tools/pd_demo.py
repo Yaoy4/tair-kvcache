@@ -105,6 +105,15 @@ class _AnalyticPredictor:
         # Per-device scaling, with a TP discount (rough).
         device = hw.name
         tp = max(1, config.tp_size)
+        if device not in self._PREFILL_US_PER_TOK:
+            import warnings
+            warnings.warn(
+                f"AnalyticPredictor: no calibration for device {device!r}; using"
+                f" generic defaults (prefill=0.5 us/tok, decode=15 us/step)."
+                " For accurate numbers, run the AIC bridge with this device's"
+                " perf db instead.",
+                stacklevel=2,
+            )
         self.prefill_us_per_tok = self._PREFILL_US_PER_TOK.get(device, 0.5) / tp
         self.decode_us_per_step = self._DECODE_US_PER_STEP.get(device, 15.0) / tp
 

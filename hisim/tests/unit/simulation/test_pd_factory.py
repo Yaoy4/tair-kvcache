@@ -17,6 +17,7 @@ from hisim.simulation.pd_config import (
 )
 from hisim.simulation.pd_factory import (
     DisaggPredictors,
+    _default_hw_factory,
     build_disagg,
     calc_kv_bytes_per_token,
 )
@@ -232,3 +233,15 @@ def test_build_disagg_uses_role_kv_cache_dtype_when_set():
     )
     # tp=4 → 2 kv_heads; FP8 → 2*128*32*2*1 = 16384
     assert out.kv_bytes_per_token == 16384
+
+
+def test_default_hw_factory_falls_back_for_unknown_name():
+    hw = _default_hw_factory("b60")
+    assert hw.name == "b60"
+    # Fallback currently clones the known NVIDIA profile if present.
+    assert getattr(hw, "vendor", "") == "NVIDIA"
+
+
+def test_default_hw_factory_keeps_known_alias_behavior():
+    hw = _default_hw_factory("h20_sxm")
+    assert hw.name == "NVIDIA H20"

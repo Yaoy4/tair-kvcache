@@ -16,6 +16,15 @@ from pathlib import Path
 from typing import Any
 
 
+# NOTE on configurability:
+#   platform.accelerator.name -> HiSim's internal hw identity (registered in
+#       hisim/spec/accelerator/info.py). Defaults to "H20" because that is the
+#       only profile currently registered; override via --platform-accelerator.
+#   predictor.device_name     -> AIConfigurator perf-database device, e.g.
+#       "h100_sxm", "h200_sxm", "b60", or any future accelerator with a perf
+#       db under aiconfigurator/systems/data/<name>/. This MUST be supplied
+#       either via the AIC CSV `system` column or --predictor-device-name; the
+#       bridge no longer falls back to a hardcoded device.
 DEFAULT_CONFIG: dict[str, Any] = {
     "platform": {
         "accelerator": {"name": "H20"},
@@ -27,13 +36,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "predictor": {
         "name": "aiconfigurator",
-        "device_name": "h100_sxm",
     },
     "scheduler": {
         "tp_size": 1,
         "ep_size": 1,
         "dp_size": 1,
-        "backend_version": "0.5.6.post2",
     },
 }
 
@@ -155,7 +162,17 @@ def _build_config_from_row(
     predictor = cfg.setdefault("predictor", {})
     predictor["name"] = "aiconfigurator"
     predictor["database_path"] = args.database_path
-    predictor["device_name"] = args.predictor_device_name or row_system or "h100_sxm"
+    device_name = args.predictor_device_name or row_system
+    if not device_name:
+        import warnings
+        device_name = "h100_sxm"
+        warnings.warn(
+            "No predictor device_name resolved from CSV or --predictor-device-name;"
+            f" defaulting to {device_name!r}. Pass --predictor-device-name to use"
+            " a different AIC perf-db device.",
+            stacklevel=2,
+        )
+    predictor["device_name"] = device_name
     predictor["database_mode"] = args.database_mode
 
     if args.prefill_scale_factor is not None:
@@ -195,10 +212,20 @@ def _build_disagg_role_dict(
     fields accepted by hisim.simulation.pd_config.RolePredictorConfig (i.e.
     consumable by sim_args._disagg_from_dict).
     """
+    role_device = (
+        _row_get(row, f"{prefix}system") or args.predictor_device_name
+    )
+    if not role_device:
+        import warnings
+        role_device = "h100_sxm"
+        warnings.warn(
+            f"No device_name for disagg role with prefix {prefix!r}; defaulting"
+            f" to {role_device!r}. Provide `{prefix}system` in the AIC CSV or"
+            " pass --predictor-device-name to override.",
+            stacklevel=2,
+        )
     role: dict[str, Any] = {
-        "device_name": (
-            _row_get(row, f"{prefix}system") or args.predictor_device_name or "h100_sxm"
-        ),
+        "device_name": role_device,
         "tp_size": _to_int(_row_get(row, f"{prefix}tp"), 1),
         "ep_size": _to_int(_row_get(row, f"{prefix}moe_ep"), 1),
         "dp_size": _to_int(_row_get(row, f"{prefix}dp"), 1),

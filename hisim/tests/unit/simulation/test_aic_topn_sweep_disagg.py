@@ -67,6 +67,7 @@ def _kwargs():
         row_idx=2,
         sim_config_path=Path("/tmp/sim.json"),
         database_path=Path("/tmp/perf_db"),
+        emit_disagg=False,
     )
 
 
@@ -92,7 +93,9 @@ def test_build_bridge_cmd_emit_disagg_propagates_flags():
         kv_transfer_latency_us=5.0,
         disagg_backend="single_process",
     )
-    cmd = SWEEP._build_bridge_cmd(args, **_kwargs())
+    kw = _kwargs()
+    kw["emit_disagg"] = True
+    cmd = SWEEP._build_bridge_cmd(args, **kw)
     assert "--emit-disagg" in cmd
     # Each --kv-transfer-* flag is followed by its stringified value.
     bw_idx = cmd.index("--kv-transfer-bw-gbps")
@@ -118,6 +121,86 @@ def test_build_bridge_cmd_propagates_optional_flags():
     assert "--prefill-scale-factor" in cmd
     assert cmd[cmd.index("--prefill-scale-factor") + 1] == "1.1"
     assert "--data-type" in cmd and cmd[cmd.index("--data-type") + 1] == "fp8"
+
+
+def test_parse_synth_disagg_profiles_parses_and_dedups():
+    profiles = SWEEP._parse_synth_disagg_profiles("2:6,4:4,2:6")
+    assert profiles == [(2, 6), (4, 4)]
+
+
+def test_parse_synth_disagg_profiles_rejects_invalid_token():
+    with pytest.raises(ValueError):
+        SWEEP._parse_synth_disagg_profiles("2x6")
+
+
+def test_build_synth_disagg_block_uses_agg_row_fields_and_replica_split():
+    args = _base_args(
+        predictor_device_name="b60",
+        backend_version="0.12.0",
+        data_type="bfloat16",
+        kv_cache_data_type="bfloat16",
+        disagg_backend="single_process",
+    )
+    args.synth_max_running_per_replica = 8
+    row = {
+        "tp": "8",
+        "dp": "1",
+        "moe_ep": "4",
+        "pp": "1",
+        "system": "b60",
+        "version": "0.12.0",
+        "gemm": "bfloat16",
+        "kvcache": "bfloat16",
+    }
+    block = SWEEP._build_synth_disagg_block(
+        row,
+        args,
+        database_path=Path("/tmp/perf_db"),
+        prefill_replicas=2,
+        decode_replicas=6,
+    )
+    assert block["enabled"] is True
+    assert block["backend"] == "single_process"
+    assert block["prefill"]["replicas"] == 2
+    assert block["decode"]["replicas"] == 6
+    assert block["prefill"]["tp_size"] == 8
+    assert block["decode"]["ep_size"] == 4
+    assert block["prefill"]["database_path"] == "/tmp/perf_db"
+
+
+def test_build_synth_disagg_block_resolves_moe_overrides():
+    args = _base_args(
+        predictor_device_name="b60",
+        backend_version="0.12.0",
+        data_type="bfloat16",
+        kv_cache_data_type="bfloat16",
+        disagg_backend="single_process",
+    )
+    args.synth_max_running_per_replica = 8
+    args.synth_ep_size = 8
+    args.synth_moe_tp_size = None
+    row = {
+        "tp": "8",
+        "dp": "1",
+        "moe_ep": "4",
+        "moe_tp": "2",
+        "pp": "1",
+        "system": "b60",
+        "version": "0.12.0",
+        "gemm": "bfloat16",
+        "kvcache": "bfloat16",
+    }
+    block = SWEEP._build_synth_disagg_block(
+        row,
+        args,
+        database_path=Path("/tmp/perf_db"),
+        prefill_replicas=2,
+        decode_replicas=6,
+    )
+    # tp*dp = 8, so synth_ep=8 resolves moe_tp to 1.
+    assert block["prefill"]["ep_size"] == 8
+    assert block["decode"]["ep_size"] == 8
+    assert block["_resolved_moe_tp_size"] == 1
 
 
 def test_sweep_parser_accepts_disagg_flags():
