@@ -26,6 +26,8 @@
         "kv_cache_data_type": "FP16",
         "backend_version": "0.5.6.post2",
         "pd_disagg_enabled": true,
+        "pd_num_prefill_instances": 1,
+        "pd_num_decode_instances": 1,
         "pd_kv_transfer_bandwidth_gb": 25
     }
 }

@@ -177,6 +177,12 @@ class ConfigManager:
             backend_name=backend,
             backend_version=scheduler_config.get("backend_version"),
             pd_disagg_enabled=scheduler_config.get("pd_disagg_enabled", False),
+            pd_num_prefill_instances=scheduler_config.get(
+                "pd_num_prefill_instances", 1
+            ),
+            pd_num_decode_instances=scheduler_config.get(
+                "pd_num_decode_instances", 1
+            ),
             pd_kv_transfer_bandwidth_gb=scheduler_config.get(
                 "pd_kv_transfer_bandwidth_gb"
             ),

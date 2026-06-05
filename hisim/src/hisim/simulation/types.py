@@ -43,6 +43,11 @@ class SchedulerConfig:
 
     # PD disaggregation
     pd_disagg_enabled: bool = False
+    # Number of prefill (P) and decode (D) instances. The P/D timelines are
+    # modeled separately; KV cache is migrated from a P instance to a D instance
+    # after prefill completes.
+    pd_num_prefill_instances: int = 1
+    pd_num_decode_instances: int = 1
     # KV cache network transfer bandwidth between P and D nodes in GB/s.
     # Required when pd_disagg_enabled is True.
     pd_kv_transfer_bandwidth_gb: Optional[float] = None
@@ -65,6 +70,11 @@ class RequestStats:
     queue_end: float = -1
     created_time: float = -1
     gen_token_latencies: list[float] = field(default_factory=list)
+    # PD disaggregation: when True, the first decode iteration of this request
+    # must be folded into TTFT (gen_token_latencies[0]) instead of being recorded
+    # as a separate inter-token latency, so that
+    #   TTFT = prefill_time + KV_transfer_time + first_decode_time.
+    pd_first_decode_pending: bool = False
 
     def is_complete(self) -> bool:
         return True

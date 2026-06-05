@@ -900,35 +900,30 @@ class C_SchedulerHook(BaseHook):
                         + hicache_l2_backup_dur
                     )
                     request_response_time = StateManager.get_global_clock()
-                # Request statistics
-                for req in batch.reqs:
-                    if req.is_chunked == 0:
-                        req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
-                        req_stats.gen_token_latencies.append(
-                            request_response_time
-                            - req_stats.last_event_time  # queue duration
-                        )
-                        req_stats.last_event_time = request_response_time
-                    else:
-                        # Chunked request: nothing to do
-                        pass
+
                 # PD disaggregation: simulate KV cache transfer latency after prefill.
-                # Clock is advanced AFTER request stats so that TTFT = pure prefill time.
-                # The transfer time will be absorbed into the first decode ITL, making
-                # gen_token_latencies[1] = kv_transfer_dur + first_decode_time.
+                # In PD disagg the first user-visible token is produced by the decode
+                # (D) instance AFTER the KV cache has been migrated from the prefill
+                # (P) instance, so the time-to-first-token is:
+                #     TTFT = prefill_time + KV_transfer_time + first_decode_time.
+                # The clock is advanced by the transfer time BEFORE recording request
+                # stats (so the prefill latency entry already includes the transfer),
+                # and the first decode iteration is later folded into that same TTFT
+                # entry (see pd_first_decode_pending below).
                 #
                 # Chunked prefill: only requests completing their FINAL chunk
                 # (is_chunked == 0) should trigger KV transfer. Mid-chunk requests
                 # (is_chunked == 1) are still accumulating KV; transfer is deferred.
                 kv_transfer_dur = 0.0
                 sched_config = ConfigManager.get_cached_scheduler_config()
-                if (
+                is_pd_prefill = (
                     sched_config is not None
                     and sched_config.pd_disagg_enabled
                     and C_SchedulerHook.HISIM_BATCH is not None
                     and not C_SchedulerHook.HISIM_BATCH.is_empty()
                     and C_SchedulerHook.HISIM_BATCH.is_prefill()
-                ):
+                )
+                if is_pd_prefill:
                     # Count tokens only for requests completing their final prefill.
                     # Cross-reference SGLang reqs (has is_chunked) with HISIM_BATCH
                     # reqs (has input_length). They are built in the same order.
@@ -955,12 +950,49 @@ class C_SchedulerHook(BaseHook):
                                 sched_config.pd_kv_transfer_bandwidth_gb * 1e9
                             )
                             StateManager.step_global_clock(kv_transfer_dur)
+                            # Fold the transfer time into the prefill latency entry
+                            # while preserving any other terms already accounted for
+                            # in request_response_time (e.g. hicache L2 backup).
+                            request_response_time += kv_transfer_dur
                             logger.debug(
                                 f"PD disagg KV transfer: {final_prefill_tokens} tokens, "
                                 f"{kv_bytes_per_token}B/token, "
                                 f"{sched_config.pd_kv_transfer_bandwidth_gb}GB/s -> "
                                 f"{kv_transfer_dur * 1000:.3f}ms"
                             )
+
+                # Request statistics
+                for req in batch.reqs:
+                    if req.is_chunked == 0:
+                        req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
+                        if req_stats.pd_first_decode_pending:
+                            # PD disagg: fold this (the first decode after KV
+                            # migration) into TTFT so that
+                            #   TTFT = prefill + KV transfer + first decode.
+                            # Do not emit a separate inter-token latency for it.
+                            if req_stats.gen_token_latencies:
+                                req_stats.gen_token_latencies[0] += (
+                                    request_response_time - req_stats.last_event_time
+                                )
+                            else:
+                                req_stats.gen_token_latencies.append(
+                                    request_response_time - req_stats.last_event_time
+                                )
+                            req_stats.last_event_time = request_response_time
+                            req_stats.pd_first_decode_pending = False
+                        else:
+                            req_stats.gen_token_latencies.append(
+                                request_response_time
+                                - req_stats.last_event_time  # queue duration
+                            )
+                            req_stats.last_event_time = request_response_time
+                            if is_pd_prefill:
+                                # This entry currently holds prefill + KV transfer;
+                                # the first decode will be folded into it next.
+                                req_stats.pd_first_decode_pending = True
+                    else:
+                        # Chunked request: nothing to do
+                        pass
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {

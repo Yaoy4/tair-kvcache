@@ -65,6 +65,10 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     for req in requests:
         if not req.is_complete():
             continue
+        if not req.gen_token_latencies:
+            # No token latency was recorded (e.g. a request that was aborted
+            # before producing any output); skip to avoid an index error.
+            continue
         completed += 1
         ttfts.append(req.gen_token_latencies[0])
         queue_durs.append(req.queue_end - req.queue_start)
