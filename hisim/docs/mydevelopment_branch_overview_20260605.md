@@ -103,3 +103,55 @@
 - 本文定位：分支全貌导航（给人快速建立地图）
 - 细节操作：看 `pd_vs_agg_runbook.md` 与 `dashboard_handbook.md`
 - 协议/判定口径：看 `pd_ab_equivalence_spec.md`
+
+## 6. 环境搭建与复现（给克隆者）
+
+本分支的 HiSim 把 **aiconfigurator 当作库**通过 `PYTHONPATH` 引入，并不修改其源码。
+因此复现需要同时准备两个仓库，并把它们的路径填入下面的环境变量。
+
+### 6.1 两个仓库的依赖关系
+
+```
+tair-kvcache (本仓库, 分支 MyDevelopment)
+  └── hisim/  ── 仿真核心，import aiconfigurator 作为预测器后端
+        depends on ▶ aiconfigurator (单独的仓库，作为 PYTHONPATH 库)
+```
+
+### 6.2 准备环境
+
+```bash
+# 1) 选一个工作根目录，并把两个仓库放在它下面
+export PROJECTS_ROOT="$HOME/projects"        # 按需修改
+git clone <tair-kvcache-url>   "$PROJECTS_ROOT/tair-kvcache"
+git clone <aiconfigurator-url> "$PROJECTS_ROOT/aiconfigurator"
+
+cd "$PROJECTS_ROOT/tair-kvcache"
+git checkout MyDevelopment
+
+# 2) 建虚拟环境并装依赖
+python -m venv venv
+source venv/bin/activate
+pip install -e "$PROJECTS_ROOT/aiconfigurator"     # 或按 aiconfigurator 自带说明安装
+pip install -e ".[dashboard]"                       # 可视化可选 extra
+
+# 3) 关键环境变量（每个 shell 都要 export）
+export PYTHONPATH="$PROJECTS_ROOT/tair-kvcache/hisim/src:$PROJECTS_ROOT/aiconfigurator/src"
+export SGLANG_USE_CPU_ENGINE=1
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+```
+
+### 6.3 冒烟验证
+
+```bash
+# 跑 Candidate B / PD 单测（最快的功能验证）
+python -m pytest hisim/tests/unit/simulation/test_pd_ab_harness.py \
+                 hisim/tests/unit/simulation/test_pd_backend_a.py -q
+```
+
+### 6.4 关于绝对路径（重要）
+
+> 本分支的 docs / shell 脚本 / mock 配置里仍残留作者机器上的绝对路径
+> （形如 `/home/<user>/projects/...`）。这些**只是示例**，克隆后请替换成你自己的
+> `$PROJECTS_ROOT`。特别是 `hisim/test/assets/mock/config.qwen8b.h100.aic.json`
+> 里的 `database_path` 指向 aiconfigurator 的 `src/aiconfigurator/systems`，
+> 跑相关用例前需改成你本地对应路径（或用环境变量/参数覆盖）。
