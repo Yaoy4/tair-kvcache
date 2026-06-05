@@ -189,6 +189,107 @@ def test_run_workload_w1_backend_a_durations_match_analytic_predictor():
 
 
 # ---------------------------------------------------------------------------
+# Batched decode driver — exercises decode_queue_mode (Candidate B).
+# ---------------------------------------------------------------------------
+
+
+def _make_disagg_cfg_decode(mode: str, replicas: int) -> DisaggConfig:
+    """Disagg config with `replicas` decode replicas and a chosen queue mode."""
+    return DisaggConfig(
+        enabled=True,
+        backend="single_process",
+        decode_queue_mode=mode,
+        prefill=RolePredictorConfig(
+            device_name="H20", tp_size=1, replicas=1, max_running_per_replica=256
+        ),
+        decode=RolePredictorConfig(
+            device_name="H20",
+            tp_size=1,
+            replicas=replicas,
+            max_running_per_replica=256,
+        ),
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=10.0),
+    )
+
+
+def _decode_heavy_workload(n: int = 16) -> list[WorkloadRequest]:
+    """Many requests arriving nearly simultaneously with long outputs, so a
+    large decode batch forms and decode dominates e2e."""
+    return [
+        WorkloadRequest(
+            rid=f"d{i}", arrival_time=i * 1e-4, input_length=128, output_length=32
+        )
+        for i in range(n)
+    ]
+
+
+def _build(mode: str, replicas: int):
+    return build_backend_a(
+        model=_make_model(),
+        base_sched_config=_make_base_sched(),
+        disagg_config=_make_disagg_cfg_decode(mode, replicas),
+        predictor_factory=_AnalyticPredictor,
+        hw_factory=_stub_hw_factory,
+    )
+
+
+def test_run_workload_batched_finishes_all_and_records_timestamps():
+    from hisim.simulation.pd_ab_harness import run_workload_batched
+
+    wl = _decode_heavy_workload(8)
+    result = run_workload_batched(_build("single_replica", 4), wl, backend_label="A")
+    assert len(result.per_request) == 8
+    for r in result.per_request:
+        assert r.finished is True
+        assert r.decode_step_count == 32
+        assert r.prefill_start_time is not None
+        assert r.kv_ready_time is not None
+        assert r.decode_start_time is not None
+        assert r.decode_end_time is not None
+        assert r.kv_ready_time <= r.decode_start_time <= r.decode_end_time
+
+
+def test_run_workload_batched_per_replica_queue_beats_single_replica_under_load():
+    """Candidate B: with a large simultaneous decode batch and multiple
+    replicas, per_replica_queue splits the batch across replica timelines and
+    must yield strictly lower mean/p99 e2e than single_replica."""
+    from hisim.simulation.pd_ab_harness import run_workload_batched
+
+    wl = _decode_heavy_workload(16)
+    ra = run_workload_batched(_build("single_replica", 4), wl, backend_label="A")
+    rb = run_workload_batched(_build("per_replica_queue", 4), wl, backend_label="B")
+
+    # Both schemes complete the same work.
+    assert all(r.finished for r in ra.per_request)
+    assert all(r.finished for r in rb.per_request)
+    assert sum(r.decode_step_count for r in ra.per_request) == sum(
+        r.decode_step_count for r in rb.per_request
+    )
+
+    mean_a = sum(r.e2e for r in ra.per_request) / len(ra.per_request)
+    mean_b = sum(r.e2e for r in rb.per_request) / len(rb.per_request)
+    # 16 reqs over 4 replicas ⇒ candidate's decode latency is ~1/4 the
+    # single-replica batch; require a clear (>2x) improvement.
+    assert mean_b < mean_a / 2.0
+
+
+def test_run_workload_batched_no_contention_is_policy_invariant():
+    """When arrivals are spaced so at most one request decodes at a time,
+    single_replica and per_replica_queue must produce identical e2e."""
+    from hisim.simulation.pd_ab_harness import run_workload_batched
+
+    # Outputs are short and arrivals spaced wide ⇒ no overlapping decode batch.
+    wl = [
+        WorkloadRequest(rid=f"s{i}", arrival_time=i * 0.01, input_length=64, output_length=4)
+        for i in range(6)
+    ]
+    ra = run_workload_batched(_build("single_replica", 4), wl, backend_label="A")
+    rb = run_workload_batched(_build("per_replica_queue", 4), wl, backend_label="B")
+    for a, b in zip(ra.per_request, rb.per_request):
+        assert isclose(a.e2e, b.e2e, abs_tol=1e-9)
+
+
+# ---------------------------------------------------------------------------
 # W1 A/B equivalence — actual cross-backend run via run_ab.
 # Per 6a spec: per-request abs_tol=1e-6 s on every timestamp + e2e.
 # ---------------------------------------------------------------------------

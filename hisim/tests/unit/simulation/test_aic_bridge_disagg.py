@@ -74,6 +74,7 @@ def test_bridge_emits_disagg_block_when_csv_is_disagg(tmp_path):
     d = cfg["disagg"]
     assert d["enabled"] is True
     assert d["backend"] == "single_process"
+    assert d["decode_queue_mode"] == "single_replica"
     assert d["prefill"]["device_name"] == "h100_sxm"
     assert d["prefill"]["tp_size"] == 4
     assert d["prefill"]["replicas"] == 2
@@ -103,6 +104,7 @@ def test_bridge_disagg_block_round_trips_through_sim_args(tmp_path):
 
     disagg = _disagg_from_dict(cfg["disagg"])
     assert disagg.enabled is True
+    assert disagg.decode_queue_mode == "single_replica"
     assert disagg.prefill.device_name == "h100_sxm"
     assert disagg.prefill.tp_size == 4
     assert disagg.prefill.replicas == 2
@@ -111,6 +113,25 @@ def test_bridge_disagg_block_round_trips_through_sim_args(tmp_path):
     assert disagg.decode.dp_size == 2
     assert disagg.decode.replicas == 4
     assert disagg.kv_transfer.bw_gbps == 100.0
+
+
+def test_bridge_emits_custom_decode_queue_mode(tmp_path):
+    csv_path = tmp_path / "pareto.csv"
+    out_path = tmp_path / "hisim.json"
+    _write_csv(csv_path, _DISAGG_HEADER, _DISAGG_ROW)
+
+    _run_bridge([
+        "--aic-csv", str(csv_path),
+        "--row-index", "0",
+        "--output", str(out_path),
+        "--database-path", "/aic/db",
+        "--emit-disagg",
+        "--kv-transfer-bw-gbps", "100",
+        "--kv-transfer-latency-us", "10",
+        "--disagg-decode-queue-mode", "per_replica_queue",
+    ])
+    cfg = json.loads(out_path.read_text())
+    assert cfg["disagg"]["decode_queue_mode"] == "per_replica_queue"
 
 
 def test_bridge_emit_disagg_requires_disagg_csv(tmp_path):

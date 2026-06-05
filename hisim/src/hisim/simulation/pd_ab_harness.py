@@ -235,6 +235,145 @@ def run_workload(
     )
 
 
+def run_workload_batched(
+    backend: PDBackendProtocol,
+    workload: Sequence[WorkloadRequest],
+    *,
+    backend_label: str = "",
+) -> RunResult:
+    """Drive ``workload`` through ``backend`` using the **batched decode**
+    path, mirroring the SGLang hook's decode loop.
+
+    Unlike :func:`run_workload` (which advances decode one request at a time
+    via ``try_admit_decode_step``), this driver coalesces every currently
+    RUNNING_DECODE request into a single decode step per tick and routes it
+    through ``try_admit_decode_batch`` / ``on_decode_step_done_batch`` — the
+    same primitives the real runtime uses (see ``sglang_hook`` decode branch).
+    This is the *only* harness path that exercises ``decode_queue_mode``:
+    ``single_replica`` runs the whole batch on one replica, while
+    ``per_replica_queue`` splits the batch across replica timelines.
+
+    Prefill/KV stages keep the same event-driven walk as
+    :func:`run_workload`. Decode is driven by a single global ``decode_tick``
+    event:
+
+    1. ``drain_kv_ready_and_admit_decode`` promotes all KV-ready requests to
+       RUNNING_DECODE (recording ``decode_start_time``).
+    2. ``decode_batch_latency`` schedules one decode step for the whole
+       running batch and returns its latency.
+    3. ``on_decode_step_done_batch`` credits one step per request; finished
+       requests record ``decode_end_time`` and leave the running set.
+    4. If any request is still running, the next tick is scheduled at the
+       step-end time.
+
+    A fresh tick is scheduled when a request becomes KV-ready and no tick is
+    currently pending, so newly-arriving decode work always restarts the loop.
+    """
+    from hisim.simulation.pd_runtime import (
+        decode_batch_latency,
+        drain_kv_ready_and_admit_decode,
+    )
+
+    states = {w.rid: w.to_state() for w in workload}
+    results = {
+        w.rid: RequestResult(
+            rid=w.rid,
+            arrival_time=float(w.arrival_time),
+            input_length=int(w.input_length),
+            output_length=int(w.output_length),
+        )
+        for w in workload
+    }
+    capacity = max(1, len(workload))
+
+    heap: list = []
+    seq = 0
+
+    def push(t: float, kind: str, rid: str) -> None:
+        nonlocal seq
+        seq += 1
+        heapq.heappush(heap, (float(t), seq, kind, rid))
+
+    for w in workload:
+        push(w.arrival_time, "arrive", w.rid)
+
+    # Set of rids currently in RUNNING_DECODE (the live decode batch).
+    decode_running: dict[str, PDRequestState] = {}
+    # Time of the next scheduled decode_tick, or None if none pending.
+    next_decode_tick: Optional[float] = None
+    final_clock = 0.0
+
+    def schedule_tick(t: float) -> None:
+        nonlocal next_decode_tick, seq
+        if next_decode_tick is None:
+            next_decode_tick = float(t)
+            seq += 1
+            heapq.heappush(heap, (float(t), seq, "decode_tick", ""))
+
+    while heap:
+        now, _, kind, rid = heapq.heappop(heap)
+        if now > final_clock:
+            final_clock = now
+
+        if kind == "arrive":
+            state = states[rid]
+            _, end_t = backend.try_admit_prefill(state, now)
+            results[rid].prefill_start_time = state.prefill_start_time
+            push(end_t, "prefill_done", rid)
+
+        elif kind == "prefill_done":
+            state = states[rid]
+            kv_ready = backend.compute_kv_ready_time(state, now)
+            backend.on_prefill_done(state, now, kv_ready)
+            results[rid].prefill_end_time = state.prefill_end_time
+            results[rid].kv_ready_time = state.kv_ready_time
+            push(kv_ready, "kv_ready", rid)
+
+        elif kind == "kv_ready":
+            # Real promotion happens in drain at tick time; here we only make
+            # sure a decode tick is pending so the loop (re)starts.
+            schedule_tick(now)
+
+        elif kind == "decode_tick":
+            next_decode_tick = None
+            # 1. Promote everything KV-ready by `now` into RUNNING_DECODE.
+            admitted = drain_kv_ready_and_admit_decode(
+                backend, now=now, capacity=capacity
+            )
+            for s in admitted:
+                decode_running[s.rid] = s
+                if results[s.rid].decode_start_time is None:
+                    results[s.rid].decode_start_time = s.decode_start_time
+            if not decode_running:
+                continue
+            # 2. One decode step for the whole running batch.
+            batch = list(decode_running.values())
+            latency = decode_batch_latency(backend, batch, now)
+            end = now + latency
+            if end > final_clock:
+                final_clock = end
+            # 3. Credit one step per request; collect finishers.
+            backend.on_decode_step_done_batch(batch, end)
+            for s in batch:
+                if s.phase == RequestPhase.FINISHED:
+                    results[s.rid].decode_end_time = end
+                    results[s.rid].decode_step_count = s.decode_step_count
+                    results[s.rid].finished = True
+                    decode_running.pop(s.rid, None)
+            # 4. Keep the loop alive while work remains.
+            if decode_running:
+                schedule_tick(end)
+
+        else:  # pragma: no cover — defensive
+            raise AssertionError(f"unknown event kind: {kind!r}")
+
+    return RunResult(
+        backend_label=backend_label,
+        per_request=[results[w.rid] for w in workload],
+        final_clock=final_clock,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level A/B runner.
 # ---------------------------------------------------------------------------

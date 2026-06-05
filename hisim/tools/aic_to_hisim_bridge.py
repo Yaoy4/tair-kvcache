@@ -252,6 +252,7 @@ def _build_disagg_block(
     return {
         "enabled": True,
         "backend": args.disagg_backend,
+        "decode_queue_mode": args.disagg_decode_queue_mode,
         "prefill": _build_disagg_role_dict(row, "(p)", args),
         "decode": _build_disagg_role_dict(row, "(d)", args),
         "kv_transfer": {
@@ -319,6 +320,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["single_process", "two_process"],
         default="single_process",
         help="DisaggConfig.backend value when --emit-disagg is set.",
+    )
+    parser.add_argument(
+        "--disagg-decode-queue-mode",
+        choices=["single_replica", "per_replica_queue"],
+        default="single_replica",
+        help="DisaggConfig.decode_queue_mode value when --emit-disagg is set.",
     )
     parser.add_argument(
         "--kv-transfer-bw-gbps",

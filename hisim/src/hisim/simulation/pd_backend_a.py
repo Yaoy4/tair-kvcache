@@ -23,12 +23,13 @@ real AIConfiguratorTimePredictor will need a thin adapter (added in 2b).
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from hisim.simulation.pd_controller import PDController
 from hisim.simulation.pd_factory import DisaggPredictors
-from hisim.simulation.pd_types import PDRequestState
+from hisim.simulation.pd_types import PDRequestState, RequestPhase
 
 
 @dataclass
@@ -56,6 +57,7 @@ class BackendA:
     def __init__(self, bundle: DisaggPredictors,
                  controller: Optional[PDController] = None):
         self._bundle = bundle
+        self._decode_queue_mode = getattr(bundle, "decode_queue_mode", "single_replica")
         self._controller = controller or PDController(
             transfer_model=bundle.transfer_model,
             kv_model_cfg=bundle.kv_model_config,
@@ -66,6 +68,7 @@ class BackendA:
         self._decode_pool = _ReplicaPool.make(
             "decode", bundle.decode_replicas
         )
+        self._decode_replica_by_rid: dict[str, int] = {}
 
     # ---- introspection ----
     def controller(self) -> PDController:
@@ -127,7 +130,14 @@ class BackendA:
         """Schedule one decode step for `req` on the earliest-free decode
         replica. Returns (replica_idx, end_time).
         """
-        idx, free_at = self._decode_pool.earliest_replica()
+        if self._decode_queue_mode == "per_replica_queue":
+            idx = self._decode_replica_by_rid.get(req.rid)
+            if idx is None:
+                idx, _ = self._decode_pool.earliest_replica()
+                self._decode_replica_by_rid[req.rid] = idx
+            free_at = self._decode_pool.busy_until[idx]
+        else:
+            idx, free_at = self._decode_pool.earliest_replica()
         start = max(now, free_at)
         dur = self._bundle.decode.predict_decode_seconds(batch_size=1)
         end = start + dur
@@ -147,6 +157,8 @@ class BackendA:
         """
         if not reqs:
             raise ValueError("try_admit_decode_batch requires at least one request")
+        if self._decode_queue_mode == "per_replica_queue":
+            return self._try_admit_decode_batch_per_replica(reqs, now)
         idx, free_at = self._decode_pool.earliest_replica()
         start = max(now, free_at)
         past_kv = [int(r.current_past_kv_length) for r in reqs]
@@ -157,10 +169,56 @@ class BackendA:
         self._decode_pool.busy_until[idx] = end
         return idx, end
 
+    def _try_admit_decode_batch_per_replica(
+        self, reqs: Sequence[PDRequestState], now: float
+    ) -> Tuple[int, float]:
+        replica_order = sorted(
+            range(len(self._decode_pool.busy_until)),
+            key=lambda i: self._decode_pool.busy_until[i],
+        )
+        if not replica_order:
+            raise ValueError("decode pool requires at least one replica")
+
+        next_replica_slot = 0
+        buckets: dict[int, list[PDRequestState]] = defaultdict(list)
+        for req in reqs:
+            replica_idx = self._decode_replica_by_rid.get(req.rid)
+            if replica_idx is None:
+                replica_idx = replica_order[next_replica_slot % len(replica_order)]
+                self._decode_replica_by_rid[req.rid] = replica_idx
+                next_replica_slot += 1
+            buckets[replica_idx].append(req)
+
+        first_replica_idx: Optional[int] = None
+        max_end = now
+        for replica_idx in replica_order:
+            bucket = buckets.get(replica_idx)
+            if not bucket:
+                continue
+            start = max(now, self._decode_pool.busy_until[replica_idx])
+            past_kv = [int(r.current_past_kv_length) for r in bucket]
+            dur = self._bundle.decode.predict_decode_seconds(
+                batch_size=len(bucket), past_kv_length=past_kv
+            )
+            end = start + dur
+            self._decode_pool.busy_until[replica_idx] = end
+            if end > max_end:
+                max_end = end
+            if first_replica_idx is None:
+                first_replica_idx = replica_idx
+        if first_replica_idx is None:
+            first_replica_idx = replica_order[0]
+        return first_replica_idx, max_end
+
     def on_decode_step_done(self, req: PDRequestState, now: float) -> None:
         self._controller.on_decode_step_done([req], now)
+        if req.phase == RequestPhase.FINISHED:
+            self._decode_replica_by_rid.pop(req.rid, None)
 
     def on_decode_step_done_batch(
         self, reqs: Iterable[PDRequestState], now: float
     ) -> None:
         self._controller.on_decode_step_done(reqs, now)
+        for req in reqs:
+            if req.phase == RequestPhase.FINISHED:
+                self._decode_replica_by_rid.pop(req.rid, None)

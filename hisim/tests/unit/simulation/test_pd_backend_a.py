@@ -89,7 +89,8 @@ def _hw(name):
 
 def _bundle(prefill_device="fast", decode_device="fast",
             prefill_replicas=2, decode_replicas=2,
-            bw_gbps=100.0, latency_us=10.0):
+            bw_gbps=100.0, latency_us=10.0,
+            decode_queue_mode="single_replica"):
     cfg = DisaggConfig(
         enabled=True,
         backend="single_process",
@@ -106,6 +107,7 @@ def _bundle(prefill_device="fast", decode_device="fast",
             max_running_per_replica=64,
         ),
         kv_transfer=BandwidthTransferConfig(bw_gbps=bw_gbps, latency_us=latency_us),
+        decode_queue_mode=decode_queue_mode,
     )
     return build_disagg(
         model=_model(),
@@ -281,6 +283,23 @@ def test_try_admit_decode_batch_advances_one_replica_only():
     busy = sorted(be._decode_pool.busy_until)
     assert busy[:3] == [0.0, 0.0, 0.0]
     assert busy[3] == pytest.approx(end_t)
+
+
+def test_try_admit_decode_batch_per_replica_queue_spreads_across_replicas():
+    be = BackendA(
+        _bundle(
+            decode_device="fast",
+            decode_replicas=2,
+            decode_queue_mode="per_replica_queue",
+        )
+    )
+    reqs = [_ready_decode_req(f"r{i}", past_kv=10 * (i + 1)) for i in range(3)]
+    idx, end_t = be.try_admit_decode_batch(reqs, now=0.0)
+    busy = sorted(be._decode_pool.busy_until)
+    assert busy[0] > 0.0
+    assert busy[1] > busy[0]
+    assert idx in {0, 1}
+    assert end_t == pytest.approx(busy[1])
 
 
 def test_try_admit_decode_batch_uses_earliest_replica():

@@ -36,6 +36,7 @@ class DisaggPredictors:
     transfer_model: BandwidthTransferModel
     prefill_replicas: int = 1
     decode_replicas: int = 1
+    decode_queue_mode: str = "single_replica"
 
 
 def _as_dtype(value) -> Optional[DataType]:
@@ -203,4 +204,5 @@ def build_disagg(
         transfer_model=transfer,
         prefill_replicas=disagg_config.prefill.replicas,
         decode_replicas=disagg_config.decode.replicas,
+        decode_queue_mode=disagg_config.decode_queue_mode,
     )

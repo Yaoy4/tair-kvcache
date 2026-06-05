@@ -234,6 +234,7 @@ def _build_synth_disagg_block(
     return {
         "enabled": True,
         "backend": args.disagg_backend,
+        "decode_queue_mode": args.disagg_decode_queue_mode,
         "prefill": _role(prefill_replicas),
         "decode": _role(decode_replicas),
         "_resolved_moe_tp_size": moe_tp_size,
@@ -258,7 +259,8 @@ def _build_bridge_cmd(
 
     Phase 3c: when --emit-disagg is set on the sweep, propagate the
     disagg JSON-emission flags (--emit-disagg, --kv-transfer-bw-gbps,
-    --kv-transfer-latency-us, --disagg-backend) so the produced sim
+    --kv-transfer-latency-us, --disagg-backend,
+    --disagg-decode-queue-mode) so the produced sim
     config carries a `disagg` block consumable by Backend A.
     """
     cmd = [
@@ -315,6 +317,8 @@ def _build_bridge_cmd(
                 str(args.kv_transfer_latency_us),
                 "--disagg-backend",
                 args.disagg_backend,
+                "--disagg-decode-queue-mode",
+                args.disagg_decode_queue_mode,
             ]
         )
     return cmd
@@ -386,6 +390,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["single_process", "two_process"],
         default="single_process",
         help="DisaggConfig.backend value propagated to the bridge.",
+    )
+    parser.add_argument(
+        "--disagg-decode-queue-mode",
+        choices=["single_replica", "per_replica_queue"],
+        default="single_replica",
+        help="DisaggConfig.decode_queue_mode value propagated to bridge/synth blocks.",
     )
     parser.add_argument(
         "--synth-disagg-from-agg",

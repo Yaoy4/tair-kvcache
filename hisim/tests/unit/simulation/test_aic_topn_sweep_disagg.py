@@ -54,6 +54,7 @@ def _base_args(**overrides) -> argparse.Namespace:
         kv_transfer_bw_gbps=200.0,
         kv_transfer_latency_us=10.0,
         disagg_backend="single_process",
+        disagg_decode_queue_mode="single_replica",
     )
     for k, v in overrides.items():
         setattr(ns, k, v)
@@ -82,6 +83,7 @@ def test_build_bridge_cmd_no_disagg_does_not_emit_disagg_flags():
         "--kv-transfer-bw-gbps",
         "--kv-transfer-latency-us",
         "--disagg-backend",
+        "--disagg-decode-queue-mode",
     ):
         assert flag not in cmd, f"unexpected {flag} in default cmd"
 
@@ -104,6 +106,8 @@ def test_build_bridge_cmd_emit_disagg_propagates_flags():
     assert cmd[lat_idx + 1] == "5.0"
     be_idx = cmd.index("--disagg-backend")
     assert cmd[be_idx + 1] == "single_process"
+    dq_idx = cmd.index("--disagg-decode-queue-mode")
+    assert cmd[dq_idx + 1] == "single_replica"
 
 
 def test_build_bridge_cmd_propagates_optional_flags():
@@ -161,6 +165,7 @@ def test_build_synth_disagg_block_uses_agg_row_fields_and_replica_split():
     )
     assert block["enabled"] is True
     assert block["backend"] == "single_process"
+    assert block["decode_queue_mode"] == "single_replica"
     assert block["prefill"]["replicas"] == 2
     assert block["decode"]["replicas"] == 6
     assert block["prefill"]["tp_size"] == 8
@@ -215,6 +220,11 @@ def test_sweep_parser_accepts_disagg_flags():
         choices=["single_process", "two_process"],
         default="single_process",
     )
+    parser.add_argument(
+        "--disagg-decode-queue-mode",
+        choices=["single_replica", "per_replica_queue"],
+        default="single_replica",
+    )
     ns = parser.parse_args(
         [
             "--emit-disagg",
@@ -224,8 +234,11 @@ def test_sweep_parser_accepts_disagg_flags():
             "1",
             "--disagg-backend",
             "single_process",
+            "--disagg-decode-queue-mode",
+            "per_replica_queue",
         ]
     )
     assert ns.emit_disagg is True
     assert ns.kv_transfer_bw_gbps == pytest.approx(100.0)
     assert ns.disagg_backend == "single_process"
+    assert ns.disagg_decode_queue_mode == "per_replica_queue"

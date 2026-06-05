@@ -161,6 +161,13 @@ class SimulationArgs:
             default=None,
             choices=["single_process", "two_process"],
         )
+        parser.add_argument(
+            f"--{prefix}disagg-decode-queue-mode",
+            dest="sim_disagg_decode_queue_mode",
+            type=str,
+            default=None,
+            choices=["single_replica", "per_replica_queue"],
+        )
         for role in ("prefill", "decode"):
             parser.add_argument(
                 f"--{prefix}disagg-{role}-device-name",
@@ -360,6 +367,7 @@ def _disagg_from_dict(d: dict) -> DisaggConfig:
     return DisaggConfig(
         enabled=True,
         backend=d.get("backend", "single_process"),
+        decode_queue_mode=d.get("decode_queue_mode", "single_replica"),
         prefill=prefill,
         decode=decode,
         kv_transfer=transfer,
@@ -405,6 +413,8 @@ def _disagg_from_cli(ns: argparse.Namespace) -> DisaggConfig:
     return DisaggConfig(
         enabled=True,
         backend=backend,
+        decode_queue_mode=getattr(ns, "sim_disagg_decode_queue_mode", None)
+        or "single_replica",
         prefill=prefill,
         decode=decode,
         kv_transfer=transfer,

@@ -57,7 +57,9 @@ class BandwidthTransferConfig:
 
 
 DisaggBackend = Literal["single_process", "two_process"]
+DecodeQueueMode = Literal["single_replica", "per_replica_queue"]
 _ALLOWED_BACKENDS = ("single_process", "two_process")
+_ALLOWED_DECODE_QUEUE_MODES = ("single_replica", "per_replica_queue")
 
 
 @dataclass
@@ -70,6 +72,7 @@ class DisaggConfig:
 
     enabled: bool = False
     backend: DisaggBackend = "single_process"
+    decode_queue_mode: DecodeQueueMode = "single_replica"
     prefill: Optional[RolePredictorConfig] = None
     decode: Optional[RolePredictorConfig] = None
     kv_transfer: Optional[BandwidthTransferConfig] = None
@@ -78,6 +81,11 @@ class DisaggConfig:
         if self.backend not in _ALLOWED_BACKENDS:
             raise ValueError(
                 f"backend must be one of {_ALLOWED_BACKENDS}, got {self.backend!r}"
+            )
+        if self.decode_queue_mode not in _ALLOWED_DECODE_QUEUE_MODES:
+            raise ValueError(
+                "decode_queue_mode must be one of "
+                f"{_ALLOWED_DECODE_QUEUE_MODES}, got {self.decode_queue_mode!r}"
             )
         if self.enabled:
             if self.prefill is None:
