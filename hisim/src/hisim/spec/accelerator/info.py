@@ -22,3 +22,28 @@ class NVIDIA:
         },
         save_to_registry=True,
     )
+
+    NVIDIA_RTX_PRO_6000_SERVER = AcceleratorInfo.from_dict(
+        config={
+            "name": "NVIDIA RTX PRO 6000 Server",
+            "device_alias": [
+                "rtx_pro_6000_server",
+                "RTX_PRO_6000_SERVER",
+                "rtx6000_server",
+            ],
+            "tflops": {
+                "FP8_TENSOR": 935.6,
+                "INT8_TENSOR": 935.6,
+                "FP16_TENSOR": 467.8,
+                "BF16_TENSOR": 467.8,
+                "FP32": 233.9,
+            },
+            "hbm_capacity_gb": 102,
+            "hbm_bandwidth_gb": 1433,
+            "inter_node_bandwidth_gb": 50,
+            "intra_node_bandwidth_gb": 64,
+            "vendor": "NVIDIA",
+            "ref": "https://www.nvidia.com/en-us/products/workstations/rtx-pro-6000/",
+        },
+        save_to_registry=True,
+    )

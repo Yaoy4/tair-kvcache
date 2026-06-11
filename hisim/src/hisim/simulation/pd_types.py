@@ -22,6 +22,7 @@ class PDRequestState:
     prefill_end_time: Optional[float] = None
     kv_ready_time: Optional[float] = None
     decode_start_time: Optional[float] = None
+    decode_end_time: Optional[float] = None
     decode_step_count: int = 0
     current_past_kv_length: int = 0
     output_length: int = 0

@@ -122,3 +122,4 @@ class PDController:
             req.current_past_kv_length += 1
             if req.decode_step_count >= req.output_length:
                 req.phase = RequestPhase.FINISHED
+                req.decode_end_time = now

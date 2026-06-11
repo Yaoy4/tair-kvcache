@@ -41,6 +41,12 @@ def compute_stage_durations(state: "PDRequestState") -> Dict[str, float]:
 def populate_request_stats(
     stats: "RequestStats", state: "PDRequestState"
 ) -> None:
+    stats.pd_arrival_time = state.arrival_time
+    stats.pd_prefill_start_time = state.prefill_start_time
+    stats.pd_prefill_end_time = state.prefill_end_time
+    stats.pd_kv_ready_time = state.kv_ready_time
+    stats.pd_decode_start_time = state.decode_start_time
+    stats.pd_decode_end_time = getattr(state, "decode_end_time", None)
     d = compute_stage_durations(state)
     stats.prefill_queue_wait = d["prefill_queue_wait"]
     stats.kv_transfer_time = d["kv_transfer_time"]

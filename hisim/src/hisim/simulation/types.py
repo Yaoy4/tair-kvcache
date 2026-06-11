@@ -66,6 +66,12 @@ class RequestStats:
     # PD-disagg stage durations (seconds). Defaults of 0 keep non-disagg
     # runs backward-compatible; populated by pd_metrics.populate_request_stats
     # when a PDRequestState finishes.
+    pd_arrival_time: Optional[float] = None
+    pd_prefill_start_time: Optional[float] = None
+    pd_prefill_end_time: Optional[float] = None
+    pd_kv_ready_time: Optional[float] = None
+    pd_decode_start_time: Optional[float] = None
+    pd_decode_end_time: Optional[float] = None
     prefill_queue_wait: float = 0.0
     kv_transfer_time: float = 0.0
     decode_queue_wait: float = 0.0

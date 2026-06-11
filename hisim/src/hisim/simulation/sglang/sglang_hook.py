@@ -618,6 +618,7 @@ class C_SchedulerHook(BaseHook):
 
             original_init(self, *args, **kwargs)
 
+            disagg_cfg = ConfigManager.get_disagg_config()
             try:
                 model = ConfigManager.get_model_info(
                     self.model_config.hf_config.__dict__
@@ -635,17 +636,34 @@ class C_SchedulerHook(BaseHook):
                     ConfigManager.get_inference_time_predictor(model, hw, sched_config)
                 )
             except Exception as e:
-                logger.error(
-                    f"Failed to initialize inference time predictor. Error: {e}"
-                )
-                raise e
+                if disagg_cfg.enabled:
+                    # In PD mode, decode still uses INFERENCE_PREDICTOR latency.
+                    # If the aggregated predictor config is unavailable, fall back
+                    # to the disagg decode-role predictor so launch can proceed.
+                    from hisim.simulation.pd_factory import build_disagg
+
+                    bundle = build_disagg(
+                        model=model,
+                        base_sched_config=sched_config,
+                        disagg_config=disagg_cfg,
+                    )
+                    C_SchedulerHook.INFERENCE_PREDICTOR = bundle.decode
+                    logger.warning(
+                        "Failed to initialize global inference predictor (%s); "
+                        "falling back to disagg decode-role predictor.",
+                        e,
+                    )
+                else:
+                    logger.error(
+                        f"Failed to initialize inference time predictor. Error: {e}"
+                    )
+                    raise e
 
             # Phase 2b.3 / 5c.1 / 5c.2: optionally build the PD disagg backend.
             # Dispatches on disagg.backend ("single_process" → BackendA,
             # "two_process" → BackendB). start_pd_backend handles BackendB's
             # start() + atexit shutdown so workers can't leak.
             try:
-                disagg_cfg = ConfigManager.get_disagg_config()
                 if disagg_cfg.enabled:
                     from hisim.simulation.pd_runtime import (
                         build_pd_backend,
@@ -788,6 +806,7 @@ class C_SchedulerHook(BaseHook):
 
             if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
+                C_SchedulerHook.LAST_FLUSH_TS = C_SchedulerHook.LAST_CPU_TS
                 StateManager.set_global_clock(0)
 
             return recv_reqs
@@ -832,8 +851,13 @@ class C_SchedulerHook(BaseHook):
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            if batch is None:
+                for candidate in list(args) + list(kwargs.values()):
+                    if hasattr(candidate, "reqs") and hasattr(candidate, "forward_mode"):
+                        batch = candidate
+                        break
 
-            if ret.__class__.__name__ == "GenerationBatchResult":
+            if batch is not None and hasattr(batch, "forward_mode"):
                 hisim_batch = HisimScheduleBatch(reqs=[])
                 if batch.forward_mode.is_extend():
                     for req in batch.reqs:
@@ -878,6 +902,9 @@ class C_SchedulerHook(BaseHook):
                             PDRequestState,
                             RequestPhase,
                         )
+                        from hisim.simulation.pd_metrics import (
+                            populate_request_stats,
+                        )
 
                         now_clock = StateManager.get_global_clock()
                         states = []
@@ -912,6 +939,10 @@ class C_SchedulerHook(BaseHook):
                             states,
                             now_clock + pd_latency,
                         )
+                        for s in states:
+                            stats = C_SchedulerHook.REQUEST_STATS.get(s.rid)
+                            if stats is not None:
+                                populate_request_stats(stats, s)
                         logger.debug(
                             "[PD] extend batch: %d reqs, agg_pred=%.6fs, "
                             "pd_pred=%.6fs",
@@ -927,6 +958,9 @@ class C_SchedulerHook(BaseHook):
                         from hisim.simulation.pd_runtime import (
                             decode_batch_latency,
                             drain_kv_ready_and_admit_decode,
+                        )
+                        from hisim.simulation.pd_metrics import (
+                            populate_request_stats,
                         )
 
                         now_clock = StateManager.get_global_clock()
@@ -950,6 +984,10 @@ class C_SchedulerHook(BaseHook):
                             C_SchedulerHook.PD_BACKEND.on_decode_step_done_batch(
                                 states, now_clock + pd_latency
                             )
+                            for s in states:
+                                stats = C_SchedulerHook.REQUEST_STATS.get(s.rid)
+                                if stats is not None:
+                                    populate_request_stats(stats, s)
                             logger.debug(
                                 "[PD] decode batch: %d reqs, agg_pred=%.6fs, "
                                 "pd_pred=%.6fs",
@@ -1068,6 +1106,25 @@ class C_SchedulerHook(BaseHook):
             output_dir = Envs.output_dir()
             os.makedirs(output_dir, exist_ok=True)
 
+            ProfileReqOutput = getattr(
+                importlib.import_module("sglang.srt.managers.io_struct"),
+                "ProfileReqOutput",
+            )
+
+            if len(stats) == 0:
+                logger.info(
+                    "Profile requested with no completed simulation stats; keeping PD backend/state intact."
+                )
+                return ProfileReqOutput(
+                    True,
+                    json.dumps(
+                        {
+                            "total_request": 0,
+                            "output_directory": output_dir,
+                        }
+                    ),
+                )
+
             if len(stats) > 0:
                 # Remove warmup requests.
                 if len(stats) > Envs.num_warmup():
@@ -1121,10 +1178,6 @@ class C_SchedulerHook(BaseHook):
                 shutdown_pd_backend(C_SchedulerHook.PD_BACKEND)
                 C_SchedulerHook.PD_BACKEND = None
 
-            ProfileReqOutput = getattr(
-                importlib.import_module("sglang.srt.managers.io_struct"),
-                "ProfileReqOutput",
-            )
             result = {
                 "total_request": len(stats),
                 "output_directory": output_dir,

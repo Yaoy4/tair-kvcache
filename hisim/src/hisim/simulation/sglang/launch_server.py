@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import argparse
+from pathlib import Path
 import torch
 import hisim.hook as hisim_hook
 from hisim.simulation.sglang import sgl_kernel_hook
@@ -64,12 +65,31 @@ if __name__ == "__main__":
     elif simulation_args.config_path:
         os.environ["HISIM_CONFIG_PATH"] = simulation_args.config_path
     else:
-        config_path = "/tmp/hisim/config.json"
-        logger.info(f"Export config to {config_path}")
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        with open(config_path, "w") as f:
-            json.dump(simulation_args.to_dict(), f)
-        os.environ["HISIM_CONFIG_PATH"] = config_path
+        config_candidates = [
+            Path("/tmp/hisim/config.json"),
+            Path.home() / ".cache" / "hisim" / "config.json",
+            Path.cwd() / ".hisim" / "config.json",
+        ]
+        saved = False
+        for candidate in config_candidates:
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Export config to {candidate}")
+                with candidate.open("w") as f:
+                    json.dump(simulation_args.to_dict(), f)
+                os.environ["HISIM_CONFIG_PATH"] = str(candidate)
+                saved = True
+                break
+            except OSError as e:
+                logger.warning(
+                    f"Failed to write simulation config to {candidate}: {e}"
+                )
+
+        if not saved:
+            raise RuntimeError(
+                "Could not write simulation config file to any fallback path. "
+                "Set HISIM_CONFIG_PATH to a writable existing file and retry."
+            )
 
     try:
         launch_server(server_args)

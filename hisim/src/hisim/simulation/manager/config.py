@@ -157,7 +157,7 @@ class ConfigManager:
             data_type=dtype,
             kv_cache_data_type=kv_cache_dtype,
             page_size=internal_config.page_size,
-            backend_name=backend,
+            backend_name=scheduler_config.get("backend_name", backend),
             backend_version=scheduler_config.get("backend_version"),
         )
         return sched_config
