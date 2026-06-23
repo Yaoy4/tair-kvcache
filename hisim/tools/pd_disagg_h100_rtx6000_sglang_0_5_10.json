@@ -1,13 +1,13 @@
 {
   "platform": {
     "accelerator": {
-      "name": "rtx_pro_6000_server"
+      "name": "h100_sxm"
     }
   },
   "predictor": {
     "name": "aiconfigurator",
     "database_path": "/mnt/nfs02/users/yaoyao1/projects/aiconfigurator/src/aiconfigurator/systems",
-    "device_name": "rtx_pro_6000_server"
+    "device_name": "h100_sxm"
   },
   "scheduler": {
     "tp_size": 1,
@@ -22,7 +22,7 @@
     "backend": "single_process",
     "decode_queue_mode": "single_replica",
     "prefill": {
-      "device_name": "rtx_pro_6000_server",
+      "device_name": "h100_sxm",
       "tp_size": 1,
       "ep_size": 1,
       "replicas": 1,
@@ -38,8 +38,8 @@
       "backend_version": "0.5.10"
     },
     "kv_transfer": {
-      "bw_gbps": 256,
-      "latency_us": 20
+      "bw_gbps": 200,
+      "latency_us": 10
     }
   }
 }
