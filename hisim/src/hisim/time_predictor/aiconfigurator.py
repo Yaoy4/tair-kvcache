@@ -16,11 +16,25 @@ from aiconfigurator.sdk.common import (
     KVCacheQuantMode,
     MoEQuantMode,
     DatabaseMode,
-    SupportedModels,
 )
+
+try:
+    from aiconfigurator.sdk.common import SupportedModels  # type: ignore
+except ImportError:
+    SupportedModels = None
 from aiconfigurator.sdk.config import RuntimeConfig, ModelConfig
 from aiconfigurator.sdk.inference_session import InferenceSession
-from aiconfigurator.sdk.perf_database import get_database, get_system_config_path
+from aiconfigurator.sdk.perf_database import get_database
+
+try:
+    from aiconfigurator.sdk.perf_database import get_system_config_path
+except ImportError:
+    get_system_config_path = None
+
+try:
+    from aiconfigurator.sdk.perf_database import get_systems_paths
+except ImportError:
+    get_systems_paths = None
 
 from hisim.simulation.types import (
     SchedulerConfig,
@@ -33,16 +47,29 @@ from hisim.time_predictor import (
 from hisim.utils import get_logger
 
 
+def _enum_member(enum_cls, *names):
+    for name in names:
+        if hasattr(enum_cls, name):
+            return getattr(enum_cls, name)
+    raise AttributeError(f"{enum_cls.__name__} has none of members: {names}")
+
+
+_GEMM_DEFAULT = _enum_member(GEMMQuantMode, "float16", "bfloat16")
+_KV_DEFAULT = _enum_member(KVCacheQuantMode, "float16", "bfloat16")
+_FMHA_DEFAULT = _enum_member(FMHAQuantMode, "float16", "bfloat16")
+_MOE_DEFAULT = _enum_member(MoEQuantMode, "float16", "bfloat16")
+
+
 # Map the common data types to AIConfigurator data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
-    DataType.FP16: GEMMQuantMode.float16,
-    DataType.BF16: GEMMQuantMode.float16,
+    DataType.FP16: _enum_member(GEMMQuantMode, "float16", "bfloat16"),
+    DataType.BF16: _enum_member(GEMMQuantMode, "bfloat16", "float16"),
     DataType.FP8: GEMMQuantMode.fp8_block,
     DataType.INT8: GEMMQuantMode.int8_wo,
     DataType.FP4: GEMMQuantMode.nvfp4,
     DataType.INT4: GEMMQuantMode.int4_wo,
-    DataType.FP16_TENSOR: GEMMQuantMode.float16,
-    DataType.BF16_TENSOR: GEMMQuantMode.float16,
+    DataType.FP16_TENSOR: _enum_member(GEMMQuantMode, "float16", "bfloat16"),
+    DataType.BF16_TENSOR: _enum_member(GEMMQuantMode, "bfloat16", "float16"),
     DataType.FP8_TENSOR: GEMMQuantMode.fp8,
     DataType.INT8_TENSOR: GEMMQuantMode.int8_wo,
     DataType.FP4_TENSOR: GEMMQuantMode.nvfp4,
@@ -50,21 +77,21 @@ MAP_DTYPE_TO_GEMMQuantMode = {
 }
 
 MAP_DTYPE_TO_KVCacheQuantMode = {
-    DataType.FP16: KVCacheQuantMode.float16,
-    DataType.BF16: KVCacheQuantMode.float16,
+    DataType.FP16: _enum_member(KVCacheQuantMode, "float16", "bfloat16"),
+    DataType.BF16: _enum_member(KVCacheQuantMode, "bfloat16", "float16"),
     DataType.FP8: KVCacheQuantMode.fp8,
     DataType.INT8: KVCacheQuantMode.int8,
 }
 
 MAP_DTYPE_TO_FMHAQuantMode = {
-    DataType.FP16: FMHAQuantMode.float16,
-    DataType.BF16: FMHAQuantMode.float16,
+    DataType.FP16: _enum_member(FMHAQuantMode, "float16", "bfloat16"),
+    DataType.BF16: _enum_member(FMHAQuantMode, "bfloat16", "float16"),
     DataType.FP8: FMHAQuantMode.fp8,
 }
 
 MAP_DTYPE_TO_MoEQuantMode = {
-    DataType.FP16: MoEQuantMode.float16,
-    DataType.BF16: MoEQuantMode.float16,
+    DataType.FP16: _enum_member(MoEQuantMode, "float16", "bfloat16"),
+    DataType.BF16: _enum_member(MoEQuantMode, "bfloat16", "float16"),
     DataType.FP8: MoEQuantMode.fp8,
     DataType.INT8: MoEQuantMode.fp8,
     DataType.FP4: MoEQuantMode.nvfp4,
@@ -80,6 +107,17 @@ MAP_DTYPE_TO_CommQunatMode = {
 
 
 logger = get_logger("hisim")
+
+
+def _get_default_systems_paths():
+    if get_system_config_path is not None:
+        return get_system_config_path()
+    if get_systems_paths is not None:
+        paths = get_systems_paths()
+        if isinstance(paths, list) and len(paths) == 1:
+            return paths[0]
+        return paths
+    return None
 
 
 # XGBoost
@@ -265,23 +303,28 @@ def _parse_decode_bs_range_from_xgb_model_path(
 
 
 def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.BaseModel:
+    model_path = model.model_path if getattr(model, "model_path", None) else model.name
+    model_path = re.sub(r"_\d{14}$", "", model_path)
+
+    moe_tp_eff = getattr(sched_config, "moe_tp_size", None) or sched_config.tp_size
+
     model_config = ModelConfig(
         pp_size=sched_config.pp_size,
         tp_size=sched_config.tp_size,
-        moe_tp_size=sched_config.tp_size,  # FIXME
+        moe_tp_size=moe_tp_eff,
         moe_ep_size=sched_config.ep_size,
-        attention_dp_size=sched_config.dp_size,  # FIXME
+        attention_dp_size=sched_config.dp_size,
         gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
-            sched_config.data_type, GEMMQuantMode.float16
+            sched_config.data_type, _GEMM_DEFAULT
         ),
         moe_quant_mode=MAP_DTYPE_TO_MoEQuantMode.get(
-            sched_config.data_type, MoEQuantMode.float16
+            sched_config.data_type, _MOE_DEFAULT
         ),
         kvcache_quant_mode=MAP_DTYPE_TO_KVCacheQuantMode.get(
-            sched_config.kv_cache_data_type, KVCacheQuantMode.float16
+            sched_config.kv_cache_data_type, _KV_DEFAULT
         ),
         fmha_quant_mode=MAP_DTYPE_TO_FMHAQuantMode.get(
-            sched_config.kv_cache_data_type, FMHAQuantMode.float16
+            sched_config.kv_cache_data_type, _FMHA_DEFAULT
         ),
         comm_quant_mode=MAP_DTYPE_TO_CommQunatMode.get(
             sched_config.data_type, CommQuantMode.half
@@ -290,8 +333,9 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
     )
 
     if model.model_type in ["qwen", "qwen2", "qwen3", "llama", "chatglm"]:
-        # aiconfigurator.sdk.backends.trtllm_backend._get_memory_usage() requires the SupportedModels.
-        SupportedModels.update(
+        # Older aiconfigurator versions require populating SupportedModels.
+        if SupportedModels is not None:
+            SupportedModels.update(
             {
                 model.name: [
                     "LLAMA",
@@ -309,9 +353,10 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
                     None,
                 ]
             }
-        )
+            )
     elif model.model_type in ["deepseek_v3", "kimi_k2"]:
-        SupportedModels.update(
+        if SupportedModels is not None:
+            SupportedModels.update(
             {
                 model.name: [
                     "DEEPSEEK",
@@ -329,9 +374,10 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
                     None,
                 ]
             }
-        )
+            )
     elif model.model_type in ["qwen3_moe"]:
-        SupportedModels.update(
+        if SupportedModels is not None:
+            SupportedModels.update(
             {
                 model.name: [
                     "MOE",
@@ -349,14 +395,10 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
                     None,
                 ]
             }
-        )
+            )
     else:
         raise ValueError(f"Unsupported model type: {model.model_type}")
-    return models.get_model(
-        model_name=model.name,
-        model_config=model_config,
-        backend_name=sched_config.backend_name,
-    )
+    return models.get_model(model_path, model_config, sched_config.backend_name)
 
 
 class AIConfiguratorTimePredictor(InferTimePredictor):
@@ -379,13 +421,12 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
 
+        systems_paths = database_path if database_path is not None else _get_default_systems_paths()
         database = get_database(
-            system=hw.name,
-            backend=config.backend_name,
-            version=config.backend_version,
-            systems_dir=database_path
-            if database_path is not None
-            else get_system_config_path(),
+            hw.name,
+            config.backend_name,
+            config.backend_version,
+            systems_paths,
         )
 
         if database is None:

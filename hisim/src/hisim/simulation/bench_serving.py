@@ -1993,10 +1993,27 @@ def calculate_metrics(
 
 
 def load_simulation_metrics() -> BenchmarkMetrics | None:
-    out_dir = os.getenv("HISIM_OUTPUT_DIR", "/tmp/hisim/output/")
-    metrics_path = os.path.join(out_dir, "metrics.json")
-    if not os.path.exists(metrics_path):
-        print(f"Fail to get simmulation metrics from {out_dir}")
+    out_dirs = []
+    configured = os.getenv("HISIM_OUTPUT_DIR")
+    if configured:
+        out_dirs.append(configured)
+    out_dirs.extend(
+        [
+            "/tmp/hisim/output/",
+            os.path.expanduser("~/.cache/hisim/output"),
+            os.path.join(os.getcwd(), ".hisim", "output"),
+        ]
+    )
+
+    metrics_path = None
+    for out_dir in out_dirs:
+        candidate = os.path.join(out_dir, "metrics.json")
+        if os.path.exists(candidate):
+            metrics_path = candidate
+            break
+
+    if metrics_path is None:
+        print(f"Fail to get simmulation metrics from any of: {out_dirs}")
         return
 
     with open(metrics_path) as f:
@@ -2027,6 +2044,7 @@ async def benchmark(
     profile: bool,
     pd_separated: bool = False,
     flush_cache: bool = False,
+    flush_cache_timeout: float = 5.0,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
@@ -2121,7 +2139,28 @@ async def benchmark(
 
     # Flush cache
     if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+        flush_cache_url = base_url + "/flush_cache"
+        try:
+            response = requests.post(
+                flush_cache_url,
+                headers=get_auth_headers(),
+                timeout=flush_cache_timeout,
+            )
+            response.raise_for_status()
+            response_text = response.text.strip()
+            if response_text:
+                print(f"flush_cache response: {response_text}")
+            else:
+                print("flush_cache request completed.")
+        except requests.Timeout:
+            warnings.warn(
+                f"flush_cache timed out after {flush_cache_timeout}s at {flush_cache_url}. "
+                "Continuing benchmark without blocking."
+            )
+        except requests.RequestException as e:
+            warnings.warn(
+                f"flush_cache request failed ({e}). Continuing benchmark."
+            )
 
     time.sleep(1.0)
 
@@ -2657,6 +2696,8 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+    if not hasattr(args, "flush_cache_timeout"):
+        args.flush_cache_timeout = 5.0
 
     # Prepare LoRA arguments
     lora_request_distribution = (
@@ -2687,6 +2728,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            flush_cache_timeout=args.flush_cache_timeout,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
@@ -3001,6 +3043,12 @@ if __name__ == "__main__":
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=float,
+        default=5.0,
+        help="Timeout in seconds for /flush_cache HTTP request. Prevents hangs when server-side flush blocks.",
     )
     parser.add_argument(
         "--warmup-requests",

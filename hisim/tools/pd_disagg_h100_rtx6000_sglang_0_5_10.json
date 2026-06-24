@@ -1,0 +1,45 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "h100_sxm"
+    }
+  },
+  "predictor": {
+    "name": "aiconfigurator",
+    "database_path": "/mnt/nfs02/users/yaoyao1/projects/aiconfigurator/src/aiconfigurator/systems",
+    "device_name": "h100_sxm"
+  },
+  "scheduler": {
+    "tp_size": 1,
+    "ep_size": 1,
+    "data_type": "FP16",
+    "kv_cache_data_type": "FP16",
+    "backend_name": "sglang",
+    "backend_version": "0.5.10"
+  },
+  "disagg": {
+    "enabled": true,
+    "backend": "single_process",
+    "decode_queue_mode": "single_replica",
+    "prefill": {
+      "device_name": "h100_sxm",
+      "tp_size": 1,
+      "ep_size": 1,
+      "replicas": 1,
+      "database_path": "/mnt/nfs02/users/yaoyao1/projects/aiconfigurator/src/aiconfigurator/systems",
+      "backend_version": "0.5.10"
+    },
+    "decode": {
+      "device_name": "rtx_pro_6000_server",
+      "tp_size": 1,
+      "ep_size": 1,
+      "replicas": 1,
+      "database_path": "/mnt/nfs02/users/yaoyao1/projects/aiconfigurator/src/aiconfigurator/systems",
+      "backend_version": "0.5.10"
+    },
+    "kv_transfer": {
+      "bw_gbps": 200,
+      "latency_us": 10
+    }
+  }
+}

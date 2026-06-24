@@ -51,7 +51,7 @@ model_config_mapping_dict = {
     ],
     "attn_algo": [],
     "architecture": [],
-    "model_path": "",
+    "model_path": ["_name_or_path", "name"],
     ## DeepSeek config
     "moe_intermediate_size": [],
     "n_routed_experts": [

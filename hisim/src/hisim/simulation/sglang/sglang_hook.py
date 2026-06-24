@@ -576,6 +576,12 @@ class C_SchedulerHook(BaseHook):
 
     OVERLAP_SCHEDULE: bool = False
 
+    # PD disaggregation (Phase 2b): populated in wrapped_init when the
+    # config's `disagg.enabled` is True. Stays None for the aggregated path.
+    PD_BACKEND = None  # Optional[BackendA]
+    # rid -> PDRequestState; populated lazily as sglang surfaces requests.
+    PD_REQUEST_STATES: dict = {}
+
     SIM_MODE = MockSimulationMode(Envs.simulation_mode())
     OFFLINE_RECV_ALL_REQUEST: bool = False
     FUTURE_QUEUE: list[
@@ -612,6 +618,7 @@ class C_SchedulerHook(BaseHook):
 
             original_init(self, *args, **kwargs)
 
+            disagg_cfg = ConfigManager.get_disagg_config()
             try:
                 model = ConfigManager.get_model_info(
                     self.model_config.hf_config.__dict__
@@ -629,9 +636,57 @@ class C_SchedulerHook(BaseHook):
                     ConfigManager.get_inference_time_predictor(model, hw, sched_config)
                 )
             except Exception as e:
-                logger.error(
-                    f"Failed to initialize inference time predictor. Error: {e}"
-                )
+                if disagg_cfg.enabled:
+                    # In PD mode, decode still uses INFERENCE_PREDICTOR latency.
+                    # If the aggregated predictor config is unavailable, fall back
+                    # to the disagg decode-role predictor so launch can proceed.
+                    from hisim.simulation.pd_factory import build_disagg
+
+                    bundle = build_disagg(
+                        model=model,
+                        base_sched_config=sched_config,
+                        disagg_config=disagg_cfg,
+                    )
+                    C_SchedulerHook.INFERENCE_PREDICTOR = bundle.decode
+                    logger.warning(
+                        "Failed to initialize global inference predictor (%s); "
+                        "falling back to disagg decode-role predictor.",
+                        e,
+                    )
+                else:
+                    logger.error(
+                        f"Failed to initialize inference time predictor. Error: {e}"
+                    )
+                    raise e
+
+            # Phase 2b.3 / 5c.1 / 5c.2: optionally build the PD disagg backend.
+            # Dispatches on disagg.backend ("single_process" → BackendA,
+            # "two_process" → BackendB). start_pd_backend handles BackendB's
+            # start() + atexit shutdown so workers can't leak.
+            try:
+                if disagg_cfg.enabled:
+                    from hisim.simulation.pd_runtime import (
+                        build_pd_backend,
+                        start_pd_backend,
+                    )
+
+                    backend = build_pd_backend(
+                        model=model,
+                        base_sched_config=sched_config,
+                        disagg_config=disagg_cfg,
+                    )
+                    C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
+                    logger.info(
+                        "PD disaggregation enabled (backend=%s, prefill_replicas=%d, "
+                        "decode_replicas=%d).",
+                        disagg_cfg.backend,
+                        C_SchedulerHook.PD_BACKEND.prefill_pool_size(),
+                        C_SchedulerHook.PD_BACKEND.decode_pool_size(),
+                    )
+                else:
+                    C_SchedulerHook.PD_BACKEND = None
+            except Exception as e:
+                logger.error(f"Failed to initialize PD backend. Error: {e}")
                 raise e
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
@@ -751,6 +806,7 @@ class C_SchedulerHook(BaseHook):
 
             if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
+                C_SchedulerHook.LAST_FLUSH_TS = C_SchedulerHook.LAST_CPU_TS
                 StateManager.set_global_clock(0)
 
             return recv_reqs
@@ -795,8 +851,13 @@ class C_SchedulerHook(BaseHook):
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            if batch is None:
+                for candidate in list(args) + list(kwargs.values()):
+                    if hasattr(candidate, "reqs") and hasattr(candidate, "forward_mode"):
+                        batch = candidate
+                        break
 
-            if ret.__class__.__name__ == "GenerationBatchResult":
+            if batch is not None and hasattr(batch, "forward_mode"):
                 hisim_batch = HisimScheduleBatch(reqs=[])
                 if batch.forward_mode.is_extend():
                     for req in batch.reqs:
@@ -825,6 +886,131 @@ class C_SchedulerHook(BaseHook):
                         )
                     )
                     predicted_latency = float(predicted_latency)
+
+                    # Phase 2b.4a: when PD is active, override prefill latency
+                    # with the BackendA prefill pool clock. Decode path still
+                    # uses the aggregated predictor (covered in 2b.4b).
+                    if (
+                        C_SchedulerHook.PD_BACKEND is not None
+                        and batch.forward_mode.is_extend()
+                    ):
+                        from hisim.simulation.pd_runtime import (
+                            admit_prefill_batch_latency,
+                            finalize_prefill_batch,
+                        )
+                        from hisim.simulation.pd_types import (
+                            PDRequestState,
+                            RequestPhase,
+                        )
+                        from hisim.simulation.pd_metrics import (
+                            populate_request_stats,
+                        )
+
+                        now_clock = StateManager.get_global_clock()
+                        states = []
+                        for req in batch.reqs:
+                            s = C_SchedulerHook.PD_REQUEST_STATES.get(req.rid)
+                            if s is None:
+                                s = PDRequestState(
+                                    rid=req.rid,
+                                    arrival_time=now_clock,
+                                    phase=RequestPhase.WAITING_PREFILL,
+                                    input_length=int(req.extend_input_len),
+                                    output_length=int(
+                                        getattr(
+                                            req.sampling_params,
+                                            "max_new_tokens",
+                                            0,
+                                        )
+                                        or 0
+                                    ),
+                                )
+                                C_SchedulerHook.PD_REQUEST_STATES[req.rid] = s
+                            states.append(s)
+
+                        pd_latency = admit_prefill_batch_latency(
+                            C_SchedulerHook.PD_BACKEND, states, now_clock
+                        )
+                        # Move each finished-prefill request into KV_TRANSIT
+                        # with its computed kv_ready_time, so the controller
+                        # is ready for the next iteration's KV-ready poll.
+                        finalize_prefill_batch(
+                            C_SchedulerHook.PD_BACKEND,
+                            states,
+                            now_clock + pd_latency,
+                        )
+                        for s in states:
+                            stats = C_SchedulerHook.REQUEST_STATS.get(s.rid)
+                            if stats is not None:
+                                populate_request_stats(stats, s)
+                        logger.debug(
+                            "[PD] extend batch: %d reqs, agg_pred=%.6fs, "
+                            "pd_pred=%.6fs",
+                            len(states),
+                            predicted_latency,
+                            pd_latency,
+                        )
+                        predicted_latency = pd_latency
+                    elif (
+                        C_SchedulerHook.PD_BACKEND is not None
+                        and batch.forward_mode.is_decode()
+                    ):
+                        from hisim.simulation.pd_runtime import (
+                            decode_batch_latency,
+                            drain_kv_ready_and_admit_decode,
+                        )
+                        from hisim.simulation.pd_metrics import (
+                            populate_request_stats,
+                        )
+
+                        now_clock = StateManager.get_global_clock()
+                        # Promote KV-ready requests to RUNNING_DECODE so the
+                        # controller's bookkeeping matches what sglang shows us.
+                        drain_kv_ready_and_admit_decode(
+                            C_SchedulerHook.PD_BACKEND,
+                            now=now_clock,
+                            capacity=len(batch.reqs),
+                        )
+                        states = [
+                            C_SchedulerHook.PD_REQUEST_STATES[req.rid]
+                            for req in batch.reqs
+                            if req.rid in C_SchedulerHook.PD_REQUEST_STATES
+                        ]
+                        if states:
+                            pd_latency = decode_batch_latency(
+                                C_SchedulerHook.PD_BACKEND, states, now_clock
+                            )
+                            # Bookkeeping: credit one decode step per request.
+                            C_SchedulerHook.PD_BACKEND.on_decode_step_done_batch(
+                                states, now_clock + pd_latency
+                            )
+                            for s in states:
+                                stats = C_SchedulerHook.REQUEST_STATS.get(s.rid)
+                                if stats is not None:
+                                    populate_request_stats(stats, s)
+                            logger.debug(
+                                "[PD] decode batch: %d reqs, agg_pred=%.6fs, "
+                                "pd_pred=%.6fs",
+                                len(states),
+                                predicted_latency,
+                                pd_latency,
+                            )
+                            predicted_latency = pd_latency
+                            # Phase 3: GC FINISHED states and copy stage
+                            # durations onto RequestStats so calc_metrics
+                            # can aggregate prefill/kv/decode-queue percentiles.
+                            from hisim.simulation.pd_metrics import (
+                                flush_finished_states,
+                            )
+
+                            flushed = flush_finished_states(
+                                C_SchedulerHook.PD_REQUEST_STATES,
+                                C_SchedulerHook.REQUEST_STATS,
+                            )
+                            if flushed:
+                                logger.debug(
+                                    "[PD] flushed %d finished states", flushed
+                                )
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
@@ -900,6 +1086,16 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_profile(self, req, *args, **kwargs):
+            # Final safety-net flush so any FINISHED PD states whose decode
+            # tick fired after the last GC point still contribute stage
+            # percentiles to the metrics dump.
+            if C_SchedulerHook.PD_REQUEST_STATES:
+                from hisim.simulation.pd_metrics import flush_finished_states
+
+                flush_finished_states(
+                    C_SchedulerHook.PD_REQUEST_STATES,
+                    C_SchedulerHook.REQUEST_STATS,
+                )
             stats: list[RequestStats] = []
             for item in C_SchedulerHook.REQUEST_STATS.values():
                 if item.rid is not None and item.input_length > 0:
@@ -909,6 +1105,25 @@ class C_SchedulerHook(BaseHook):
 
             output_dir = Envs.output_dir()
             os.makedirs(output_dir, exist_ok=True)
+
+            ProfileReqOutput = getattr(
+                importlib.import_module("sglang.srt.managers.io_struct"),
+                "ProfileReqOutput",
+            )
+
+            if len(stats) == 0:
+                logger.info(
+                    "Profile requested with no completed simulation stats; keeping PD backend/state intact."
+                )
+                return ProfileReqOutput(
+                    True,
+                    json.dumps(
+                        {
+                            "total_request": 0,
+                            "output_directory": output_dir,
+                        }
+                    ),
+                )
 
             if len(stats) > 0:
                 # Remove warmup requests.
@@ -950,14 +1165,19 @@ class C_SchedulerHook(BaseHook):
             StateManager.reset()
             C_SchedulerHook.REQUEST_STATS.clear()
             C_SchedulerHook.ITERATION_STATS.clear()
+            C_SchedulerHook.PD_REQUEST_STATES.clear()
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
 
-            ProfileReqOutput = getattr(
-                importlib.import_module("sglang.srt.managers.io_struct"),
-                "ProfileReqOutput",
-            )
+            # Phase 5c.2: tear down PD backend workers (BackendB only).
+            # atexit also fires shutdown_pd_backend; idempotent.
+            if C_SchedulerHook.PD_BACKEND is not None:
+                from hisim.simulation.pd_runtime import shutdown_pd_backend
+
+                shutdown_pd_backend(C_SchedulerHook.PD_BACKEND)
+                C_SchedulerHook.PD_BACKEND = None
+
             result = {
                 "total_request": len(stats),
                 "output_directory": output_dir,

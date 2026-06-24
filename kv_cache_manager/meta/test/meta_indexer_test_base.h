@@ -22,7 +22,7 @@ protected:
     // describes key_i's locations + block-level properties.
     struct KVData {
         KeyVector keys;
-        LocationMapVector location_maps;
+        CacheLocationMapVector location_maps;
         PropertyMapVector properties;
     };
 
@@ -36,15 +36,14 @@ protected:
 
     // Build a single-location CacheLocation with the given id/uri, using the
     // same schema as MakeKVData so producers/consumers stay in lockstep.
-    static CacheLocation MakeLocation(const std::string &id, const std::string &uri);
+    static CacheLocationConstPtr MakeLocation(const std::string &id, const std::string &uri);
 
     // Assertions over MetaIndexer::Get(LocationMapVector, PropertyMapVector)
     // (the new whole-block read path).
+    void
+    AssertGet(const KeyVector &keys, const CacheLocationMapVector &expect_location_maps, const Result &expect_result);
     void AssertGet(const KeyVector &keys,
-                   const LocationMapVector &expect_location_maps,
-                   const Result &expect_result);
-    void AssertGet(const KeyVector &keys,
-                   const LocationMapVector &expect_location_maps,
+                   const CacheLocationMapVector &expect_location_maps,
                    const PropertyMapVector &expect_properties,
                    const Result &expect_result);
     void AssertGetProperties(const KeyVector &keys,

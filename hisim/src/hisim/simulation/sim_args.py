@@ -3,6 +3,12 @@ import dataclasses
 import json
 from typing import Optional
 
+from hisim.simulation.pd_config import (
+    BandwidthTransferConfig,
+    DisaggConfig,
+    RolePredictorConfig,
+)
+
 
 @dataclasses.dataclass
 class AcceleratorConfig:
@@ -47,6 +53,7 @@ class SimulationArgs:
     platform: PlatformConfig = dataclasses.field(default_factory=PlatformConfig)
     predictor: PredictorConfig = dataclasses.field(default_factory=PredictorConfig)
     scheduler: SchedulerConfig = dataclasses.field(default_factory=SchedulerConfig)
+    disagg: DisaggConfig = dataclasses.field(default_factory=DisaggConfig)
 
     def add_cli_args(parser: argparse.ArgumentParser):
         prefix = "sim-"
@@ -141,6 +148,90 @@ class SimulationArgs:
             default=None,
         )
 
+        # ----- disagg flags -----
+        parser.add_argument(
+            f"--{prefix}disagg-enable",
+            dest="sim_disagg_enable",
+            action="store_true",
+        )
+        parser.add_argument(
+            f"--{prefix}disagg-backend",
+            dest="sim_disagg_backend",
+            type=str,
+            default=None,
+            choices=["single_process", "two_process"],
+        )
+        parser.add_argument(
+            f"--{prefix}disagg-decode-queue-mode",
+            dest="sim_disagg_decode_queue_mode",
+            type=str,
+            default=None,
+            choices=["single_replica", "per_replica_queue"],
+        )
+        for role in ("prefill", "decode"):
+            parser.add_argument(
+                f"--{prefix}disagg-{role}-device-name",
+                dest=f"sim_disagg_{role}_device_name",
+                type=str,
+                default=None,
+            )
+            for short, full in (("tp", "tp_size"), ("ep", "ep_size"),
+                                ("dp", "dp_size"), ("pp", "pp_size")):
+                parser.add_argument(
+                    f"--{prefix}disagg-{role}-{short}",
+                    dest=f"sim_disagg_{role}_{full}",
+                    type=int,
+                    default=None,
+                )
+            parser.add_argument(
+                f"--{prefix}disagg-{role}-replicas",
+                dest=f"sim_disagg_{role}_replicas",
+                type=int,
+                default=None,
+            )
+            parser.add_argument(
+                f"--{prefix}disagg-{role}-max-running",
+                dest=f"sim_disagg_{role}_max_running_per_replica",
+                type=int,
+                default=None,
+            )
+            parser.add_argument(
+                f"--{prefix}disagg-{role}-data-type",
+                dest=f"sim_disagg_{role}_data_type",
+                type=str,
+                default=None,
+            )
+            parser.add_argument(
+                f"--{prefix}disagg-{role}-kv-cache-data-type",
+                dest=f"sim_disagg_{role}_kv_cache_data_type",
+                type=str,
+                default=None,
+            )
+            parser.add_argument(
+                f"--{prefix}disagg-{role}-database-path",
+                dest=f"sim_disagg_{role}_database_path",
+                type=str,
+                default=None,
+            )
+            parser.add_argument(
+                f"--{prefix}disagg-{role}-backend-version",
+                dest=f"sim_disagg_{role}_backend_version",
+                type=str,
+                default=None,
+            )
+        parser.add_argument(
+            f"--{prefix}kv-transfer-bw-gbps",
+            dest="sim_kv_transfer_bw_gbps",
+            type=float,
+            default=None,
+        )
+        parser.add_argument(
+            f"--{prefix}kv-transfer-latency-us",
+            dest="sim_kv_transfer_latency_us",
+            type=float,
+            default=None,
+        )
+
     @staticmethod
     def from_json(path: str) -> "SimulationArgs":
         with open(path, "r", encoding="utf-8") as f:
@@ -177,6 +268,7 @@ class SimulationArgs:
                 backend_name=scheduler.get("backend_name", "sglang"),
                 backend_version=scheduler.get("backend_version"),
             ),
+            disagg=_disagg_from_dict(cfg.get("disagg", {})),
         )
 
     def to_dict(self, indent=2, ensure_ascii: bool = False) -> dict:
@@ -231,4 +323,99 @@ class SimulationArgs:
             if v is not None:
                 setattr(args.scheduler, field, v)
 
+        # disagg
+        args.disagg = _disagg_from_cli(ns)
+
         return args
+
+
+_ROLE_FIELDS = (
+    "device_name",
+    "tp_size",
+    "ep_size",
+    "dp_size",
+    "pp_size",
+    "replicas",
+    "max_running_per_replica",
+    "data_type",
+    "kv_cache_data_type",
+    "database_path",
+    "backend_version",
+)
+
+
+def _role_from_dict(d: dict) -> RolePredictorConfig:
+    kwargs = {k: d[k] for k in _ROLE_FIELDS if k in d and d[k] is not None}
+    if "prefill_scale_factor" in d:
+        kwargs["prefill_scale_factor"] = d["prefill_scale_factor"]
+    if "decode_scale_factor" in d:
+        kwargs["decode_scale_factor"] = d["decode_scale_factor"]
+    return RolePredictorConfig(**kwargs)
+
+
+def _disagg_from_dict(d: dict) -> DisaggConfig:
+    if not d.get("enabled", False):
+        return DisaggConfig()
+    prefill = _role_from_dict(d["prefill"]) if "prefill" in d else None
+    decode = _role_from_dict(d["decode"]) if "decode" in d else None
+    transfer = None
+    if "kv_transfer" in d:
+        kv = d["kv_transfer"]
+        transfer = BandwidthTransferConfig(
+            bw_gbps=kv["bw_gbps"], latency_us=kv["latency_us"]
+        )
+    return DisaggConfig(
+        enabled=True,
+        backend=d.get("backend", "single_process"),
+        decode_queue_mode=d.get("decode_queue_mode", "single_replica"),
+        prefill=prefill,
+        decode=decode,
+        kv_transfer=transfer,
+    )
+
+
+def _role_from_cli(ns: argparse.Namespace, role: str) -> Optional[RolePredictorConfig]:
+    device_name = getattr(ns, f"sim_disagg_{role}_device_name", None)
+    if device_name is None:
+        return None
+    kwargs = {"device_name": device_name}
+    for field in (
+        "tp_size",
+        "ep_size",
+        "dp_size",
+        "pp_size",
+        "replicas",
+        "max_running_per_replica",
+        "data_type",
+        "kv_cache_data_type",
+        "database_path",
+        "backend_version",
+    ):
+        v = getattr(ns, f"sim_disagg_{role}_{field}", None)
+        if v is not None:
+            kwargs[field] = v
+    return RolePredictorConfig(**kwargs)
+
+
+def _disagg_from_cli(ns: argparse.Namespace) -> DisaggConfig:
+    if not getattr(ns, "sim_disagg_enable", False):
+        return DisaggConfig()
+    prefill = _role_from_cli(ns, "prefill")
+    decode = _role_from_cli(ns, "decode")
+    bw = getattr(ns, "sim_kv_transfer_bw_gbps", None)
+    lat = getattr(ns, "sim_kv_transfer_latency_us", None)
+    transfer = (
+        BandwidthTransferConfig(bw_gbps=bw, latency_us=lat)
+        if bw is not None and lat is not None
+        else None
+    )
+    backend = getattr(ns, "sim_disagg_backend", None) or "single_process"
+    return DisaggConfig(
+        enabled=True,
+        backend=backend,
+        decode_queue_mode=getattr(ns, "sim_disagg_decode_queue_mode", None)
+        or "single_replica",
+        prefill=prefill,
+        decode=decode,
+        kv_transfer=transfer,
+    )

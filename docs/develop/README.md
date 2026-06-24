@@ -1,4 +1,7 @@
 # 开发方式
+## HiSim
+- PD sweep（same seed + flush cache）运行手册： [hisim_pd_sweep_runbook.md](./hisim_pd_sweep_runbook.md)
+
 ## 开发镜像
 - Manager开发镜像（仅包含Manager相关依赖，不包含CUDA）：
   - 镜像：ghcr.io/alibaba/tair-kvcache-kvcm-dev:latest
