@@ -127,6 +127,24 @@ def test_finalize_prefill_batch_calls_on_prefill_done_with_kv_ready_time():
     assert all(s.phase == RequestPhase.KV_TRANSIT for s in states)
 
 
+def test_finalize_prefill_batch_uses_each_request_prefill_end_time_when_present():
+    ctrl = _StubController(kv_dur=0.002)
+    be = _StubBackendForTransition(ctrl)
+    a = _running_prefill_state("a")
+    b = _running_prefill_state("b")
+    a.prefill_end_time = 0.005
+    b.prefill_end_time = 0.008
+
+    finalize_prefill_batch(be, [a, b], now=0.010)
+
+    assert ctrl.prefill_done_calls == [
+        ("a", 0.005, pytest.approx(0.007)),
+        ("b", 0.008, pytest.approx(0.010)),
+    ]
+    assert a.kv_ready_time == pytest.approx(0.007)
+    assert b.kv_ready_time == pytest.approx(0.010)
+
+
 def test_drain_kv_ready_and_admit_decode_polls_and_admits():
     ctrl = _StubController(kv_dur=0)
 

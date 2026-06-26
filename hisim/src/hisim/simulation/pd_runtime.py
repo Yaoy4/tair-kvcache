@@ -259,6 +259,7 @@ def admit_prefill_batch_latency(
     max_end = now
     for s in states:
         _, end_t = backend.try_admit_prefill(s, now)
+        s.prefill_end_time = end_t
         if end_t > max_end:
             max_end = end_t
     return max_end - now
@@ -288,8 +289,9 @@ def finalize_prefill_batch(
     request to KV_TRANSIT with its computed kv_ready_time.
     """
     for s in states:
-        kv_ready = backend.compute_kv_ready_time(s, now)
-        backend.on_prefill_done(s, now, kv_ready)
+        prefill_end = s.prefill_end_time if s.prefill_end_time is not None else now
+        kv_ready = backend.compute_kv_ready_time(s, prefill_end)
+        backend.on_prefill_done(s, prefill_end, kv_ready)
 
 
 def drain_kv_ready_and_admit_decode(

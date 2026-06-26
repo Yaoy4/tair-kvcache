@@ -139,6 +139,33 @@ def test_admit_decode_respects_capacity_and_sets_decode_start_time():
     assert ctrl.decode_waiting_count() == 1
 
 
+def test_admit_decode_targeted_only_starts_requested_rids():
+    ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
+    reqs = []
+    for i in range(3):
+        r = PDRequestState(rid=f"r{i}", arrival_time=0.0, input_length=8)
+        ctrl.on_request_arrival(r, now=0.0)
+        ctrl.admit_prefill(capacity=3, now=0.0)
+        ctrl.on_prefill_done(
+            r,
+            now=1.0,
+            kv_ready_time=ctrl.compute_kv_ready_time(r, 1.0),
+        )
+        reqs.append(r)
+    ctrl.poll_kv_ready(now=10.0)
+
+    admitted = ctrl.admit_decode_targeted({"r1"}, now=10.0)
+
+    assert [r.rid for r in admitted] == ["r1"]
+    assert reqs[1].phase == RequestPhase.RUNNING_DECODE
+    assert reqs[1].decode_start_time == 10.0
+    assert reqs[0].phase == RequestPhase.WAITING_DECODE
+    assert reqs[2].phase == RequestPhase.WAITING_DECODE
+    assert ctrl.decode_waiting_count() == 2
+    later = ctrl.admit_decode(capacity=2, now=11.0)
+    assert [r.rid for r in later] == ["r0", "r2"]
+
+
 def test_on_decode_step_done_increments_state_and_finishes_when_done():
     ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=4, output_length=2)

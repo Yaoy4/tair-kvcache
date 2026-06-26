@@ -38,7 +38,7 @@
       "backend_version": "0.5.10"
     },
     "kv_transfer": {
-      "bw_gbps": 256,
+      "bw_gbps": 128,
       "latency_us": 20
     }
   }

@@ -63,3 +63,12 @@ def test_admit_prefill_batch_latency_marks_each_request_running():
     admit_prefill_batch_latency(be, states, now=0.5)
     assert all(s.phase == RequestPhase.RUNNING_PREFILL for s in states)
     assert all(s.prefill_start_time == 0.5 for s in states)
+
+
+def test_admit_prefill_batch_latency_tracks_each_request_end_time():
+    be = _StubBackend(end_times=[1.003, 1.007, 1.005])
+    states = [_state("a"), _state("b"), _state("c")]
+    admit_prefill_batch_latency(be, states, now=1.0)
+    assert [s.prefill_end_time for s in states] == pytest.approx(
+        [1.003, 1.007, 1.005]
+    )
