@@ -288,8 +288,37 @@ class BackendB:
             raise AssertionError("controller did not admit just-enqueued request")
         return idx, end
 
+    def try_admit_prefill_batch(
+        self, reqs: Sequence[PDRequestState], now: float
+    ) -> Tuple[int, float]:
+        """Schedule an entire prefill batch to one worker using sum of tokens."""
+        if not reqs:
+            raise ValueError("try_admit_prefill_batch requires at least one request")
+        self._require_started()
+        idx, worker = self._earliest_worker(self._prefill_workers)
+        start = max(now, worker.busy_until)
+        total_tokens = sum(r.input_length for r in reqs)
+        job_id = self._next_id()
+        worker.in_q.put(_PrefillJob(job_id=job_id, batch_tokens=total_tokens))
+        res = self._await_result(worker, job_id, role="prefill", idx=idx)
+        end = start + res.duration
+        worker.busy_until = end
+        for req in reqs:
+            self._controller.on_request_arrival(req, now)
+        admitted = self._controller.admit_prefill(capacity=len(reqs), now=start)
+        if len(admitted) != len(reqs):
+            raise AssertionError(
+                f"controller admitted {len(admitted)} of {len(reqs)} requests"
+            )
+        for req in reqs:
+            req.prefill_end_time = end
+        return idx, end
+
     def compute_kv_ready_time(self, req: PDRequestState, now: float) -> float:
         return self._controller.compute_kv_ready_time(req, now)
+
+    def compute_batch_kv_ready_time(self, total_tokens: int, now: float) -> float:
+        return self._controller.compute_batch_kv_ready_time(total_tokens, now)
 
     def on_prefill_done(
         self, req: PDRequestState, now: float, kv_ready_time: float

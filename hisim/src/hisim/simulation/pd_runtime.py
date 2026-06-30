@@ -249,20 +249,19 @@ def admit_prefill_batch_latency(
     states: Sequence[PDRequestState],
     now: float,
 ) -> float:
-    """Admit every request in `states` onto the backend's prefill pool.
+    """Admit the entire batch onto the backend's prefill pool as one unit.
 
-    Returns the predicted batch latency = (max prefill end time) - now.
+    Calls ``backend.try_admit_prefill_batch`` which issues a single predictor
+    call with the sum of all request input lengths — matching the way a real
+    prefill node processes a batch as one forward pass.
+
+    Returns the predicted batch latency = batch_end_time - now.
     Returns 0.0 for an empty batch.
     """
     if not states:
         return 0.0
-    max_end = now
-    for s in states:
-        _, end_t = backend.try_admit_prefill(s, now)
-        s.prefill_end_time = end_t
-        if end_t > max_end:
-            max_end = end_t
-    return max_end - now
+    _, end_t = backend.try_admit_prefill_batch(states, now)
+    return end_t - now
 
 
 def decode_batch_latency(
@@ -286,11 +285,20 @@ def finalize_prefill_batch(
     now: float,
 ) -> None:
     """After a prefill batch completes at virtual time `now`, move each
-    request to KV_TRANSIT with its computed kv_ready_time.
+    request to KV_TRANSIT with a shared kv_ready_time.
+
+    KV transfer is modeled as a single serial stream over the combined data of
+    all requests (sum of input_lengths), so all requests in the batch share the
+    same kv_ready_time. This matches the user-selected sum-total KV transfer
+    model.
     """
+    states = list(states)
+    if not states:
+        return
+    total_tokens = sum(s.input_length for s in states)
+    kv_ready = backend.compute_batch_kv_ready_time(total_tokens, now)
     for s in states:
         prefill_end = s.prefill_end_time if s.prefill_end_time is not None else now
-        kv_ready = backend.compute_kv_ready_time(s, prefill_end)
         backend.on_prefill_done(s, prefill_end, kv_ready)
 
 

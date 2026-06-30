@@ -47,8 +47,16 @@ class PDBackendProtocol(Protocol):
         self, req: PDRequestState, now: float
     ) -> Tuple[int, float]: ...
 
+    def try_admit_prefill_batch(
+        self, reqs: Sequence[PDRequestState], now: float
+    ) -> Tuple[int, float]: ...
+
     def compute_kv_ready_time(
         self, req: PDRequestState, now: float
+    ) -> float: ...
+
+    def compute_batch_kv_ready_time(
+        self, total_tokens: int, now: float
     ) -> float: ...
 
     def on_prefill_done(

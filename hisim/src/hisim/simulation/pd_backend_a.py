@@ -110,8 +110,41 @@ class BackendA:
             raise AssertionError("controller did not admit just-enqueued request")
         return idx, end
 
+    def try_admit_prefill_batch(
+        self, reqs: Sequence[PDRequestState], now: float
+    ) -> Tuple[int, float]:
+        """Schedule an entire prefill batch onto one replica.
+
+        All requests in the batch share a single predictor call using the
+        sum of their input lengths, matching how a real prefill node processes
+        a batch as one forward pass. Returns (replica_idx, batch_end_time).
+        """
+        if not reqs:
+            raise ValueError("try_admit_prefill_batch requires at least one request")
+        idx, free_at = self._prefill_pool.earliest_replica()
+        start = max(now, free_at)
+        total_tokens = sum(r.input_length for r in reqs)
+        dur = self._bundle.prefill.predict_prefill_seconds(total_tokens)
+        end = start + dur
+        self._prefill_pool.busy_until[idx] = end
+        # Drive controller state machine for the entire batch at once.
+        for req in reqs:
+            self._controller.on_request_arrival(req, now)
+        admitted = self._controller.admit_prefill(capacity=len(reqs), now=start)
+        if len(admitted) != len(reqs):
+            raise AssertionError(
+                f"controller admitted {len(admitted)} of {len(reqs)} requests"
+            )
+        # Stamp the shared batch end time on each request.
+        for req in reqs:
+            req.prefill_end_time = end
+        return idx, end
+
     def compute_kv_ready_time(self, req: PDRequestState, now: float) -> float:
         return self._controller.compute_kv_ready_time(req, now)
+
+    def compute_batch_kv_ready_time(self, total_tokens: int, now: float) -> float:
+        return self._controller.compute_batch_kv_ready_time(total_tokens, now)
 
     def on_prefill_done(
         self, req: PDRequestState, now: float, kv_ready_time: float

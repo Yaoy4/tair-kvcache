@@ -220,3 +220,47 @@ def test_full_lifecycle_finishes(backend):
         )
         backend.on_decode_step_done(r, now=end_t)
     assert r.phase == RequestPhase.FINISHED
+
+
+# ---------------------------------------------------------------------------
+# Batch prefill parity (try_admit_prefill_batch + compute_batch_kv_ready_time)
+# ---------------------------------------------------------------------------
+
+
+def test_batch_prefill_uses_sum_tokens(backend):
+    """try_admit_prefill_batch must call the predictor with total token count."""
+    reqs = [_req(f"r{i}", input_len=200) for i in range(4)]  # 800 total
+    idx, end_t = backend.try_admit_prefill_batch(reqs, now=0.0)
+    # fast: 0.1 us/tok * 800 = 80 us
+    assert end_t == pytest.approx(8e-5)
+
+
+def test_batch_prefill_all_requests_share_timestamps(backend):
+    reqs = [_req("a", input_len=100), _req("b", input_len=300)]
+    _, end_t = backend.try_admit_prefill_batch(reqs, now=0.0)
+    assert all(r.prefill_end_time == pytest.approx(end_t) for r in reqs)
+    assert all(r.prefill_start_time == pytest.approx(0.0) for r in reqs)
+    assert all(r.phase == RequestPhase.RUNNING_PREFILL for r in reqs)
+
+
+def test_batch_prefill_occupies_single_replica(backend):
+    reqs = [_req(f"r{i}") for i in range(3)]
+    _, end_t = backend.try_admit_prefill_batch(reqs, now=0.0)
+    # The batch was scheduled (took positive time)
+    assert end_t > 0.0
+    # With 2 prefill replicas, the other replica stays free; earliest is still 0
+    assert backend.earliest_pool_time("prefill") == 0.0
+
+
+def test_batch_prefill_rejects_empty(backend):
+    with pytest.raises(ValueError):
+        backend.try_admit_prefill_batch([], now=0.0)
+
+
+def test_compute_batch_kv_ready_time_uses_total_tokens(backend):
+    """Batch KV ready time must scale with total_tokens, not max per-request."""
+    # kv_bytes_per_token = 131072 (FP16, TP=1), bw=100Gbps, latency=10us
+    total_tokens = 8
+    expected = 10e-6 + 8 * 131072 / 100e9
+    assert backend.compute_batch_kv_ready_time(total_tokens, now=0.0) == pytest.approx(expected)
+

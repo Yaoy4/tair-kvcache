@@ -90,6 +90,16 @@ class PDController:
         )
         return now + transfer_dur
 
+    def compute_batch_kv_ready_time(self, total_tokens: int, now: float) -> float:
+        """Batch-level KV transfer estimate.
+
+        Treats the whole batch's KV data as a single serial transfer stream:
+        t = latency + sum(all request tokens) * bytes_per_token / bw.
+        All requests in the batch share the same kv_ready_time.
+        """
+        transfer_dur = self._transfer_model.estimate(total_tokens, self._kv_model_cfg)
+        return now + transfer_dur
+
     def poll_kv_ready(self, now: float) -> List[PDRequestState]:
         ready: List[PDRequestState] = []
         remaining: List[PDRequestState] = []

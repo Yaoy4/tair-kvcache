@@ -327,3 +327,73 @@ def test_on_decode_batch_step_done_advances_all_requests():
     # each req gets one decode step credited; output_len=1 → FINISHED
     for r in reqs:
         assert r.phase == RequestPhase.FINISHED
+
+
+# ---------------------------------------------------------------------------
+# Batch prefill admission (try_admit_prefill_batch)
+# ---------------------------------------------------------------------------
+
+
+def test_try_admit_prefill_batch_uses_sum_tokens():
+    """Predictor must receive sum of all input_lengths, not per-request values."""
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=1))
+    reqs = [_req(f"r{i}", input_len=200) for i in range(4)]  # 800 tokens total
+    idx, end_t = be.try_admit_prefill_batch(reqs, now=0.0)
+    # fast: 0.1 us/tok * 800 = 80 us = 8e-5 s
+    assert idx == 0
+    assert end_t == pytest.approx(8e-5)
+
+
+def test_try_admit_prefill_batch_all_reqs_share_end_time():
+    """All requests in a batch receive the same prefill_end_time."""
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=1))
+    reqs = [_req("a", input_len=100), _req("b", input_len=300), _req("c", input_len=200)]
+    _, end_t = be.try_admit_prefill_batch(reqs, now=0.0)
+    for r in reqs:
+        assert r.prefill_end_time == pytest.approx(end_t)
+
+
+def test_try_admit_prefill_batch_all_reqs_share_start_time():
+    """All requests in a batch receive the same prefill_start_time via controller."""
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=1))
+    reqs = [_req("a"), _req("b"), _req("c")]
+    be.try_admit_prefill_batch(reqs, now=0.5)
+    assert all(r.prefill_start_time == pytest.approx(0.5) for r in reqs)
+    assert all(r.phase == RequestPhase.RUNNING_PREFILL for r in reqs)
+
+
+def test_try_admit_prefill_batch_occupies_single_replica():
+    """The batch goes to ONE replica; other replicas stay free."""
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=4))
+    reqs = [_req(f"r{i}", input_len=100) for i in range(3)]
+    be.try_admit_prefill_batch(reqs, now=0.0)
+    busy_count = sum(1 for t in be._prefill_pool.busy_until if t > 0.0)
+    assert busy_count == 1
+
+
+def test_try_admit_prefill_batch_queues_behind_busy_replica():
+    """Two consecutive batches on 1 replica must serialize."""
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=1))
+    batch_a = [_req("a", input_len=1000)]
+    batch_b = [_req("b", input_len=1000)]
+    _, end_a = be.try_admit_prefill_batch(batch_a, now=0.0)
+    _, end_b = be.try_admit_prefill_batch(batch_b, now=0.0)
+    # fast: 0.1 us * 1000 = 100 us each → serial → b ends at 200 us
+    assert end_a == pytest.approx(1e-4)
+    assert end_b == pytest.approx(2e-4)
+
+
+def test_try_admit_prefill_batch_rejects_empty():
+    be = BackendA(_bundle())
+    with pytest.raises(ValueError):
+        be.try_admit_prefill_batch([], now=0.0)
+
+
+def test_compute_batch_kv_ready_time_uses_total_tokens():
+    """KV ready time must use sum of tokens, not per-request max."""
+    be = BackendA(_bundle(bw_gbps=100.0, latency_us=10.0))
+    # kv_bytes_per_token for FP16/TP=1 = 131072
+    total_tokens = 4
+    expected = 10e-6 + 4 * 131072 / 100e9
+    assert be.compute_batch_kv_ready_time(total_tokens, now=0.0) == pytest.approx(expected)
+

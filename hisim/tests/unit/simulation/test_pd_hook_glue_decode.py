@@ -66,6 +66,10 @@ class _StubController:
     def compute_kv_ready_time(self, req, now):
         return now + self._kv_dur
 
+    def compute_batch_kv_ready_time(self, total_tokens, now):
+        # Stub: ignores total_tokens, returns now + kv_dur for predictable assertions
+        return now + self._kv_dur
+
     def on_prefill_done(self, req, now, kv_ready_time):
         self.prefill_done_calls.append((req.rid, now, kv_ready_time))
         req.phase = RequestPhase.KV_TRANSIT
@@ -100,6 +104,9 @@ class _StubBackendForTransition:
     def compute_kv_ready_time(self, req, now):
         return self._ctrl.compute_kv_ready_time(req, now)
 
+    def compute_batch_kv_ready_time(self, total_tokens, now):
+        return self._ctrl.compute_batch_kv_ready_time(total_tokens, now)
+
     def on_prefill_done(self, req, now, kv_ready_time):
         self._ctrl.on_prefill_done(req, now, kv_ready_time)
 
@@ -120,6 +127,7 @@ def test_finalize_prefill_batch_calls_on_prefill_done_with_kv_ready_time():
     be = _StubBackendForTransition(ctrl)
     states = [_running_prefill_state("a"), _running_prefill_state("b")]
     finalize_prefill_batch(be, states, now=0.005)
+    # Both requests share the same kv_ready_time computed from now=0.005
     assert ctrl.prefill_done_calls == [
         ("a", 0.005, pytest.approx(0.007)),
         ("b", 0.005, pytest.approx(0.007)),
@@ -127,22 +135,26 @@ def test_finalize_prefill_batch_calls_on_prefill_done_with_kv_ready_time():
     assert all(s.phase == RequestPhase.KV_TRANSIT for s in states)
 
 
-def test_finalize_prefill_batch_uses_each_request_prefill_end_time_when_present():
+def test_finalize_prefill_batch_all_requests_share_kv_ready_time():
+    """All requests in a batch share a single kv_ready_time (sum KV model)."""
     ctrl = _StubController(kv_dur=0.002)
     be = _StubBackendForTransition(ctrl)
     a = _running_prefill_state("a")
     b = _running_prefill_state("b")
+    # Even with different prefill_end_times, kv_ready_time is computed
+    # from the `now` argument (batch end time), not per-request prefill_end_time.
     a.prefill_end_time = 0.005
     b.prefill_end_time = 0.008
 
     finalize_prefill_batch(be, [a, b], now=0.010)
 
+    # kv_ready_time is now + kv_dur = 0.010 + 0.002 = 0.012 for both
     assert ctrl.prefill_done_calls == [
-        ("a", 0.005, pytest.approx(0.007)),
-        ("b", 0.008, pytest.approx(0.010)),
+        ("a", 0.005, pytest.approx(0.012)),
+        ("b", 0.008, pytest.approx(0.012)),
     ]
-    assert a.kv_ready_time == pytest.approx(0.007)
-    assert b.kv_ready_time == pytest.approx(0.010)
+    assert a.kv_ready_time == pytest.approx(0.012)
+    assert b.kv_ready_time == pytest.approx(0.012)
 
 
 def test_drain_kv_ready_and_admit_decode_polls_and_admits():
