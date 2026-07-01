@@ -64,5 +64,16 @@ class Envs:
         return int(os.getenv("HISIM_NUM_WARMUP", "0"))
 
     @classmethod
+    def pd_closed_loop(cls) -> bool:
+        # Closed-loop emulation for PD-disaggregated runs. When enabled, the
+        # harness feeds all requests at virtual t=0 (request_rate=inf) and caps
+        # in-system concurrency via the scheduler's max_running_requests=C. In
+        # that setup gen_token_latencies[0] can absorb synthetic cap queueing
+        # from the t=0 bulk arrival. closed-loop mode switches first-token TTFT
+        # to service-span accounting (prefill+KV+first decode step), matching
+        # SGLang's client-gated closed-loop benchmark semantics.
+        return os.getenv("HISIM_PD_CLOSED_LOOP") == "1"
+
+    @classmethod
     def reset_hicache_storage(cls) -> bool:
         return os.getenv("HISIM_RESET_HICACHE_STORAGE") == "1"

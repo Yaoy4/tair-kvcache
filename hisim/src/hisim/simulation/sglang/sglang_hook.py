@@ -583,6 +583,25 @@ class C_SchedulerHook(BaseHook):
     PD_REQUEST_STATES: dict = {}
     # rids that actually emitted one token in the most recent PD decode batch.
     PD_BATCH_TOKEN_RIDS: set[str] = set()
+    # P1 dual-clock decoupling: the single global clock serialised prefill and
+    # decode (a prefill batch + its KV transfer froze every in-flight decode in
+    # virtual time). These two role clocks advance independently — prefill only
+    # by extend batches, decode only by decode batches — and reconcile at the
+    # KV handoff via sync_decode_start. They self-anchor to real arrival /
+    # kv_ready times, so 0 init is valid in both OFFLINE and BLOCKING modes.
+    PD_PREFILL_CLOCK: float = 0.0
+    PD_DECODE_CLOCK: float = 0.0
+    # End time of the most recent PD decode batch step, on the decode role
+    # clock. process_batch_result records decode tokens at this time instead of
+    # the (prefill/KV-polluted) global clock, so ITL/TTFT/E2E/makespan are clean.
+    PD_LAST_DECODE_STEP_END: float = 0.0
+    # Per-request service span accumulated on the prefill role timeline:
+    # (kv_ready_time - prefill_start_time). Used by closed-loop first-token
+    # TTFT accounting to drop synthetic t=0 cap queueing.
+    PD_PREFILL_KV_SERVICE: dict[str, float] = {}
+    # Closed-loop TTFT accounting switch (enabled via disagg.closed_loop_ttft in
+    # HISIM config, with HISIM_PD_CLOSED_LOOP env as an override fallback).
+    PD_CLOSED_LOOP: bool = False
 
     SIM_MODE = MockSimulationMode(Envs.simulation_mode())
     OFFLINE_RECV_ALL_REQUEST: bool = False
@@ -621,6 +640,23 @@ class C_SchedulerHook(BaseHook):
             original_init(self, *args, **kwargs)
 
             disagg_cfg = ConfigManager.get_disagg_config()
+            cfg_closed_loop = False
+            try:
+                with open(Envs.config_path(), "r", encoding="utf-8") as f:
+                    cfg_closed_loop = bool(
+                        json.load(f)
+                        .get("disagg", {})
+                        .get("closed_loop_ttft", False)
+                    )
+            except Exception:
+                cfg_closed_loop = False
+            C_SchedulerHook.PD_CLOSED_LOOP = (
+                cfg_closed_loop or Envs.pd_closed_loop()
+            )
+            logger.info(
+                "PD closed-loop TTFT mode: %s",
+                C_SchedulerHook.PD_CLOSED_LOOP,
+            )
             try:
                 model = ConfigManager.get_model_info(
                     self.model_config.hf_config.__dict__
@@ -678,6 +714,13 @@ class C_SchedulerHook(BaseHook):
                         disagg_config=disagg_cfg,
                     )
                     C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
+                    # Fresh run: reset the PD role clocks so a re-built backend
+                    # (e.g. a new sweep config in the same process) starts from
+                    # a clean t=0 timeline.
+                    C_SchedulerHook.PD_PREFILL_CLOCK = 0.0
+                    C_SchedulerHook.PD_DECODE_CLOCK = 0.0
+                    C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
+                    C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
                     logger.info(
                         "PD disaggregation enabled (backend=%s, prefill_replicas=%d, "
                         "decode_replicas=%d).",
@@ -687,6 +730,7 @@ class C_SchedulerHook(BaseHook):
                     )
                 else:
                     C_SchedulerHook.PD_BACKEND = None
+                    C_SchedulerHook.PD_CLOSED_LOOP = False
             except Exception as e:
                 logger.error(f"Failed to initialize PD backend. Error: {e}")
                 raise e
@@ -810,6 +854,12 @@ class C_SchedulerHook(BaseHook):
                 C_SchedulerHook.LAST_CPU_TS = time.time()
                 C_SchedulerHook.LAST_FLUSH_TS = C_SchedulerHook.LAST_CPU_TS
                 StateManager.set_global_clock(0)
+                # Anchor the PD role clocks to the same t=0 origin as the
+                # global clock at the start of a run.
+                C_SchedulerHook.PD_PREFILL_CLOCK = 0.0
+                C_SchedulerHook.PD_DECODE_CLOCK = 0.0
+                C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
+                C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
 
             return recv_reqs
 
@@ -858,6 +908,54 @@ class C_SchedulerHook(BaseHook):
                     if hasattr(candidate, "reqs") and hasattr(candidate, "forward_mode"):
                         batch = candidate
                         break
+
+            # In recent SGLang multiprocessing layouts, run_batch can execute in
+            # a worker process that does not carry over class-level PD backend
+            # state from wrapped_init. Build it lazily on first use.
+            if C_SchedulerHook.PD_BACKEND is None:
+                disagg_cfg = ConfigManager.get_disagg_config()
+                if disagg_cfg.enabled:
+                    cfg_closed_loop = False
+                    try:
+                        with open(Envs.config_path(), "r", encoding="utf-8") as f:
+                            cfg_closed_loop = bool(
+                                json.load(f)
+                                .get("disagg", {})
+                                .get("closed_loop_ttft", False)
+                            )
+                    except Exception:
+                        cfg_closed_loop = False
+                    C_SchedulerHook.PD_CLOSED_LOOP = (
+                        cfg_closed_loop or Envs.pd_closed_loop()
+                    )
+                    from hisim.simulation.pd_runtime import (
+                        build_pd_backend,
+                        start_pd_backend,
+                    )
+
+                    model = ConfigManager.get_model_info(
+                        self.model_config.hf_config.__dict__
+                    )
+                    sched_config = ConfigManager.get_scheduler_config(
+                        self.server_args.__dict__,
+                        "sglang",
+                        self.model_config.hf_config.__dict__,
+                    )
+                    backend = build_pd_backend(
+                        model=model,
+                        base_sched_config=sched_config,
+                        disagg_config=disagg_cfg,
+                    )
+                    C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
+                    C_SchedulerHook.PD_PREFILL_CLOCK = 0.0
+                    C_SchedulerHook.PD_DECODE_CLOCK = 0.0
+                    C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
+                    C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
+                    logger.info(
+                        "PD backend lazily initialized in run_batch (backend=%s, closed_loop=%s).",
+                        disagg_cfg.backend,
+                        C_SchedulerHook.PD_CLOSED_LOOP,
+                    )
 
             if batch is not None and hasattr(batch, "forward_mode"):
                 hisim_batch = HisimScheduleBatch(reqs=[])
@@ -908,15 +1006,55 @@ class C_SchedulerHook(BaseHook):
                         from hisim.simulation.pd_metrics import (
                             populate_request_stats,
                         )
+                        from hisim.simulation.pd_timeline import (
+                            has_unsupported_chunked,
+                            prefill_batch_start,
+                        )
 
-                        now_clock = StateManager.get_global_clock()
+                        # P1 #3 guard: chunked prefill spreads one request over
+                        # several extend batches, which the PD glue does not yet
+                        # account for (input_length/kv_ready/decode-base would be
+                        # captured from a single chunk). Warn loudly instead of
+                        # silently emitting corrupted PD numbers. Unchunked
+                        # batches (is_chunked == 0 for every req) are unaffected.
+                        if has_unsupported_chunked(batch.reqs):
+                            logger.warning(
+                                "[PD] chunked prefill detected (is_chunked != 0); "
+                                "PD prefill/KV accounting assumes one extend batch "
+                                "per request and may be inaccurate until the "
+                                "chunked-prefill fix lands. Disable chunked prefill "
+                                "for PD-disaggregated simulation runs."
+                            )
+
+                        # P1: prefill role clock. The batch starts no earlier
+                        # than the prefill engine is free AND every request has
+                        # arrived (self-anchoring to real created_time, so the
+                        # timeline shares the global clock's t=0 origin without
+                        # being pushed forward by decode work).
+                        arrivals = []
+                        for req in batch.reqs:
+                            st = C_SchedulerHook.REQUEST_STATS.get(req.rid)
+                            arrivals.append(
+                                st.created_time if st is not None else None
+                            )
+                        now_clock = prefill_batch_start(
+                            C_SchedulerHook.PD_PREFILL_CLOCK, arrivals
+                        )
                         states = []
                         for req in batch.reqs:
                             s = C_SchedulerHook.PD_REQUEST_STATES.get(req.rid)
                             if s is None:
+                                st = C_SchedulerHook.REQUEST_STATS.get(req.rid)
+                                arrival = now_clock
+                                if (
+                                    st is not None
+                                    and st.created_time is not None
+                                    and st.created_time >= 0.0
+                                ):
+                                    arrival = st.created_time
                                 s = PDRequestState(
                                     rid=req.rid,
-                                    arrival_time=now_clock,
+                                    arrival_time=arrival,
                                     phase=RequestPhase.WAITING_PREFILL,
                                     input_length=int(req.extend_input_len),
                                     output_length=int(
@@ -943,32 +1081,52 @@ class C_SchedulerHook(BaseHook):
                             now_clock + pd_latency,
                         )
                         for s in states:
+                            if s.kv_ready_time is not None:
+                                if s.prefill_start_time is not None:
+                                    prefill_kv_service = max(
+                                        s.kv_ready_time
+                                        - s.prefill_start_time,
+                                        0.0,
+                                    )
+                                else:
+                                    # Some SGLang paths do not stamp
+                                    # prefill_start_time onto PDRequestState.
+                                    # Reconstruct prefill+KV service from the
+                                    # observed batch window plus kv_ready.
+                                    prefill_end = (
+                                        s.prefill_end_time
+                                        if s.prefill_end_time is not None
+                                        else now_clock + pd_latency
+                                    )
+                                    prefill_kv_service = max(
+                                        prefill_end - now_clock, 0.0
+                                    ) + max(
+                                        s.kv_ready_time - prefill_end,
+                                        0.0,
+                                    )
+                                C_SchedulerHook.PD_PREFILL_KV_SERVICE[s.rid] = (
+                                    prefill_kv_service
+                                )
                             stats = C_SchedulerHook.REQUEST_STATS.get(s.rid)
                             if stats is not None:
                                 populate_request_stats(stats, s)
-                        # Advance the global simulation clock past kv_ready_time
-                        # so the next decode iteration's poll_kv_ready() sees
-                        # now >= kv_ready_time and properly promotes all
-                        # requests from KV_TRANSIT → WAITING_DECODE →
-                        # RUNNING_DECODE. Without this, KV transfer time is
-                        # silently dropped from the timeline and the first
-                        # decode step starts before the KV cache has arrived
-                        # on the decode node.
-                        kv_times = [
-                            s.kv_ready_time - (now_clock + pd_latency)
-                            for s in states
-                            if s.kv_ready_time is not None
-                        ]
-                        kv_transfer_extra = max(max(kv_times), 0.0) if kv_times else 0.0
+                        # P1: advance ONLY the prefill role clock by the prefill
+                        # batch latency. KV transfer time is NOT added to any
+                        # advancing clock (fixes #2): it is encoded solely in
+                        # per-request kv_ready_time (set by finalize_prefill_batch
+                        # above), and the decode role clock gates on it via
+                        # sync_decode_start. This stops a prefill batch + its KV
+                        # transfer from freezing in-flight decode in virtual time.
+                        C_SchedulerHook.PD_PREFILL_CLOCK = now_clock + pd_latency
                         logger.debug(
                             "[PD] extend batch: %d reqs, agg_pred=%.6fs, "
-                            "pd_pred=%.6fs, kv_transfer_extra=%.6fs",
+                            "pd_pred=%.6fs, prefill_clock=%.6fs",
                             len(states),
                             predicted_latency,
                             pd_latency,
-                            kv_transfer_extra,
+                            C_SchedulerHook.PD_PREFILL_CLOCK,
                         )
-                        predicted_latency = pd_latency + kv_transfer_extra
+                        predicted_latency = pd_latency
                     elif (
                         C_SchedulerHook.PD_BACKEND is not None
                         and batch.forward_mode.is_decode()
@@ -980,17 +1138,40 @@ class C_SchedulerHook(BaseHook):
                         from hisim.simulation.pd_metrics import (
                             populate_request_stats,
                         )
+                        from hisim.simulation.pd_timeline import (
+                            sync_decode_start,
+                        )
 
-                        now_clock = StateManager.get_global_clock()
+                        # P1: decode role clock. The decode engine is free at
+                        # PD_DECODE_CLOCK; the step also cannot begin before the
+                        # KV cache of any request joining this batch has arrived.
+                        # sync_decode_start jumps the clock forward to the latest
+                        # such kv_ready_time (the prefill->decode handoff), and is
+                        # otherwise driven purely by decode step latency — so
+                        # prefill/KV work never freezes in-flight decode.
+                        step_start = C_SchedulerHook.PD_DECODE_CLOCK
+                        for req in batch.reqs:
+                            s = C_SchedulerHook.PD_REQUEST_STATES.get(req.rid)
+                            if (
+                                s is not None
+                                and s.phase
+                                in (
+                                    RequestPhase.KV_TRANSIT,
+                                    RequestPhase.WAITING_DECODE,
+                                )
+                            ):
+                                step_start = sync_decode_start(
+                                    step_start, s.kv_ready_time
+                                )
                         ctrl = C_SchedulerHook.PD_BACKEND.controller()
-                        ctrl.poll_kv_ready(now_clock)
+                        ctrl.poll_kv_ready(step_start)
                         ctrl.admit_decode_targeted(
                             {
                                 req.rid
                                 for req in batch.reqs
                                 if req.rid in C_SchedulerHook.PD_REQUEST_STATES
                             },
-                            now_clock,
+                            step_start,
                         )
                         # Only include requests that are both in the current
                         # SGLang decode batch and have been admitted onto the
@@ -1008,25 +1189,33 @@ class C_SchedulerHook(BaseHook):
                         ]
                         if states:
                             pd_latency = decode_batch_latency(
-                                C_SchedulerHook.PD_BACKEND, states, now_clock
+                                C_SchedulerHook.PD_BACKEND, states, step_start
                             )
+                            step_end = step_start + pd_latency
                             C_SchedulerHook.PD_BATCH_TOKEN_RIDS = {
                                 s.rid for s in states
                             }
                             # Bookkeeping: credit one decode step per request.
                             C_SchedulerHook.PD_BACKEND.on_decode_step_done_batch(
-                                states, now_clock + pd_latency
+                                states, step_end
                             )
                             for s in states:
                                 stats = C_SchedulerHook.REQUEST_STATS.get(s.rid)
                                 if stats is not None:
                                     populate_request_stats(stats, s)
+                            # P1: advance the decode role clock and remember the
+                            # step end so process_batch_result records this
+                            # batch's tokens on the decode timeline (not the
+                            # prefill/KV-polluted global clock).
+                            C_SchedulerHook.PD_DECODE_CLOCK = step_end
+                            C_SchedulerHook.PD_LAST_DECODE_STEP_END = step_end
                             logger.debug(
                                 "[PD] decode batch: %d reqs, agg_pred=%.6fs, "
-                                "pd_pred=%.6fs",
+                                "pd_pred=%.6fs, decode_clock=%.6fs",
                                 len(states),
                                 predicted_latency,
                                 pd_latency,
+                                step_end,
                             )
                             predicted_latency = pd_latency
                             # Phase 3: GC FINISHED states and copy stage
@@ -1094,6 +1283,19 @@ class C_SchedulerHook(BaseHook):
                         + hicache_l2_backup_dur
                     )
                     request_response_time = StateManager.get_global_clock()
+                pd_decode_mode = (
+                    C_SchedulerHook.PD_BACKEND is not None
+                    and hasattr(batch, "forward_mode")
+                    and batch.forward_mode.is_decode()
+                )
+                pd_closed_loop = (
+                    pd_decode_mode and C_SchedulerHook.PD_CLOSED_LOOP
+                )
+                if pd_closed_loop:
+                    from hisim.simulation.pd_timeline import (
+                        closed_loop_first_token_latency,
+                    )
+
                 # Request statistics
                 for req in batch.reqs:
                     if req.is_chunked == 0:
@@ -1121,6 +1323,62 @@ class C_SchedulerHook(BaseHook):
                             and req.rid not in C_SchedulerHook.PD_BATCH_TOKEN_RIDS
                         ):
                             pass  # this PD decode batch did not emit a token for this rid
+                        elif (
+                            C_SchedulerHook.PD_BACKEND is not None
+                            and hasattr(batch, "forward_mode")
+                            and batch.forward_mode.is_decode()
+                        ):
+                            # P1: record the decode token on the decode role
+                            # clock (PD_LAST_DECODE_STEP_END) instead of the
+                            # global clock. For the first token last_event_time
+                            # is still the arrival time, so gen[0] == full TTFT;
+                            # for later tokens it is the previous step end, so
+                            # gen[i] == decode step latency (ITL). This makes
+                            # E2E = sum(gen) telescope to decode_end - arrival,
+                            # and last_event_time track the true decode makespan
+                            # — all free of prefill/KV serialisation.
+                            token_time = C_SchedulerHook.PD_LAST_DECODE_STEP_END
+                            if pd_closed_loop and not req_stats.gen_token_latencies:
+                                state = C_SchedulerHook.PD_REQUEST_STATES.get(
+                                    req.rid
+                                )
+                                service_ttft = None
+                                if state is not None:
+                                    # Closed-loop emulation feeds all arrivals
+                                    # at virtual t=0. Measure first-token TTFT
+                                    # from the request's service spans to drop
+                                    # the synthetic cap queueing.
+                                    service_ttft = closed_loop_first_token_latency(
+                                        token_time,
+                                        prefill_start_time=state.prefill_start_time,
+                                        kv_ready_time=state.kv_ready_time,
+                                        decode_start_time=state.decode_start_time,
+                                    )
+                                if service_ttft is None:
+                                    prefill_kv = (
+                                        C_SchedulerHook.PD_PREFILL_KV_SERVICE.get(
+                                            req.rid
+                                        )
+                                    )
+                                    if prefill_kv is not None:
+                                        service_ttft = (
+                                            prefill_kv
+                                            + max(current_inference_dur, 0.0)
+                                        )
+                                if service_ttft is not None:
+                                    req_stats.gen_token_latencies.append(
+                                        service_ttft
+                                    )
+                                else:
+                                    req_stats.gen_token_latencies.append(
+                                        token_time
+                                        - req_stats.last_event_time
+                                    )
+                            else:
+                                req_stats.gen_token_latencies.append(
+                                    token_time - req_stats.last_event_time
+                                )
+                            req_stats.last_event_time = token_time
                         else:
                             req_stats.gen_token_latencies.append(
                                 request_response_time
@@ -1224,6 +1482,7 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.REQUEST_STATS.clear()
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.PD_REQUEST_STATES.clear()
+            C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False

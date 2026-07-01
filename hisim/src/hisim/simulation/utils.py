@@ -65,8 +65,17 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     prefill_queue_waits = []
     kv_transfer_times = []
     decode_queue_waits = []
+    skipped_empty = 0
     for req in requests:
         if not req.is_complete():
+            continue
+        if not req.gen_token_latencies:
+            # A request can reach REQUEST_STATS (it arrived and was tracked)
+            # without ever recording a generated-token latency — e.g. a client
+            # warmup request whose decode had not been credited before a
+            # flush/profile snapshot. Such a request has no measurable
+            # TTFT/TPOT/E2E; skip it rather than crashing the whole dump.
+            skipped_empty += 1
             continue
         completed += 1
         ttfts.append(req.gen_token_latencies[0])
@@ -88,6 +97,7 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     return {
         "num_requests": len(requests),
         "completed": completed,
+        "skipped_empty_requests": skipped_empty,
         "total_input": total_input,
         "total_output": total_output,
         "duration": total_dur_s,

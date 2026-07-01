@@ -151,3 +151,38 @@ equivalence to be declared.
 
 This document, committed and tagged `pd-phase-6a`. No code, no tests.
 The next slice (Phase 6 proper) implements the harness against this spec.
+
+## Addendum (P1 — overlap dual-clock): equivalence is preserved
+
+The P1 dual-clock decoupling (prefill/decode role clocks + KV-ready handoff,
+see `pd_timeline.py` and the SGLang hook) does **not** weaken this spec:
+
+- The role clocks (`PD_PREFILL_CLOCK`, `PD_DECODE_CLOCK`,
+  `PD_LAST_DECODE_STEP_END`) and the `gen_token_latencies` time-source swap
+  live entirely in the **SGLang hook closure**, which sits *above* both
+  backends. The identical clock logic runs regardless of whether
+  `PD_BACKEND` is BackendA or BackendB.
+- The per-batch quantities the backends actually produce — prefill batch
+  latency, `kv_ready_time`, decode step latency — are unchanged by P1. The
+  hook merely stops *serialising* them onto one global clock; it does not
+  alter how A or B computes them.
+- Therefore the per-request stage identities and tolerances above
+  (`prefill_end - arrival`, KV transfer, `decode_end - decode_start`,
+  queue waits, `e2e`) remain bit-for-bit equal across A/B. The
+  `test_pd_ab_*` and `test_pd_backend_parity` suites continue to pass
+  after P1.
+
+What P1 *does* change is the **absolute timeline** on which decode tokens
+are recorded (TTFT/ITL/E2E/throughput now read the decode role clock instead
+of the prefill/KV-polluted global clock). That change is symmetric across A
+and B, so A≡B still holds; it only moves both backends *together* toward the
+overlap-correct timeline modelled by the DES reference
+(`tools/pd_vs_agg_compare.py`).
+
+Residual caveat (unchanged by P1): a single SGLang scheduler loop still
+drives both logical engines, so decode **batch composition / ordering** is a
+single-engine approximation. Dual-clock removes the first-order distortion
+(prefill + KV no longer freeze in-flight decode); the second-order
+batch-composition effect needs a true two-process scheduler and is out of
+scope for both this spec and P1.
+

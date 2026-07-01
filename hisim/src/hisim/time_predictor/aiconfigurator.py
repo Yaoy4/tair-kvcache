@@ -337,7 +337,7 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
         if SupportedModels is not None:
             SupportedModels.update(
             {
-                model.name: [
+                model_path: [
                     "LLAMA",
                     model.num_hidden_layers,
                     model.num_attention_heads,
@@ -358,7 +358,7 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
         if SupportedModels is not None:
             SupportedModels.update(
             {
-                model.name: [
+                model_path: [
                     "DEEPSEEK",
                     model.num_hidden_layers,
                     model.num_attention_heads,
@@ -379,7 +379,7 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
         if SupportedModels is not None:
             SupportedModels.update(
             {
-                model.name: [
+                model_path: [
                     "MOE",
                     model.num_hidden_layers,
                     model.num_attention_heads,
