@@ -28,7 +28,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from hisim.simulation.pd_controller import PDController
 from hisim.simulation.pd_factory import DisaggPredictors
-from hisim.simulation.pd_types import PDRequestState
+from hisim.simulation.pd_types import PDRequestState, RequestPhase
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +291,12 @@ class BackendB:
     def try_admit_prefill_batch(
         self, reqs: Sequence[PDRequestState], now: float
     ) -> Tuple[int, float]:
-        """Schedule an entire prefill batch to one worker using sum of tokens."""
+        """Schedule an entire prefill batch to one worker using sum of tokens.
+
+        Phase guard: only WAITING_PREFILL requests go through the controller
+        lifecycle; mid-chunk requests (already RUNNING_PREFILL) bypass state
+        transitions but still contribute to the latency estimate.
+        """
         if not reqs:
             raise ValueError("try_admit_prefill_batch requires at least one request")
         self._require_started()
@@ -303,13 +308,16 @@ class BackendB:
         res = self._await_result(worker, job_id, role="prefill", idx=idx)
         end = start + res.duration
         worker.busy_until = end
-        for req in reqs:
+        # Drive lifecycle only for WAITING_PREFILL requests; skip mid-chunk ones.
+        fresh = [r for r in reqs if r.phase == RequestPhase.WAITING_PREFILL]
+        for req in fresh:
             self._controller.on_request_arrival(req, now)
-        admitted = self._controller.admit_prefill(capacity=len(reqs), now=start)
-        if len(admitted) != len(reqs):
-            raise AssertionError(
-                f"controller admitted {len(admitted)} of {len(reqs)} requests"
-            )
+        if fresh:
+            admitted = self._controller.admit_prefill(capacity=len(fresh), now=start)
+            if len(admitted) != len(fresh):
+                raise AssertionError(
+                    f"controller admitted {len(admitted)} of {len(fresh)} fresh requests"
+                )
         for req in reqs:
             req.prefill_end_time = end
         return idx, end

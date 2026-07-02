@@ -599,6 +599,10 @@ class C_SchedulerHook(BaseHook):
     # (kv_ready_time - prefill_start_time). Used by closed-loop first-token
     # TTFT accounting to drop synthetic t=0 cap queueing.
     PD_PREFILL_KV_SERVICE: dict[str, float] = {}
+    # Accumulated chunk token counts for chunked-prefill requests. Tracks the
+    # running sum of extend_input_len across extend batches so full prompt
+    # length is known at finalize time when origin_input_ids is unavailable.
+    PD_CHUNK_ACCUM: dict = {}
     # Closed-loop TTFT accounting switch (enabled via disagg.closed_loop_ttft in
     # HISIM config, with HISIM_PD_CLOSED_LOOP env as an override fallback).
     PD_CLOSED_LOOP: bool = False
@@ -721,6 +725,7 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.PD_DECODE_CLOCK = 0.0
                     C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                     C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
+                    C_SchedulerHook.PD_CHUNK_ACCUM.clear()
                     logger.info(
                         "PD disaggregation enabled (backend=%s, prefill_replicas=%d, "
                         "decode_replicas=%d).",
@@ -860,6 +865,7 @@ class C_SchedulerHook(BaseHook):
                 C_SchedulerHook.PD_DECODE_CLOCK = 0.0
                 C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                 C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
+                C_SchedulerHook.PD_CHUNK_ACCUM.clear()
 
             return recv_reqs
 
@@ -951,6 +957,7 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.PD_DECODE_CLOCK = 0.0
                     C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                     C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
+                    C_SchedulerHook.PD_CHUNK_ACCUM.clear()
                     logger.info(
                         "PD backend lazily initialized in run_batch (backend=%s, closed_loop=%s).",
                         disagg_cfg.backend,
@@ -1007,24 +1014,8 @@ class C_SchedulerHook(BaseHook):
                             populate_request_stats,
                         )
                         from hisim.simulation.pd_timeline import (
-                            has_unsupported_chunked,
                             prefill_batch_start,
                         )
-
-                        # P1 #3 guard: chunked prefill spreads one request over
-                        # several extend batches, which the PD glue does not yet
-                        # account for (input_length/kv_ready/decode-base would be
-                        # captured from a single chunk). Warn loudly instead of
-                        # silently emitting corrupted PD numbers. Unchunked
-                        # batches (is_chunked == 0 for every req) are unaffected.
-                        if has_unsupported_chunked(batch.reqs):
-                            logger.warning(
-                                "[PD] chunked prefill detected (is_chunked != 0); "
-                                "PD prefill/KV accounting assumes one extend batch "
-                                "per request and may be inaccurate until the "
-                                "chunked-prefill fix lands. Disable chunked prefill "
-                                "for PD-disaggregated simulation runs."
-                            )
 
                         # P1: prefill role clock. The batch starts no earlier
                         # than the prefill engine is free AND every request has
@@ -1040,10 +1031,24 @@ class C_SchedulerHook(BaseHook):
                         now_clock = prefill_batch_start(
                             C_SchedulerHook.PD_PREFILL_CLOCK, arrivals
                         )
+
+                        # Build per-request states. Accumulate chunk token counts
+                        # so full prompt length is available at finalize time.
+                        # Mid-chunk requests (already in RUNNING_PREFILL) reuse
+                        # their existing state; the backend's phase guard ensures
+                        # on_request_arrival / admit_prefill are NOT re-run on
+                        # them, preventing phase reset and double-counted time.
                         states = []
                         for req in batch.reqs:
+                            chunk_len = int(req.extend_input_len)
+                            # Running sum across chunks for full-prompt fallback.
+                            C_SchedulerHook.PD_CHUNK_ACCUM[req.rid] = (
+                                C_SchedulerHook.PD_CHUNK_ACCUM.get(req.rid, 0)
+                                + chunk_len
+                            )
                             s = C_SchedulerHook.PD_REQUEST_STATES.get(req.rid)
                             if s is None:
+                                # First (or only) chunk: create state.
                                 st = C_SchedulerHook.REQUEST_STATS.get(req.rid)
                                 arrival = now_clock
                                 if (
@@ -1056,7 +1061,7 @@ class C_SchedulerHook(BaseHook):
                                     rid=req.rid,
                                     arrival_time=arrival,
                                     phase=RequestPhase.WAITING_PREFILL,
-                                    input_length=int(req.extend_input_len),
+                                    input_length=chunk_len,
                                     output_length=int(
                                         getattr(
                                             req.sampling_params,
@@ -1067,20 +1072,58 @@ class C_SchedulerHook(BaseHook):
                                     ),
                                 )
                                 C_SchedulerHook.PD_REQUEST_STATES[req.rid] = s
+                            else:
+                                # Continuing chunk: update input_length to this
+                                # chunk's token count for per-chunk latency
+                                # accuracy (one forward pass ≈ chunk_len tokens).
+                                s.input_length = chunk_len
                             states.append(s)
 
+                        # Compute batch latency. The backend phase guard in
+                        # try_admit_prefill_batch skips controller transitions
+                        # for any state already past WAITING_PREFILL, so only
+                        # first-chunk states go through on_request_arrival +
+                        # admit_prefill.
                         pd_latency = admit_prefill_batch_latency(
                             C_SchedulerHook.PD_BACKEND, states, now_clock
                         )
-                        # Move each finished-prefill request into KV_TRANSIT
-                        # with its computed kv_ready_time, so the controller
-                        # is ready for the next iteration's KV-ready poll.
-                        finalize_prefill_batch(
-                            C_SchedulerHook.PD_BACKEND,
-                            states,
-                            now_clock + pd_latency,
-                        )
-                        for s in states:
+
+                        # Finalize only requests at their final (or only) chunk.
+                        # is_chunked == 0: this extend batch completes the
+                        # request's prefill phase.  is_chunked != 0: more chunks
+                        # follow, so leave the request in RUNNING_PREFILL.
+                        # Before finalizing, set input_length to the full prompt
+                        # so KV transfer sizing and decode KV base are accurate.
+                        final_states = []
+                        for req, s in zip(batch.reqs, states):
+                            if getattr(req, "is_chunked", 0) == 0:
+                                if (
+                                    hasattr(req, "origin_input_ids")
+                                    and req.origin_input_ids
+                                ):
+                                    s.input_length = len(req.origin_input_ids)
+                                else:
+                                    # Fallback: use accumulated chunk sum.
+                                    s.input_length = (
+                                        C_SchedulerHook.PD_CHUNK_ACCUM.get(
+                                            req.rid, s.input_length
+                                        )
+                                    )
+                                C_SchedulerHook.PD_CHUNK_ACCUM.pop(req.rid, None)
+                                final_states.append(s)
+
+                        # Move finalized requests into KV_TRANSIT so the
+                        # controller is ready for the next KV-ready poll.
+                        if final_states:
+                            finalize_prefill_batch(
+                                C_SchedulerHook.PD_BACKEND,
+                                final_states,
+                                now_clock + pd_latency,
+                            )
+
+                        # Record prefill+KV service time (closed-loop TTFT) and
+                        # populate diagnostic stats for finalized requests only.
+                        for s in final_states:
                             if s.kv_ready_time is not None:
                                 if s.prefill_start_time is not None:
                                     prefill_kv_service = max(
@@ -1110,6 +1153,7 @@ class C_SchedulerHook(BaseHook):
                             stats = C_SchedulerHook.REQUEST_STATS.get(s.rid)
                             if stats is not None:
                                 populate_request_stats(stats, s)
+
                         # P1: advance ONLY the prefill role clock by the prefill
                         # batch latency. KV transfer time is NOT added to any
                         # advancing clock (fixes #2): it is encoded solely in
@@ -1119,9 +1163,10 @@ class C_SchedulerHook(BaseHook):
                         # transfer from freezing in-flight decode in virtual time.
                         C_SchedulerHook.PD_PREFILL_CLOCK = now_clock + pd_latency
                         logger.debug(
-                            "[PD] extend batch: %d reqs, agg_pred=%.6fs, "
-                            "pd_pred=%.6fs, prefill_clock=%.6fs",
+                            "[PD] extend batch: %d reqs (%d final-chunk), "
+                            "agg_pred=%.6fs, pd_pred=%.6fs, prefill_clock=%.6fs",
                             len(states),
+                            len(final_states),
                             predicted_latency,
                             pd_latency,
                             C_SchedulerHook.PD_PREFILL_CLOCK,
@@ -1483,6 +1528,7 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.PD_REQUEST_STATES.clear()
             C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
+            C_SchedulerHook.PD_CHUNK_ACCUM.clear()
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False

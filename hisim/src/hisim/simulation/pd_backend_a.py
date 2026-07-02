@@ -118,6 +118,11 @@ class BackendA:
         All requests in the batch share a single predictor call using the
         sum of their input lengths, matching how a real prefill node processes
         a batch as one forward pass. Returns (replica_idx, batch_end_time).
+
+        Phase guard: only WAITING_PREFILL requests go through the controller
+        lifecycle (on_request_arrival + admit_prefill). Mid-chunk requests
+        (already RUNNING_PREFILL) contribute to latency estimation but bypass
+        state transitions so their phase is not reset.
         """
         if not reqs:
             raise ValueError("try_admit_prefill_batch requires at least one request")
@@ -127,15 +132,19 @@ class BackendA:
         dur = self._bundle.prefill.predict_prefill_seconds(total_tokens)
         end = start + dur
         self._prefill_pool.busy_until[idx] = end
-        # Drive controller state machine for the entire batch at once.
-        for req in reqs:
+        # Drive the controller state machine only for WAITING_PREFILL requests.
+        # Mid-chunk requests (already RUNNING_PREFILL) must not be re-arrived
+        # or re-admitted: doing so resets their phase and double-counts prefill.
+        fresh = [r for r in reqs if r.phase == RequestPhase.WAITING_PREFILL]
+        for req in fresh:
             self._controller.on_request_arrival(req, now)
-        admitted = self._controller.admit_prefill(capacity=len(reqs), now=start)
-        if len(admitted) != len(reqs):
-            raise AssertionError(
-                f"controller admitted {len(admitted)} of {len(reqs)} requests"
-            )
-        # Stamp the shared batch end time on each request.
+        if fresh:
+            admitted = self._controller.admit_prefill(capacity=len(fresh), now=start)
+            if len(admitted) != len(fresh):
+                raise AssertionError(
+                    f"controller admitted {len(admitted)} of {len(fresh)} fresh requests"
+                )
+        # Stamp the shared batch end time on ALL requests (fresh + mid-chunk).
         for req in reqs:
             req.prefill_end_time = end
         return idx, end
