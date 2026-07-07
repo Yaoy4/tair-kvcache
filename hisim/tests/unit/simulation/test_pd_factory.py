@@ -244,4 +244,7 @@ def test_default_hw_factory_falls_back_for_unknown_name():
 
 def test_default_hw_factory_keeps_known_alias_behavior():
     hw = _default_hw_factory("h20_sxm")
-    assert hw.name == "NVIDIA H20"
+    # The registry's NVIDIA_H20 entry displays as the short device name "h20"
+    # (see hisim/spec/accelerator/info.py); "h20_sxm" is just one of its
+    # device_alias entries used to look it up.
+    assert hw.name == "h20"

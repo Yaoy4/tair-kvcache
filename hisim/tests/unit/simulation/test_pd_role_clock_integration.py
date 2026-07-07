@@ -133,7 +133,14 @@ class HookDriver:
     def extend(self, reqs):
         """reqs: list of (rid, input_len, output_len, created_time)."""
         arrivals = [ct for (_, _, _, ct) in reqs]
-        now_clock = prefill_batch_start(self.prefill_clock, arrivals)
+        # Prefill's "engine free" floor is read off the backend's own replica
+        # pool (min busy_until across prefill replicas), not a hand-tracked
+        # scalar -- see the sglang_hook.py fix this mirrors. self.prefill_clock
+        # is still updated below for the p1-02 decoupling assertion, but it is
+        # no longer what gates `now_clock`.
+        now_clock = prefill_batch_start(
+            self.backend.earliest_pool_time("prefill"), arrivals
+        )
         states = []
         for (rid, ilen, olen, ct) in reqs:
             s = self.states.get(rid)
@@ -283,3 +290,32 @@ def test_overlapping_makespan_is_decode_end_and_below_old_clock():
     assert makespan == pytest.approx(decode_end)
     # ... and strictly below the old serialised global-clock makespan.
     assert makespan < d.old_global_clock
+
+
+# ---------------------------------------------------------------------------
+# Regression: with prefill_replicas > 1, an idle replica must not wait for a
+# different, still-busy replica. Before this fix, the prefill floor was a
+# hand-tracked scalar that remembered only the specific replica the previous
+# extend batch landed on, so a second concurrently-arriving request was
+# forced to wait for THAT replica even when a different one had been idle
+# the whole time.
+# ---------------------------------------------------------------------------
+def test_concurrent_extend_batches_use_idle_replica_not_busy_one():
+    d = HookDriver(_backend())  # 2 prefill replicas
+    # A: a big request that occupies one prefill replica for a while.
+    d.extend([("a", 20_000, 1, 0.0)])
+    a_end = d.states["a"].prefill_end_time
+    assert a_end > 0.0
+
+    # B: a tiny, independent request that also arrived at t=0. SGLang's
+    # serialized loop happens to hand it to the hook as the *next* extend
+    # iteration, but the second prefill replica has been idle since t=0 and
+    # should serve it immediately, concurrently with A still prefilling on
+    # the first replica.
+    d.extend([("b", 10, 1, 0.0)])
+    b_start = d.states["b"].prefill_start_time
+
+    # B must start at/near t=0 on the idle replica, NOT be pushed back to
+    # wait for A's (unrelated) replica to free up.
+    assert b_start == pytest.approx(0.0, abs=1e-9)
+    assert b_start < a_end

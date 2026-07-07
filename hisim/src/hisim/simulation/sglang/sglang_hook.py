@@ -585,11 +585,19 @@ class C_SchedulerHook(BaseHook):
     PD_BATCH_TOKEN_RIDS: set[str] = set()
     # P1 dual-clock decoupling: the single global clock serialised prefill and
     # decode (a prefill batch + its KV transfer froze every in-flight decode in
-    # virtual time). These two role clocks advance independently — prefill only
-    # by extend batches, decode only by decode batches — and reconcile at the
-    # KV handoff via sync_decode_start. They self-anchor to real arrival /
-    # kv_ready times, so 0 init is valid in both OFFLINE and BLOCKING modes.
-    PD_PREFILL_CLOCK: float = 0.0
+    # virtual time). The decode role clock advances independently of prefill —
+    # only by decode batches — and reconciles at the KV handoff via
+    # sync_decode_start. It self-anchors to real kv_ready times, so 0 init is
+    # valid in both OFFLINE and BLOCKING modes.
+    #
+    # The prefill role's "engine free" floor is NOT a hand-tracked scalar
+    # (it used to be PD_PREFILL_CLOCK, removed): with prefill_replicas > 1 a
+    # scalar tracks only the specific replica the previous extend batch landed
+    # on, which forces every later batch to wait for THAT replica even when a
+    # different one has been idle the whole time. Instead the floor is read
+    # directly off the backend's own per-replica pool state via
+    # PD_BACKEND.earliest_pool_time("prefill"), which already reflects
+    # whichever replica is actually soonest free.
     PD_DECODE_CLOCK: float = 0.0
     # End time of the most recent PD decode batch step, on the decode role
     # clock. process_batch_result records decode tokens at this time instead of
@@ -718,10 +726,11 @@ class C_SchedulerHook(BaseHook):
                         disagg_config=disagg_cfg,
                     )
                     C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
-                    # Fresh run: reset the PD role clocks so a re-built backend
+                    # Fresh run: reset the PD role clock so a re-built backend
                     # (e.g. a new sweep config in the same process) starts from
-                    # a clean t=0 timeline.
-                    C_SchedulerHook.PD_PREFILL_CLOCK = 0.0
+                    # a clean t=0 timeline. (The prefill floor lives on the
+                    # freshly-built backend's own busy_until pools, which
+                    # start at 0 already -- nothing to reset here for prefill.)
                     C_SchedulerHook.PD_DECODE_CLOCK = 0.0
                     C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                     C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
@@ -859,9 +868,8 @@ class C_SchedulerHook(BaseHook):
                 C_SchedulerHook.LAST_CPU_TS = time.time()
                 C_SchedulerHook.LAST_FLUSH_TS = C_SchedulerHook.LAST_CPU_TS
                 StateManager.set_global_clock(0)
-                # Anchor the PD role clocks to the same t=0 origin as the
-                # global clock at the start of a run.
-                C_SchedulerHook.PD_PREFILL_CLOCK = 0.0
+                # Anchor the PD decode role clock to the same t=0 origin as
+                # the global clock at the start of a run.
                 C_SchedulerHook.PD_DECODE_CLOCK = 0.0
                 C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                 C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
@@ -953,7 +961,6 @@ class C_SchedulerHook(BaseHook):
                         disagg_config=disagg_cfg,
                     )
                     C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
-                    C_SchedulerHook.PD_PREFILL_CLOCK = 0.0
                     C_SchedulerHook.PD_DECODE_CLOCK = 0.0
                     C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                     C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
@@ -1022,6 +1029,15 @@ class C_SchedulerHook(BaseHook):
                         # arrived (self-anchoring to real created_time, so the
                         # timeline shares the global clock's t=0 origin without
                         # being pushed forward by decode work).
+                        #
+                        # "Prefill engine is free" is read straight off the
+                        # backend's own replica pool (min busy_until across all
+                        # prefill replicas), NOT a hand-tracked scalar: with
+                        # prefill_replicas > 1, a scalar would only remember the
+                        # one replica the previous extend batch happened to land
+                        # on, and would force this batch to wait for that
+                        # specific replica even when a different one has been
+                        # idle the whole time.
                         arrivals = []
                         for req in batch.reqs:
                             st = C_SchedulerHook.REQUEST_STATS.get(req.rid)
@@ -1029,7 +1045,10 @@ class C_SchedulerHook(BaseHook):
                                 st.created_time if st is not None else None
                             )
                         now_clock = prefill_batch_start(
-                            C_SchedulerHook.PD_PREFILL_CLOCK, arrivals
+                            C_SchedulerHook.PD_BACKEND.earliest_pool_time(
+                                "prefill"
+                            ),
+                            arrivals,
                         )
 
                         # Build per-request states. Accumulate chunk token counts
@@ -1154,22 +1173,24 @@ class C_SchedulerHook(BaseHook):
                             if stats is not None:
                                 populate_request_stats(stats, s)
 
-                        # P1: advance ONLY the prefill role clock by the prefill
-                        # batch latency. KV transfer time is NOT added to any
-                        # advancing clock (fixes #2): it is encoded solely in
-                        # per-request kv_ready_time (set by finalize_prefill_batch
-                        # above), and the decode role clock gates on it via
+                        # P1: KV transfer time is NOT added to any advancing
+                        # clock (fixes #2): it is encoded solely in per-request
+                        # kv_ready_time (set by finalize_prefill_batch above),
+                        # and the decode role clock gates on it via
                         # sync_decode_start. This stops a prefill batch + its KV
-                        # transfer from freezing in-flight decode in virtual time.
-                        C_SchedulerHook.PD_PREFILL_CLOCK = now_clock + pd_latency
+                        # transfer from freezing in-flight decode in virtual
+                        # time. The prefill engine's own "free at" state lives
+                        # entirely on PD_BACKEND's replica pool (busy_until,
+                        # updated inside try_admit_prefill_batch above) -- there
+                        # is no separate scalar to advance here.
                         logger.debug(
                             "[PD] extend batch: %d reqs (%d final-chunk), "
-                            "agg_pred=%.6fs, pd_pred=%.6fs, prefill_clock=%.6fs",
+                            "agg_pred=%.6fs, pd_pred=%.6fs, prefill_batch_end=%.6fs",
                             len(states),
                             len(final_states),
                             predicted_latency,
                             pd_latency,
-                            C_SchedulerHook.PD_PREFILL_CLOCK,
+                            now_clock + pd_latency,
                         )
                         predicted_latency = pd_latency
                     elif (

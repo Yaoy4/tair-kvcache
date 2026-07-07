@@ -26,6 +26,7 @@ from __future__ import annotations
 import heapq
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List
 
@@ -402,9 +403,12 @@ def test_4d_aic_bridge_emit_disagg_roundtrips_through_sim_args(tmp_path):
     out_json = tmp_path / "hisim.json"
 
     # Invoke the bridge as a subprocess (mirrors the real sweep pipeline).
+    # Use sys.executable (the current venv's interpreter) rather than a bare
+    # "python", which is not guaranteed to exist on PATH (e.g. distros that
+    # only ship "python3" unless python-is-python3 is installed).
     result = subprocess.run(
         [
-            "python",
+            sys.executable,
             str(bridge),
             "--aic-csv",
             str(csv_path),
