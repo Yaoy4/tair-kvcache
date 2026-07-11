@@ -135,8 +135,8 @@ def test_finalize_prefill_batch_calls_on_prefill_done_with_kv_ready_time():
     assert all(s.phase == RequestPhase.KV_TRANSIT for s in states)
 
 
-def test_finalize_prefill_batch_all_requests_share_kv_ready_time():
-    """All requests in a batch share a single kv_ready_time (sum KV model)."""
+def test_finalize_prefill_batch_legacy_states_share_kv_ready_time():
+    """States without replica-local batch ids keep legacy shared transfer."""
     ctrl = _StubController(kv_dur=0.002)
     be = _StubBackendForTransition(ctrl)
     a = _running_prefill_state("a")

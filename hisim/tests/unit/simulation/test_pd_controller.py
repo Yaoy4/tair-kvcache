@@ -70,6 +70,16 @@ def test_admit_prefill_with_zero_capacity_admits_nothing():
     assert ctrl.prefill_waiting_count() == 1
 
 
+def test_invalid_phase_transition_is_rejected():
+    ctrl = make_controller()
+    req = PDRequestState(rid="r1", arrival_time=0.0)
+    ctrl.on_request_arrival(req, now=0.0)
+    ctrl.admit_prefill(capacity=1, now=0.0)
+
+    with pytest.raises(ValueError, match="request arrival"):
+        ctrl.on_request_arrival(req, now=0.1)
+
+
 def test_compute_kv_ready_time_uses_bandwidth_model():
     ctrl = make_controller(bw_gbps=100.0, latency_us=10.0, kv_bytes_per_token=1024)
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=2048)

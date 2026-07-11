@@ -6,7 +6,7 @@ PDRequestState timestamps into RequestStats stage fields, and ultimately
 into calc_metrics percentile aggregates.
 
 Stage durations:
-- prefill_queue_wait = prefill_start_time - arrival_time
+- prefill_queue_wait = prefill_start_time - prefill_queue_start_time
 - kv_transfer_time   = kv_ready_time - prefill_end_time
 - decode_queue_wait  = decode_start_time - kv_ready_time
 
@@ -31,8 +31,11 @@ def _delta(end, start) -> float:
 
 
 def compute_stage_durations(state: "PDRequestState") -> Dict[str, float]:
+    prefill_queue_start = getattr(state, "prefill_queue_start_time", None)
+    if prefill_queue_start is None:
+        prefill_queue_start = state.arrival_time
     return {
-        "prefill_queue_wait": _delta(state.prefill_start_time, state.arrival_time),
+        "prefill_queue_wait": _delta(state.prefill_start_time, prefill_queue_start),
         "kv_transfer_time": _delta(state.kv_ready_time, state.prefill_end_time),
         "decode_queue_wait": _delta(state.decode_start_time, state.kv_ready_time),
     }
@@ -42,6 +45,9 @@ def populate_request_stats(
     stats: "RequestStats", state: "PDRequestState"
 ) -> None:
     stats.pd_arrival_time = state.arrival_time
+    stats.pd_prefill_queue_start_time = getattr(
+        state, "prefill_queue_start_time", None
+    )
     stats.pd_prefill_start_time = state.prefill_start_time
     stats.pd_prefill_end_time = state.prefill_end_time
     stats.pd_kv_ready_time = state.kv_ready_time

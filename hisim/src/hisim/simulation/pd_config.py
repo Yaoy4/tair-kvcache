@@ -16,9 +16,11 @@ DEFAULT_MAX_RUNNING = (1 << 31) - 1
 class RolePredictorConfig:
     """Predictor inputs for one PD role (prefill or decode).
 
-    The HiSim runtime scheduler does NOT execute TP/EP/DP/PP — these are
-    inputs to AIConfigurator's perf-database lookup. One PD role corresponds
-    to one AIConfiguratorTimePredictor instance.
+    The HiSim runtime scheduler does NOT execute TP/EP/DP/PP; these describe
+    the topology inside one predictor-backed service replica. ``replicas`` is
+    the number of independently scheduled service replicas to which requests
+    are routed. Runtime affinity is therefore indexed by ``replicas``, not by
+    ``dp_size`` or by an SGLang ``dp_rank`` owned by another scheduler process.
     """
 
     device_name: str
@@ -94,3 +96,14 @@ class DisaggConfig:
                 raise ValueError("disagg enabled but decode role config missing")
             if self.kv_transfer is None:
                 raise ValueError("disagg enabled but kv_transfer config missing")
+
+    def decode_admission_capacity(self) -> int:
+        """Native SGLang running-request cap compatible with decode routing."""
+        if not self.enabled or self.decode is None:
+            return DEFAULT_MAX_RUNNING
+        replicas = (
+            self.decode.replicas
+            if self.decode_queue_mode == "per_replica_queue"
+            else 1
+        )
+        return self.decode.max_running_per_replica * replicas

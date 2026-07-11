@@ -16,8 +16,20 @@ class RequestPhase(Enum):
 class PDRequestState:
     rid: str
     arrival_time: float
+    # Timestamp at which the request entered the server-side scheduling
+    # queue.  This is deliberately separate from ``arrival_time`` (request
+    # creation / end-to-end baseline): prefill queue wait must not include
+    # client or transport time.  Older callers may omit it; metrics then fall
+    # back to ``arrival_time`` for backward compatibility.
+    prefill_queue_start_time: Optional[float] = None
     phase: RequestPhase = RequestPhase.WAITING_PREFILL
     input_length: int = 0
+    # Scheduling metadata for the current prefill chunk.  The hook refreshes
+    # ``prefill_is_final_chunk`` before every extend call; backends stamp the
+    # replica and replica-local fused-batch id.
+    prefill_is_final_chunk: bool = True
+    prefill_replica_idx: Optional[int] = None
+    prefill_batch_id: Optional[int] = None
     prefill_start_time: Optional[float] = None
     prefill_end_time: Optional[float] = None
     kv_ready_time: Optional[float] = None

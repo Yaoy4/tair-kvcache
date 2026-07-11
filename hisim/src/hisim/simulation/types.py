@@ -67,6 +67,7 @@ class RequestStats:
     # runs backward-compatible; populated by pd_metrics.populate_request_stats
     # when a PDRequestState finishes.
     pd_arrival_time: Optional[float] = None
+    pd_prefill_queue_start_time: Optional[float] = None
     pd_prefill_start_time: Optional[float] = None
     pd_prefill_end_time: Optional[float] = None
     pd_kv_ready_time: Optional[float] = None

@@ -654,9 +654,19 @@ class C_SchedulerHook(BaseHook):
                 f"Overlap schedule simulation mode: {C_SchedulerHook.OVERLAP_SCHEDULE}."
             )
 
-            original_init(self, *args, **kwargs)
-
             disagg_cfg = ConfigManager.get_disagg_config()
+            if disagg_cfg.enabled and disagg_cfg.decode is not None:
+                decode_capacity = disagg_cfg.decode_admission_capacity()
+                configured_capacity = getattr(
+                    server_args, "max_running_requests", None
+                )
+                if configured_capacity is not None:
+                    decode_capacity = min(
+                        int(configured_capacity), int(decode_capacity)
+                    )
+                setattr(server_args, "max_running_requests", decode_capacity)
+
+            original_init(self, *args, **kwargs)
             cfg_closed_loop = False
             try:
                 with open(Envs.config_path(), "r", encoding="utf-8") as f:
@@ -1021,14 +1031,16 @@ class C_SchedulerHook(BaseHook):
                             populate_request_stats,
                         )
                         from hisim.simulation.pd_timeline import (
+                            prefill_admission_baseline,
                             prefill_batch_start,
+                            prefill_queue_baseline,
                         )
 
                         # P1: prefill role clock. The batch starts no earlier
                         # than the prefill engine is free AND every request has
-                        # arrived (self-anchoring to real created_time, so the
-                        # timeline shares the global clock's t=0 origin without
-                        # being pushed forward by decode work).
+                        # been admitted by SGLang's native waiting queue. Using
+                        # queue_end (with created_time fallback) prevents the PD
+                        # role clock from retroactively erasing queue wait.
                         #
                         # "Prefill engine is free" is read straight off the
                         # backend's own replica pool (min busy_until across all
@@ -1038,17 +1050,22 @@ class C_SchedulerHook(BaseHook):
                         # on, and would force this batch to wait for that
                         # specific replica even when a different one has been
                         # idle the whole time.
-                        arrivals = []
+                        admission_times = []
                         for req in batch.reqs:
                             st = C_SchedulerHook.REQUEST_STATS.get(req.rid)
-                            arrivals.append(
-                                st.created_time if st is not None else None
+                            admission_times.append(
+                                prefill_admission_baseline(
+                                    st.created_time
+                                    if st is not None
+                                    else 0.0,
+                                    st.queue_end if st is not None else None,
+                                )
                             )
                         now_clock = prefill_batch_start(
                             C_SchedulerHook.PD_BACKEND.earliest_pool_time(
                                 "prefill"
                             ),
-                            arrivals,
+                            admission_times,
                         )
 
                         # Build per-request states. Accumulate chunk token counts
@@ -1079,6 +1096,10 @@ class C_SchedulerHook(BaseHook):
                                 s = PDRequestState(
                                     rid=req.rid,
                                     arrival_time=arrival,
+                                    prefill_queue_start_time=prefill_queue_baseline(
+                                        arrival,
+                                        st.queue_start if st is not None else None,
+                                    ),
                                     phase=RequestPhase.WAITING_PREFILL,
                                     input_length=chunk_len,
                                     output_length=int(
@@ -1096,6 +1117,9 @@ class C_SchedulerHook(BaseHook):
                                 # chunk's token count for per-chunk latency
                                 # accuracy (one forward pass ≈ chunk_len tokens).
                                 s.input_length = chunk_len
+                            s.prefill_is_final_chunk = (
+                                getattr(req, "is_chunked", 0) == 0
+                            )
                             states.append(s)
 
                         # Compute batch latency. The backend phase guard in
@@ -1358,7 +1382,7 @@ class C_SchedulerHook(BaseHook):
                                         step_start, s.kv_ready_time
                                     )
                             ctrl.poll_kv_ready(step_start)
-                            ctrl.admit_decode_targeted(
+                            C_SchedulerHook.PD_BACKEND.admit_decode_single_replica(
                                 {
                                     req.rid
                                     for req in batch.reqs

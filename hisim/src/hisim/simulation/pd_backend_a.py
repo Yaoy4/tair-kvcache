@@ -71,10 +71,20 @@ class BackendA:
         self._decode_pool = _ReplicaPool.make(
             "decode", bundle.decode_replicas
         )
+        self._prefill_replica_by_rid: dict[str, int] = {}
+        self._prefill_max_running_per_replica: int = (
+            getattr(bundle, "prefill_max_running_per_replica", None)
+            or (1 << 31) - 1
+        )
+        self._prefill_running_count: dict[int, int] = defaultdict(int)
+        self._prefill_slot_reserved: set[str] = set()
+        self._next_prefill_batch_id = 0
         self._decode_replica_by_rid: dict[str, int] = {}
         self._decode_running_count: dict[int, int] = defaultdict(int)
-        self._max_running_per_replica: int = getattr(
-            bundle, "max_running_per_replica", (1 << 31) - 1
+        self._single_decode_running_rids: set[str] = set()
+        self._max_running_per_replica: int = (
+            getattr(bundle, "decode_max_running_per_replica", None)
+            or getattr(bundle, "max_running_per_replica", (1 << 31) - 1)
         )
 
     # ---- introspection ----
@@ -89,6 +99,127 @@ class BackendA:
 
     def decode_queue_mode(self) -> str:
         return self._decode_queue_mode
+
+    def bind_prefill_replicas(
+        self, reqs: Sequence[PDRequestState]
+    ) -> dict[str, int]:
+        """Bind requests to prefill replicas, preserving chunk affinity.
+
+        New requests are spread round-robin over replicas ordered by virtual
+        availability.  A chunked request keeps its original replica until its
+        final chunk calls :meth:`on_prefill_done`.
+        """
+        if not reqs:
+            return {}
+        mapping: dict[str, int] = {}
+        for req in reqs:
+            self._validate_prefill_phase(req)
+            replica_idx = self._reserve_prefill_slot(req)
+            if replica_idx is None:
+                raise RuntimeError(
+                    "prefill capacity exhausted while binding request "
+                    f"rid={req.rid!r}"
+                )
+            mapping[req.rid] = replica_idx
+        return mapping
+
+    def prefill_replica_for(self, rid: str) -> Optional[int]:
+        return self._prefill_replica_by_rid.get(rid)
+
+    def _validate_prefill_phase(self, req: PDRequestState) -> None:
+        if req.phase not in (
+            RequestPhase.WAITING_PREFILL,
+            RequestPhase.RUNNING_PREFILL,
+        ):
+            raise ValueError(
+                f"cannot schedule prefill for rid={req.rid!r} "
+                f"in phase={req.phase.value}"
+            )
+        if (
+            req.phase == RequestPhase.RUNNING_PREFILL
+            and req.rid not in self._prefill_slot_reserved
+        ):
+            raise ValueError(
+                f"running prefill request rid={req.rid!r} has no reserved slot"
+            )
+
+    def _reserve_prefill_slot(self, req: PDRequestState) -> Optional[int]:
+        replica_idx = self._prefill_replica_by_rid.get(req.rid)
+        if replica_idx is not None:
+            return replica_idx
+        candidates = [
+            idx
+            for idx in range(len(self._prefill_pool.busy_until))
+            if self._prefill_running_count[idx]
+            < self._prefill_max_running_per_replica
+        ]
+        if not candidates:
+            return None
+        replica_idx = min(
+            candidates,
+            key=lambda idx: (
+                self._prefill_running_count[idx],
+                self._prefill_pool.busy_until[idx],
+                idx,
+            ),
+        )
+        self._prefill_replica_by_rid[req.rid] = replica_idx
+        self._prefill_slot_reserved.add(req.rid)
+        self._prefill_running_count[replica_idx] += 1
+        req.prefill_replica_idx = replica_idx
+        return replica_idx
+
+    def _release_prefill_slot(self, req: PDRequestState) -> None:
+        if req.rid not in self._prefill_slot_reserved:
+            return
+        replica_idx = self._prefill_replica_by_rid.get(req.rid)
+        self._prefill_slot_reserved.remove(req.rid)
+        if replica_idx is not None:
+            self._prefill_running_count[replica_idx] = max(
+                0, self._prefill_running_count[replica_idx] - 1
+            )
+
+    def _predict_prefill_batch(self, wave: Sequence[PDRequestState]) -> float:
+        input_lengths = [int(req.input_length) for req in wave]
+        batch_predict = getattr(
+            self._bundle.prefill, "predict_prefill_batch_seconds", None
+        )
+        if batch_predict is not None:
+            return float(batch_predict(input_lengths))
+        return float(
+            self._bundle.prefill.predict_prefill_seconds(sum(input_lengths))
+        )
+
+    def _schedule_prefill_wave(
+        self, replica_idx: int, wave: Sequence[PDRequestState], now: float
+    ) -> float:
+        start = max(now, self._prefill_pool.busy_until[replica_idx])
+        end = start + self._predict_prefill_batch(wave)
+        self._prefill_pool.busy_until[replica_idx] = end
+        self._next_prefill_batch_id += 1
+        batch_id = self._next_prefill_batch_id
+
+        fresh = [req for req in wave if req.phase == RequestPhase.WAITING_PREFILL]
+        for fresh_req in fresh:
+            self._controller.on_request_arrival(fresh_req, now)
+        if fresh:
+            admitted = self._controller.admit_prefill(
+                capacity=len(fresh), now=start
+            )
+            if len(admitted) != len(fresh) or any(
+                actual is not expected
+                for actual, expected in zip(admitted, fresh)
+            ):
+                raise AssertionError(
+                    "controller did not preserve replica-local prefill batch"
+                )
+        for req in wave:
+            req.prefill_replica_idx = replica_idx
+            req.prefill_batch_id = batch_id
+            req.prefill_end_time = end
+            if req.prefill_is_final_chunk:
+                self._release_prefill_slot(req)
+        return end
 
     def earliest_pool_time(self, pool: str) -> float:
         """The correct floor for this pool's next admission call.
@@ -121,30 +252,72 @@ class BackendA:
     ) -> dict[str, int]:
         if not reqs:
             return {}
+        allowed = {
+            RequestPhase.KV_TRANSIT,
+            RequestPhase.WAITING_DECODE,
+            RequestPhase.RUNNING_DECODE,
+        }
+        for req in reqs:
+            if req.phase not in allowed:
+                raise ValueError(
+                    f"cannot bind decode replica for rid={req.rid!r} "
+                    f"in phase={req.phase.value}"
+                )
         if self._decode_queue_mode != "per_replica_queue":
             idx, _ = self._decode_pool.earliest_replica()
             return {req.rid: idx for req in reqs}
 
-        replica_order = sorted(
-            range(len(self._decode_pool.busy_until)),
-            key=lambda i: self._decode_pool.busy_until[i],
-        )
-        if not replica_order:
+        replica_indices = list(range(len(self._decode_pool.busy_until)))
+        if not replica_indices:
             raise ValueError("decode pool requires at least one replica")
 
-        next_replica_slot = 0
+        planned_count = dict(self._decode_running_count)
         mapping: dict[str, int] = {}
         for req in reqs:
             replica_idx = self._decode_replica_by_rid.get(req.rid)
             if replica_idx is None:
-                replica_idx = replica_order[next_replica_slot % len(replica_order)]
+                candidates = [
+                    idx
+                    for idx in replica_indices
+                    if planned_count.get(idx, 0)
+                    < self._max_running_per_replica
+                ]
+                if not candidates:
+                    raise RuntimeError("decode replica capacity exhausted")
+                replica_idx = min(
+                    candidates,
+                    key=lambda idx: (
+                        planned_count.get(idx, 0),
+                        self._decode_pool.busy_until[idx],
+                        idx,
+                    ),
+                )
                 self._decode_replica_by_rid[req.rid] = replica_idx
-                next_replica_slot += 1
+                planned_count[replica_idx] = planned_count.get(replica_idx, 0) + 1
             mapping[req.rid] = replica_idx
         return mapping
 
     def decode_replica_time(self, replica_idx: int) -> float:
         return self._decode_pool.busy_until[replica_idx]
+
+    def decode_batch_capacity(self) -> int:
+        if self._decode_queue_mode == "per_replica_queue":
+            return self._max_running_per_replica * self.decode_pool_size()
+        return self._max_running_per_replica
+
+    def admit_decode_single_replica(
+        self, rids: AbstractSet[str], now: float
+    ) -> List[PDRequestState]:
+        available = max(
+            0,
+            self._max_running_per_replica
+            - len(self._single_decode_running_rids),
+        )
+        admitted = self._controller.admit_decode_targeted(
+            rids, now, max_count=available
+        )
+        self._single_decode_running_rids.update(req.rid for req in admitted)
+        return admitted
 
     # ---- scheduling primitives ----
     def try_admit_prefill(
@@ -155,28 +328,16 @@ class BackendA:
         Advances that replica's busy_until clock. Updates req state to
         RUNNING_PREFILL via the controller. Returns (replica_idx, end_time).
         """
-        idx, free_at = self._prefill_pool.earliest_replica()
-        start = max(now, free_at)
-        dur = self._bundle.prefill.predict_prefill_seconds(req.input_length)
-        end = start + dur
-        self._prefill_pool.busy_until[idx] = end
-        # Drive the controller's state machine.
-        self._controller.on_request_arrival(req, now)
-        admitted = self._controller.admit_prefill(capacity=1, now=start)
-        # admit_prefill takes from its own queue; we just appended `req` so it
-        # is guaranteed to be the one admitted.
-        if not admitted or admitted[0] is not req:
-            raise AssertionError("controller did not admit just-enqueued request")
-        return idx, end
+        return self.try_admit_prefill_batch([req], now)
 
     def try_admit_prefill_batch(
         self, reqs: Sequence[PDRequestState], now: float
     ) -> Tuple[int, float]:
-        """Schedule an entire prefill batch onto one replica.
+        """Partition a scheduler batch into replica-local prefill batches.
 
-        All requests in the batch share a single predictor call using the
-        sum of their input lengths, matching how a real prefill node processes
-        a batch as one forward pass. Returns (replica_idx, batch_end_time).
+        Each replica-local wave uses one predictor call with the sum of that
+        wave's input lengths. Waves are capacity-bounded and requests retain
+        replica affinity across chunked-prefill iterations.
 
         Phase guard: only WAITING_PREFILL requests go through the controller
         lifecycle (on_request_arrival + admit_prefill). Mid-chunk requests
@@ -185,28 +346,46 @@ class BackendA:
         """
         if not reqs:
             raise ValueError("try_admit_prefill_batch requires at least one request")
-        idx, free_at = self._prefill_pool.earliest_replica()
-        start = max(now, free_at)
-        total_tokens = sum(r.input_length for r in reqs)
-        dur = self._bundle.prefill.predict_prefill_seconds(total_tokens)
-        end = start + dur
-        self._prefill_pool.busy_until[idx] = end
-        # Drive the controller state machine only for WAITING_PREFILL requests.
-        # Mid-chunk requests (already RUNNING_PREFILL) must not be re-arrived
-        # or re-admitted: doing so resets their phase and double-counts prefill.
-        fresh = [r for r in reqs if r.phase == RequestPhase.WAITING_PREFILL]
-        for req in fresh:
-            self._controller.on_request_arrival(req, now)
-        if fresh:
-            admitted = self._controller.admit_prefill(capacity=len(fresh), now=start)
-            if len(admitted) != len(fresh):
-                raise AssertionError(
-                    f"controller admitted {len(admitted)} of {len(fresh)} fresh requests"
-                )
-        # Stamp the shared batch end time on ALL requests (fresh + mid-chunk).
+        if len({req.rid for req in reqs}) != len(reqs):
+            raise ValueError("prefill batch contains duplicate request ids")
         for req in reqs:
-            req.prefill_end_time = end
-        return idx, end
+            self._validate_prefill_phase(req)
+        pending = list(reqs)
+        first_replica_idx: Optional[int] = None
+        max_end = now
+        while pending:
+            buckets: dict[int, list[PDRequestState]] = defaultdict(list)
+            remaining: list[PDRequestState] = []
+            for req in pending:
+                replica_idx = self._prefill_replica_by_rid.get(req.rid)
+                if replica_idx is None:
+                    replica_idx = self._reserve_prefill_slot(req)
+                if replica_idx is None:
+                    remaining.append(req)
+                    continue
+                buckets[replica_idx].append(req)
+
+            if not buckets:
+                blocked = ", ".join(req.rid for req in remaining)
+                raise RuntimeError(
+                    "prefill capacity exhausted by unfinished chunked requests; "
+                    f"cannot schedule: {blocked}"
+                )
+
+            for replica_idx in sorted(
+                buckets, key=lambda idx: self._prefill_pool.busy_until[idx]
+            ):
+                if first_replica_idx is None:
+                    first_replica_idx = replica_idx
+                end = self._schedule_prefill_wave(
+                    replica_idx, buckets[replica_idx], now
+                )
+                max_end = max(max_end, end)
+            pending = remaining
+
+        if first_replica_idx is None:
+            raise AssertionError("non-empty prefill batch produced no replica bucket")
+        return first_replica_idx, max_end
 
     def compute_kv_ready_time(self, req: PDRequestState, now: float) -> float:
         return self._controller.compute_kv_ready_time(req, now)
@@ -218,6 +397,8 @@ class BackendA:
         self, req: PDRequestState, now: float, kv_ready_time: float
     ) -> None:
         self._controller.on_prefill_done(req, now, kv_ready_time)
+        self._release_prefill_slot(req)
+        self._prefill_replica_by_rid.pop(req.rid, None)
 
     def advance_to_kv_ready(self, req: PDRequestState, now: float) -> None:
         """Convenience: move req from KV_TRANSIT → WAITING_DECODE at `now`."""
@@ -231,6 +412,21 @@ class BackendA:
         """Schedule one decode step for `req` on the earliest-free decode
         replica. Returns (replica_idx, end_time).
         """
+        if req.phase == RequestPhase.WAITING_DECODE:
+            if self._decode_queue_mode == "per_replica_queue":
+                idx = self.bind_decode_replicas([req])[req.rid]
+                admitted = self.admit_decode_for_replica(
+                    idx, {req.rid}, now
+                )
+            else:
+                admitted = self.admit_decode_single_replica({req.rid}, now)
+            if admitted != [req]:
+                raise AssertionError("decode step could not admit waiting request")
+        if req.phase != RequestPhase.RUNNING_DECODE:
+            raise ValueError(
+                f"cannot schedule decode step for rid={req.rid!r} "
+                f"in phase={req.phase.value}"
+            )
         if self._decode_queue_mode == "per_replica_queue":
             idx = self.bind_decode_replicas([req])[req.rid]
             free_at = self._decode_pool.busy_until[idx]
@@ -255,6 +451,12 @@ class BackendA:
         """
         if not reqs:
             raise ValueError("try_admit_decode_batch requires at least one request")
+        for req in reqs:
+            if req.phase != RequestPhase.RUNNING_DECODE:
+                raise ValueError(
+                    f"cannot schedule decode batch for rid={req.rid!r} "
+                    f"in phase={req.phase.value}"
+                )
         if self._decode_queue_mode == "per_replica_queue":
             return self._try_admit_decode_batch_per_replica(reqs, now)
         idx, free_at = self._decode_pool.earliest_replica()
@@ -307,6 +509,7 @@ class BackendA:
     def on_decode_step_done(self, req: PDRequestState, now: float) -> None:
         self._controller.on_decode_step_done([req], now)
         if req.phase == RequestPhase.FINISHED:
+            self._single_decode_running_rids.discard(req.rid)
             replica_idx = self._decode_replica_by_rid.pop(req.rid, None)
             if replica_idx is not None:
                 self._decode_running_count[replica_idx] = max(
@@ -319,6 +522,7 @@ class BackendA:
         self._controller.on_decode_step_done(reqs, now)
         for req in reqs:
             if req.phase == RequestPhase.FINISHED:
+                self._single_decode_running_rids.discard(req.rid)
                 replica_idx = self._decode_replica_by_rid.pop(req.rid, None)
                 if replica_idx is not None:
                     self._decode_running_count[replica_idx] = max(
@@ -334,4 +538,7 @@ class BackendA:
         )
         admitted = self._controller.admit_decode_targeted(rids, now, max_count=capacity)
         self._decode_running_count[replica_idx] += len(admitted)
+        admitted_rids = {req.rid for req in admitted}
+        for rid in set(rids) - admitted_rids:
+            self._decode_replica_by_rid.pop(rid, None)
         return admitted

@@ -199,6 +199,7 @@ def test_decode_batch_admission(backend):
         _req("c", input_len=10),
     ]
     for r in reqs:
+        r.phase = RequestPhase.RUNNING_DECODE
         r.current_past_kv_length = 100
     idx, end_t = backend.try_admit_decode_batch(reqs, now=0.0)
     # 5us/slot * 3 + 0.001us * 300 = 15.3us
@@ -227,29 +228,29 @@ def test_full_lifecycle_finishes(backend):
 # ---------------------------------------------------------------------------
 
 
-def test_batch_prefill_uses_sum_tokens(backend):
-    """try_admit_prefill_batch must call the predictor with total token count."""
+def test_batch_prefill_uses_replica_local_token_sums(backend):
+    """Four requests on two replicas become two fused 400-token batches."""
     reqs = [_req(f"r{i}", input_len=200) for i in range(4)]  # 800 total
     idx, end_t = backend.try_admit_prefill_batch(reqs, now=0.0)
-    # fast: 0.1 us/tok * 800 = 80 us
-    assert end_t == pytest.approx(8e-5)
+    assert end_t == pytest.approx(4e-5)
 
 
-def test_batch_prefill_all_requests_share_timestamps(backend):
+def test_batch_prefill_records_replica_local_timestamps(backend):
     reqs = [_req("a", input_len=100), _req("b", input_len=300)]
     _, end_t = backend.try_admit_prefill_batch(reqs, now=0.0)
-    assert all(r.prefill_end_time == pytest.approx(end_t) for r in reqs)
+    assert reqs[0].prefill_end_time == pytest.approx(1e-5)
+    assert reqs[1].prefill_end_time == pytest.approx(3e-5)
+    assert end_t == pytest.approx(3e-5)
     assert all(r.prefill_start_time == pytest.approx(0.0) for r in reqs)
     assert all(r.phase == RequestPhase.RUNNING_PREFILL for r in reqs)
 
 
-def test_batch_prefill_occupies_single_replica(backend):
+def test_batch_prefill_uses_all_available_replicas(backend):
     reqs = [_req(f"r{i}") for i in range(3)]
     _, end_t = backend.try_admit_prefill_batch(reqs, now=0.0)
-    # The batch was scheduled (took positive time)
     assert end_t > 0.0
-    # With 2 prefill replicas, the other replica stays free; earliest is still 0
-    assert backend.earliest_pool_time("prefill") == 0.0
+    assert backend.earliest_pool_time("prefill") > 0.0
+    assert len({backend.prefill_replica_for(r.rid) for r in reqs}) == 2
 
 
 def test_batch_prefill_rejects_empty(backend):

@@ -221,7 +221,7 @@ def _build_synth_disagg_block(
             "pp_size": pp_size,
             "replicas": replicas,
             "max_running_per_replica": args.synth_max_running_per_replica,
-            "database_path": str(database_path),
+            "database_path": database_path.as_posix(),
         }
         if data_type is not None:
             role["data_type"] = data_type

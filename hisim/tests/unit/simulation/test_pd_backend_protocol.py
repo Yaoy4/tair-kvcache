@@ -31,8 +31,11 @@ _REQUIRED_METHODS = (
     "decode_pool_size",
     "decode_queue_mode",
     "earliest_pool_time",
+    "bind_prefill_replicas",
+    "prefill_replica_for",
     "bind_decode_replicas",
     "decode_replica_time",
+    "decode_batch_capacity",
     "try_admit_prefill",
     "try_admit_prefill_batch",
     "compute_kv_ready_time",
@@ -43,6 +46,8 @@ _REQUIRED_METHODS = (
     "try_admit_decode_batch",
     "on_decode_step_done",
     "on_decode_step_done_batch",
+    "admit_decode_for_replica",
+    "admit_decode_single_replica",
 )
 
 

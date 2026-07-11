@@ -37,6 +37,10 @@ class DisaggPredictors:
     prefill_replicas: int = 1
     decode_replicas: int = 1
     decode_queue_mode: str = "single_replica"
+    prefill_max_running_per_replica: Optional[int] = None
+    decode_max_running_per_replica: Optional[int] = None
+    # Backward-compatible alias used by older tests/callers.  New backends
+    # prefer the role-specific fields above.
     max_running_per_replica: int = (1 << 31) - 1
 
 
@@ -206,5 +210,11 @@ def build_disagg(
         prefill_replicas=disagg_config.prefill.replicas,
         decode_replicas=disagg_config.decode.replicas,
         decode_queue_mode=disagg_config.decode_queue_mode,
+        prefill_max_running_per_replica=(
+            disagg_config.prefill.max_running_per_replica
+        ),
+        decode_max_running_per_replica=(
+            disagg_config.decode.max_running_per_replica
+        ),
         max_running_per_replica=disagg_config.decode.max_running_per_replica,
     )

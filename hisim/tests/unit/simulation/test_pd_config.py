@@ -135,3 +135,20 @@ def test_pd_config_has_no_sglang_dependency():
             imported.add(node.module)
     assert not any(name.startswith("sglang") for name in imported)
     assert not any(name.startswith("hisim.simulation.sglang") for name in imported)
+
+
+def test_decode_admission_capacity_matches_queue_mode():
+    common = dict(
+        enabled=True,
+        prefill=RolePredictorConfig(device_name="p"),
+        decode=RolePredictorConfig(
+            device_name="d", replicas=3, max_running_per_replica=7
+        ),
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    assert DisaggConfig(
+        **common, decode_queue_mode="single_replica"
+    ).decode_admission_capacity() == 7
+    assert DisaggConfig(
+        **common, decode_queue_mode="per_replica_queue"
+    ).decode_admission_capacity() == 21

@@ -42,6 +42,19 @@ def test_predict_prefill_builds_single_request_batch():
     assert batch.is_prefill()
 
 
+def test_predict_prefill_batch_preserves_request_lengths():
+    base = _RecordingPredictor(return_value=0.006)
+    adapter = AICPredictorAdapter(base)
+
+    out = adapter.predict_prefill_batch_seconds([100, 300, 500])
+
+    assert out == 0.006
+    batch = base.calls[0]
+    assert batch.batch_size == 3
+    assert [req.input_length for req in batch.reqs] == [100, 300, 500]
+    assert batch.is_prefill()
+
+
 def test_predict_decode_builds_decode_batch_with_uniform_past_kv():
     base = _RecordingPredictor(return_value=0.0008)
     adapter = AICPredictorAdapter(base)

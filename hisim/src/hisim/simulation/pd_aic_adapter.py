@@ -35,8 +35,22 @@ class AICPredictorAdapter:
     def predict_prefill_seconds(self, batch_tokens: int) -> float:
         if batch_tokens <= 0:
             raise ValueError(f"batch_tokens must be > 0, got {batch_tokens}")
+        return self.predict_prefill_batch_seconds([int(batch_tokens)])
+
+    def predict_prefill_batch_seconds(
+        self, input_lengths: Sequence[int]
+    ) -> float:
+        """Predict one fused prefill batch without collapsing its requests."""
+        lengths = [int(length) for length in input_lengths]
+        if not lengths or any(length <= 0 for length in lengths):
+            raise ValueError(
+                f"input_lengths must contain positive lengths, got {lengths!r}"
+            )
         batch = ScheduleBatch(
-            reqs=[FakeRequest(input_length=int(batch_tokens), past_kv_length=0)]
+            reqs=[
+                FakeRequest(input_length=length, past_kv_length=0)
+                for length in lengths
+            ]
         )
         return self._base.predict_infer_time(batch)
 

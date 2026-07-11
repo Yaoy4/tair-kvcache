@@ -25,6 +25,7 @@ from hisim.simulation.pd_config import (
 from hisim.simulation.pd_factory import build_disagg
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
 from hisim.simulation.pd_backend_a import BackendA
+from hisim.simulation.pd_runtime import finalize_prefill_batch
 
 
 def _model():
@@ -90,7 +91,9 @@ def _hw(name):
 def _bundle(prefill_device="fast", decode_device="fast",
             prefill_replicas=2, decode_replicas=2,
             bw_gbps=100.0, latency_us=10.0,
-            decode_queue_mode="single_replica"):
+            decode_queue_mode="single_replica",
+            prefill_max_running_per_replica=8,
+            decode_max_running_per_replica=64):
     cfg = DisaggConfig(
         enabled=True,
         backend="single_process",
@@ -98,13 +101,13 @@ def _bundle(prefill_device="fast", decode_device="fast",
             device_name=prefill_device,
             tp_size=1,
             replicas=prefill_replicas,
-            max_running_per_replica=8,
+            max_running_per_replica=prefill_max_running_per_replica,
         ),
         decode=RolePredictorConfig(
             device_name=decode_device,
             tp_size=1,
             replicas=decode_replicas,
-            max_running_per_replica=64,
+            max_running_per_replica=decode_max_running_per_replica,
         ),
         kv_transfer=BandwidthTransferConfig(bw_gbps=bw_gbps, latency_us=latency_us),
         decode_queue_mode=decode_queue_mode,
@@ -214,6 +217,7 @@ def test_compute_kv_ready_time_uses_transfer_model():
 def test_try_admit_decode_step_uses_predicted_step_latency():
     be = BackendA(_bundle(decode_device="fast", decode_replicas=1))
     r = _req("r")
+    r.phase = RequestPhase.RUNNING_DECODE
     idx, end_t = be.try_admit_decode_step(r, now=0.0)
     assert idx == 0
     assert end_t == pytest.approx(5e-6)
@@ -221,11 +225,14 @@ def test_try_admit_decode_step_uses_predicted_step_latency():
 
 def test_try_admit_decode_step_round_robins_across_replicas():
     be = BackendA(_bundle(decode_device="fast", decode_replicas=4))
-    ends = [be.try_admit_decode_step(_req(f"r{i}"), now=0.0)[1] for i in range(4)]
+    reqs = [_req(f"r{i}") for i in range(5)]
+    for req in reqs:
+        req.phase = RequestPhase.RUNNING_DECODE
+    ends = [be.try_admit_decode_step(req, now=0.0)[1] for req in reqs[:4]]
     # all four replicas free at t=0 → all four steps end at the same virtual time
     assert ends == [pytest.approx(5e-6)] * 4
     # fifth must queue behind the earliest-free
-    _, end5 = be.try_admit_decode_step(_req("r4"), now=0.0)
+    _, end5 = be.try_admit_decode_step(reqs[4], now=0.0)
     assert end5 == pytest.approx(2 * 5e-6)
 
 
@@ -329,6 +336,43 @@ def test_on_decode_batch_step_done_advances_all_requests():
         assert r.phase == RequestPhase.FINISHED
 
 
+def test_single_replica_decode_admission_respects_capacity():
+    be = BackendA(
+        _bundle(
+            decode_queue_mode="single_replica",
+            decode_max_running_per_replica=1,
+        )
+    )
+    ctrl = be.controller()
+    reqs = [_req("a", output_len=1), _req("b", output_len=1)]
+    for req in reqs:
+        ctrl.on_request_arrival(req, 0.0)
+        ctrl.admit_prefill(1, 0.0)
+        ctrl.on_prefill_done(req, 0.0, 0.0)
+        ctrl.poll_kv_ready(0.0)
+
+    admitted = be.admit_decode_single_replica({"a", "b"}, 0.0)
+    assert len(admitted) == 1
+    assert ctrl.decode_waiting_count() == 1
+
+
+def test_per_replica_decode_binding_avoids_full_replica():
+    be = BackendA(
+        _bundle(
+            decode_queue_mode="per_replica_queue",
+            decode_replicas=2,
+            decode_max_running_per_replica=1,
+        )
+    )
+    be._decode_running_count[0] = 1
+    req = _req("new")
+    req.phase = RequestPhase.WAITING_DECODE
+
+    mapping = be.bind_decode_replicas([req])
+
+    assert mapping[req.rid] == 1
+
+
 # ---------------------------------------------------------------------------
 # Batch prefill admission (try_admit_prefill_batch)
 # ---------------------------------------------------------------------------
@@ -362,13 +406,86 @@ def test_try_admit_prefill_batch_all_reqs_share_start_time():
     assert all(r.phase == RequestPhase.RUNNING_PREFILL for r in reqs)
 
 
-def test_try_admit_prefill_batch_occupies_single_replica():
-    """The batch goes to ONE replica; other replicas stay free."""
+def test_try_admit_prefill_batch_partitions_across_replicas():
+    """One central SGLang batch becomes replica-local predictor batches."""
     be = BackendA(_bundle(prefill_device="fast", prefill_replicas=4))
     reqs = [_req(f"r{i}", input_len=100) for i in range(3)]
     be.try_admit_prefill_batch(reqs, now=0.0)
     busy_count = sum(1 for t in be._prefill_pool.busy_until if t > 0.0)
-    assert busy_count == 1
+    assert busy_count == 3
+    assert len({be.prefill_replica_for(r.rid) for r in reqs}) == 3
+
+
+def test_try_admit_prefill_batch_enforces_capacity_with_waves():
+    be = BackendA(
+        _bundle(
+            prefill_device="fast",
+            prefill_replicas=1,
+            prefill_max_running_per_replica=2,
+        )
+    )
+    reqs = [_req(f"r{i}", input_len=100) for i in range(5)]
+    _, end_t = be.try_admit_prefill_batch(reqs, now=0.0)
+
+    # Three fused waves: [2 requests], [2 requests], [1 request].
+    assert end_t == pytest.approx(5e-5)
+    assert [r.prefill_start_time for r in reqs] == pytest.approx(
+        [0.0, 0.0, 2e-5, 2e-5, 4e-5]
+    )
+
+
+def test_chunked_prefill_reserves_capacity_across_scheduler_batches():
+    be = BackendA(
+        _bundle(
+            prefill_device="fast",
+            prefill_replicas=1,
+            prefill_max_running_per_replica=1,
+        )
+    )
+    chunked = _req("chunked", input_len=100)
+    chunked.prefill_is_final_chunk = False
+    be.try_admit_prefill_batch([chunked], now=0.0)
+
+    fresh = _req("fresh", input_len=100)
+    with pytest.raises(RuntimeError, match="unfinished chunked"):
+        be.try_admit_prefill_batch([fresh], now=0.0)
+    assert fresh.phase == RequestPhase.WAITING_PREFILL
+
+    chunked.prefill_is_final_chunk = True
+    _, final_end = be.try_admit_prefill_batch([chunked], now=0.0)
+    finalize_prefill_batch(be, [chunked], now=final_end)
+    be.try_admit_prefill_batch([fresh], now=final_end)
+    assert fresh.phase == RequestPhase.RUNNING_PREFILL
+
+
+def test_chunked_prefill_keeps_replica_affinity_until_handoff():
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=2))
+    req = _req("chunked", input_len=100)
+    req.prefill_is_final_chunk = False
+    be.try_admit_prefill_batch([req], now=0.0)
+    first_replica = be.prefill_replica_for(req.rid)
+
+    req.input_length = 50
+    req.prefill_is_final_chunk = True
+    be.try_admit_prefill_batch([req], now=0.0)
+    assert be.prefill_replica_for(req.rid) == first_replica
+
+    prefill_end = req.prefill_end_time
+    be.on_prefill_done(req, prefill_end, prefill_end)
+    assert be.prefill_replica_for(req.rid) is None
+
+
+def test_replica_local_prefill_batches_start_kv_handoff_independently():
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=2))
+    fast = _req("fast", input_len=100)
+    slow = _req("slow", input_len=300)
+    _, batch_end = be.try_admit_prefill_batch([fast, slow], now=0.0)
+
+    finalize_prefill_batch(be, [fast, slow], now=batch_end)
+
+    assert fast.prefill_batch_id != slow.prefill_batch_id
+    assert fast.prefill_end_time < slow.prefill_end_time
+    assert fast.kv_ready_time < slow.kv_ready_time
 
 
 def test_try_admit_prefill_batch_queues_behind_busy_replica():
@@ -387,6 +504,15 @@ def test_try_admit_prefill_batch_rejects_empty():
     be = BackendA(_bundle())
     with pytest.raises(ValueError):
         be.try_admit_prefill_batch([], now=0.0)
+
+
+def test_prefill_batch_rejects_request_from_decode_phase():
+    be = BackendA(_bundle())
+    req = _req("wrong-phase", input_len=100)
+    req.phase = RequestPhase.RUNNING_DECODE
+    with pytest.raises(ValueError, match="cannot schedule prefill"):
+        be.try_admit_prefill_batch([req], now=0.0)
+    assert req.prefill_end_time is None
 
 
 def test_compute_batch_kv_ready_time_uses_total_tokens():

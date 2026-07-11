@@ -2,9 +2,8 @@
 
 `admit_prefill_batch_latency(backend, states, now)` is the small helper the
 SGLang hook calls when a PD backend is active and an extend batch arrives.
-It now calls ``backend.try_admit_prefill_batch`` as a single unit so the
-predictor receives the sum of all request input lengths — mirroring how a
-real prefill node processes a batch as one forward pass.
+It delegates to ``backend.try_admit_prefill_batch``, which forms
+capacity-bounded, replica-local fused batches.
 """
 import pytest
 

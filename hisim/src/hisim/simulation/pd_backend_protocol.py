@@ -14,7 +14,7 @@ This file is intentionally behavior-free: it adds types only.
 """
 from __future__ import annotations
 
-from typing import AbstractSet, Iterable, List, Protocol, Sequence, Tuple, runtime_checkable
+from typing import AbstractSet, Iterable, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from hisim.simulation.pd_controller import PDController
 from hisim.simulation.pd_types import PDRequestState
@@ -42,10 +42,15 @@ class PDBackendProtocol(Protocol):
     def decode_pool_size(self) -> int: ...
     def decode_queue_mode(self) -> str: ...
     def earliest_pool_time(self, pool: str) -> float: ...
+    def bind_prefill_replicas(
+        self, reqs: Sequence[PDRequestState]
+    ) -> dict[str, int]: ...
+    def prefill_replica_for(self, rid: str) -> Optional[int]: ...
     def bind_decode_replicas(
         self, reqs: Sequence[PDRequestState]
     ) -> dict[str, int]: ...
     def decode_replica_time(self, replica_idx: int) -> float: ...
+    def decode_batch_capacity(self) -> int: ...
 
     # ---- prefill ----
     def try_admit_prefill(
@@ -91,4 +96,8 @@ class PDBackendProtocol(Protocol):
 
     def admit_decode_for_replica(
         self, replica_idx: int, rids: AbstractSet[str], now: float
+    ) -> List[PDRequestState]: ...
+
+    def admit_decode_single_replica(
+        self, rids: AbstractSet[str], now: float
     ) -> List[PDRequestState]: ...

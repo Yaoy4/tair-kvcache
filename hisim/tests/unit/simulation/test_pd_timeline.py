@@ -15,7 +15,9 @@ from hisim.simulation.pd_timeline import (
     closed_loop_first_token_latency,
     decode_step_token_latency,
     first_token_latency,
+    prefill_admission_baseline,
     prefill_batch_start,
+    prefill_queue_baseline,
     sync_decode_start,
 )
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
@@ -43,6 +45,19 @@ def test_sync_decode_start_gates_on_kv_ready():
     assert sync_decode_start(5.0, 2.0) == 5.0
     # No KV gate known -> unchanged.
     assert sync_decode_start(7.0, None) == 7.0
+
+
+def test_prefill_queue_baseline_prefers_server_queue_timestamp():
+    assert prefill_queue_baseline(1.0, 1.4) == pytest.approx(1.4)
+    assert prefill_queue_baseline(1.0, None) == pytest.approx(1.0)
+    assert prefill_queue_baseline(1.0, -1.0) == pytest.approx(1.0)
+
+
+def test_prefill_admission_baseline_gates_on_native_queue_end():
+    assert prefill_admission_baseline(0.0, 10.0) == pytest.approx(10.0)
+    assert prefill_batch_start(
+        0.0, [prefill_admission_baseline(0.0, 10.0)]
+    ) == pytest.approx(10.0)
 
 
 def test_first_token_latency_folds_full_ttft():

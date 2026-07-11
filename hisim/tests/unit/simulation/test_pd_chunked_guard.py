@@ -125,6 +125,7 @@ def test_phase_guard_skips_lifecycle_for_running_prefill():
     be = BackendA(_bundle())
 
     s = _req("r1", input_len=256)
+    s.prefill_is_final_chunk = False
     assert s.phase == RequestPhase.WAITING_PREFILL
 
     # First chunk: fresh → lifecycle runs → RUNNING_PREFILL
@@ -147,6 +148,7 @@ def test_phase_guard_mixed_batch():
 
     s_fresh = _req("r_new", input_len=200)
     s_mid = _req("r_mid", input_len=200)
+    s_mid.prefill_is_final_chunk = False
 
     # Pre-admit s_mid to RUNNING_PREFILL (first chunk)
     be.try_admit_prefill_batch([s_mid], now=0.0)
@@ -171,19 +173,23 @@ def test_finalize_called_only_on_final_chunk():
     be = BackendA(_bundle())
 
     s = _req("r1", input_len=256)
+    s.prefill_is_final_chunk = False
     be.try_admit_prefill_batch([s], now=0.0)
     assert s.phase == RequestPhase.RUNNING_PREFILL
 
     # Mid-chunk: do NOT call finalize — state should remain RUNNING_PREFILL
     assert s.kv_ready_time is None  # not yet finalized
 
-    # Final chunk: call finalize with full prompt length
-    s.input_length = 512  # full prompt
-    finalize_prefill_batch(be, [s], now=0.1)
+    # Final chunk: schedule the final compute, then finalize with full length.
+    s.input_length = 256
+    s.prefill_is_final_chunk = True
+    _, final_end = be.try_admit_prefill_batch([s], now=0.1)
+    s.input_length = 512  # full prompt for KV sizing
+    finalize_prefill_batch(be, [s], now=final_end)
 
     assert s.phase == RequestPhase.KV_TRANSIT, "after final chunk → KV_TRANSIT"
     assert s.kv_ready_time is not None, "kv_ready_time must be set after finalize"
-    assert s.kv_ready_time >= 0.1, "kv_ready_time must be at or after finalize time"
+    assert s.kv_ready_time >= final_end, "kv_ready_time must follow final compute"
 
 
 # ---------------------------------------------------------------------------

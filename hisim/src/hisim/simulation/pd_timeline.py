@@ -7,21 +7,10 @@ layer over logic that is fully covered by fast, deterministic unit tests.
 
 Background
 ----------
-The single-process SGLang hook drives **two** logical engines (prefill and
-decode) from **one** scheduler loop. Historically it advanced a single global
-clock by every batch's latency, so a prefill batch (and its KV transfer) froze
-all in-flight decode requests in virtual time. P1 decouples the two roles into
-two independent "role clocks":
-
-- ``PD_PREFILL_CLOCK``: advanced only by prefill (extend) batches.
-- ``PD_DECODE_CLOCK``:  advanced only by decode batches; jumps forward to a
-  request's ``kv_ready_time`` at the prefill->decode handoff.
-
-Both clocks are *self-anchoring*: they start at 0 and are reconciled against
-already-anchored quantities (each request's real ``arrival_time`` for prefill,
-and ``kv_ready_time`` for decode) via ``max(...)``. This keeps the absolute
-time base aligned with ``RequestStats.created_time`` in both OFFLINE and
-BLOCKING simulation modes without any explicit epoch bookkeeping.
+The single SGLang loop drives two logical pools. Their virtual availability
+is held by backend-owned per-replica ``busy_until`` values rather than scalar
+hook clocks. Prefill starts are anchored to request arrival; decode starts are
+additionally gated by each request's ``kv_ready_time``.
 """
 from __future__ import annotations
 
@@ -61,6 +50,29 @@ def prefill_batch_start(
         if arrival is not None and arrival >= 0.0:
             start = max(start, arrival)
     return start
+
+
+def prefill_queue_baseline(
+    arrival_time: float, queue_start_time: Optional[float]
+) -> float:
+    """Return the server-side baseline for prefill queue wait.
+
+    ``arrival_time`` remains the end-to-end request baseline used by TTFT and
+    E2E.  Queue wait starts when the server enqueues the request; missing or
+    invalid queue timestamps fall back to arrival for older traces.
+    """
+    if queue_start_time is None or queue_start_time < 0.0:
+        return arrival_time
+    return queue_start_time
+
+
+def prefill_admission_baseline(
+    arrival_time: float, queue_end_time: Optional[float]
+) -> float:
+    """Earliest legal prefill start after native scheduler admission."""
+    if queue_end_time is None or queue_end_time < 0.0:
+        return arrival_time
+    return queue_end_time
 
 
 def closed_loop_first_token_latency(
@@ -120,8 +132,7 @@ def decode_step_token_latency(step_lat: float) -> float:
 
 
 def advance_after_decode_step(step_start: float, step_lat: float) -> float:
-    """New ``PD_DECODE_CLOCK`` value after a decode step that began at
-    ``step_start`` and took ``step_lat`` seconds."""
+    """Replica-local decode completion after a step at ``step_start``."""
     return step_start + step_lat
 
 

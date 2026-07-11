@@ -249,11 +249,10 @@ def admit_prefill_batch_latency(
     states: Sequence[PDRequestState],
     now: float,
 ) -> float:
-    """Admit the entire batch onto the backend's prefill pool as one unit.
+    """Admit a scheduler batch onto the backend's prefill replica pool.
 
-    Calls ``backend.try_admit_prefill_batch`` which issues a single predictor
-    call with the sum of all request input lengths — matching the way a real
-    prefill node processes a batch as one forward pass.
+    The backend partitions it into replica-local, capacity-bounded predictor
+    batches and returns the enclosing virtual-time span.
 
     Returns the predicted batch latency = batch_end_time - now.
     Returns 0.0 for an empty batch.
@@ -284,22 +283,42 @@ def finalize_prefill_batch(
     states: Iterable[PDRequestState],
     now: float,
 ) -> None:
-    """After a prefill batch completes at virtual time `now`, move each
-    request to KV_TRANSIT with a shared kv_ready_time.
+    """Move completed replica-local prefill batches into KV_TRANSIT.
 
-    KV transfer is modeled as a single serial stream over the combined data of
-    all requests (sum of input_lengths), so all requests in the batch share the
-    same kv_ready_time. This matches the user-selected sum-total KV transfer
-    model.
+    Requests share a transfer only with requests from the same fused prefill
+    wave (``prefill_batch_id``).  Independent replicas/waves start handoff at
+    their own completion time instead of waiting for the slowest global batch.
+    Legacy states without a batch id retain the old single-group behaviour.
     """
     states = list(states)
     if not states:
         return
-    total_tokens = sum(s.input_length for s in states)
-    kv_ready = backend.compute_batch_kv_ready_time(total_tokens, now)
-    for s in states:
-        prefill_end = s.prefill_end_time if s.prefill_end_time is not None else now
-        backend.on_prefill_done(s, prefill_end, kv_ready)
+    groups: dict[object, list[PDRequestState]] = {}
+    for state in states:
+        batch_id = getattr(state, "prefill_batch_id", None)
+        key = ("batch", batch_id) if batch_id is not None else ("legacy", 0)
+        groups.setdefault(key, []).append(state)
+
+    for key, group in groups.items():
+        group_end = (
+            now
+            if key == ("legacy", 0)
+            else max(
+                state.prefill_end_time
+                if state.prefill_end_time is not None
+                else now
+                for state in group
+            )
+        )
+        total_tokens = sum(state.input_length for state in group)
+        kv_ready = backend.compute_batch_kv_ready_time(total_tokens, group_end)
+        for state in group:
+            prefill_end = (
+                state.prefill_end_time
+                if state.prefill_end_time is not None
+                else group_end
+            )
+            backend.on_prefill_done(state, prefill_end, kv_ready)
 
 
 def drain_kv_ready_and_admit_decode(

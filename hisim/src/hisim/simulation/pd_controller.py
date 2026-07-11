@@ -54,13 +54,16 @@ class PDController:
 
     # ---- lifecycle hooks ----
     def on_request_arrival(self, req: PDRequestState, now: float) -> None:
-        req.phase = RequestPhase.WAITING_PREFILL
+        self._require_phase(req, RequestPhase.WAITING_PREFILL, "request arrival")
+        if any(queued.rid == req.rid for queued in self._prefill_waiting):
+            raise ValueError(f"duplicate prefill arrival for rid={req.rid!r}")
         self._prefill_waiting.append(req)
 
     def admit_prefill(self, capacity: int, now: float) -> List[PDRequestState]:
         admitted: List[PDRequestState] = []
         while capacity > 0 and self._prefill_waiting:
             req = self._prefill_waiting.popleft()
+            self._require_phase(req, RequestPhase.WAITING_PREFILL, "prefill admission")
             req.phase = RequestPhase.RUNNING_PREFILL
             req.prefill_start_time = now
             admitted.append(req)
@@ -70,6 +73,7 @@ class PDController:
     def on_prefill_done(
         self, req: PDRequestState, now: float, kv_ready_time: float
     ) -> None:
+        self._require_phase(req, RequestPhase.RUNNING_PREFILL, "prefill completion")
         if kv_ready_time < now:
             raise ValueError(
                 f"kv_ready_time ({kv_ready_time}) must be >= now ({now}); "
@@ -104,6 +108,7 @@ class PDController:
         ready: List[PDRequestState] = []
         remaining: List[PDRequestState] = []
         for req in self._kv_transit:
+            self._require_phase(req, RequestPhase.KV_TRANSIT, "KV-ready polling")
             if req.kv_ready_time is not None and req.kv_ready_time <= now:
                 req.phase = RequestPhase.WAITING_DECODE
                 self._decode_waiting.append(req)
@@ -117,6 +122,7 @@ class PDController:
         admitted: List[PDRequestState] = []
         while capacity > 0 and self._decode_waiting:
             req = self._decode_waiting.popleft()
+            self._require_phase(req, RequestPhase.WAITING_DECODE, "decode admission")
             req.phase = RequestPhase.RUNNING_DECODE
             req.decode_start_time = now
             req.current_past_kv_length = req.input_length
@@ -142,6 +148,7 @@ class PDController:
         remaining: Deque[PDRequestState] = deque()
         while self._decode_waiting:
             req = self._decode_waiting.popleft()
+            self._require_phase(req, RequestPhase.WAITING_DECODE, "targeted decode admission")
             if req.rid in rids:
                 if max_count is not None and len(admitted) >= max_count:
                     remaining.append(req)
@@ -159,8 +166,19 @@ class PDController:
         self, reqs: Iterable[PDRequestState], now: float
     ) -> None:
         for req in reqs:
+            self._require_phase(req, RequestPhase.RUNNING_DECODE, "decode completion")
             req.decode_step_count += 1
             req.current_past_kv_length += 1
             if req.decode_step_count >= req.output_length:
                 req.phase = RequestPhase.FINISHED
                 req.decode_end_time = now
+
+    @staticmethod
+    def _require_phase(
+        req: PDRequestState, expected: RequestPhase, operation: str
+    ) -> None:
+        if req.phase != expected:
+            raise ValueError(
+                f"invalid PD phase for {operation}: rid={req.rid!r}, "
+                f"expected={expected.value}, actual={req.phase.value}"
+            )

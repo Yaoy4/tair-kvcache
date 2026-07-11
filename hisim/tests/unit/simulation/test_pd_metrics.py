@@ -19,6 +19,10 @@ from hisim.simulation.pd_metrics import (
     populate_request_stats,
 )
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
+from hisim.simulation.pd_timeline import (
+    prefill_admission_baseline,
+    prefill_batch_start,
+)
 from hisim.simulation.types import RequestStats
 from hisim.simulation.utils import calc_metrics
 
@@ -61,6 +65,33 @@ def test_compute_stage_durations_basic():
     assert d["prefill_queue_wait"] == pytest.approx(0.5)
     assert d["kv_transfer_time"] == pytest.approx(0.25)
     assert d["decode_queue_wait"] == pytest.approx(0.15)
+
+
+def test_prefill_queue_wait_uses_server_queue_start_not_request_creation():
+    state = _make_finished_state(
+        "r1",
+        arrival=1.0,
+        prefill_start=2.0,
+        prefill_end=2.5,
+        kv_ready=2.6,
+        decode_start=2.7,
+    )
+    state.prefill_queue_start_time = 1.6
+    d = compute_stage_durations(state)
+    assert d["prefill_queue_wait"] == pytest.approx(0.4)
+
+
+def test_native_queue_end_prevents_structural_zero_prefill_wait():
+    start = prefill_batch_start(
+        0.0, [prefill_admission_baseline(arrival_time=0.0, queue_end_time=10.0)]
+    )
+    state = PDRequestState(
+        rid="queued",
+        arrival_time=0.0,
+        prefill_queue_start_time=0.0,
+        prefill_start_time=start,
+    )
+    assert compute_stage_durations(state)["prefill_queue_wait"] == pytest.approx(10.0)
 
 
 def test_compute_stage_durations_missing_timestamps_returns_zero():

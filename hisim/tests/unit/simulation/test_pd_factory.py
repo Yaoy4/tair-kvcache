@@ -168,11 +168,13 @@ def test_build_disagg_returns_two_predictors_with_role_configs():
     assert out.prefill.config.tp_size == 4
     assert out.prefill.config.ep_size == 1
     assert out.prefill.config.max_running_requests == 128
+    assert out.prefill_max_running_per_replica == 128
     assert out.prefill.kwargs.get("database_path") == "/aic/prefill.db"
     # Decode role
     assert out.decode.config.tp_size == 2
     assert out.decode.config.dp_size == 2
     assert out.decode.config.max_running_requests == 64
+    assert out.decode_max_running_per_replica == 64
     assert out.decode.kwargs.get("database_path") == "/aic/decode.db"
 
 
