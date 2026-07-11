@@ -41,6 +41,7 @@ class PDController:
         self._prefill_waiting: Deque[PDRequestState] = deque()
         self._kv_transit: List[PDRequestState] = []
         self._decode_waiting: Deque[PDRequestState] = deque()
+        self._kv_link_busy_until = 0.0
 
     # ---- introspection (used by tests / metrics) ----
     def prefill_waiting_count(self) -> int:
@@ -92,7 +93,9 @@ class PDController:
         transfer_dur = self._transfer_model.estimate(
             req.input_length, self._kv_model_cfg
         )
-        return now + transfer_dur
+        start = max(now, self._kv_link_busy_until)
+        self._kv_link_busy_until = start + transfer_dur
+        return self._kv_link_busy_until
 
     def compute_batch_kv_ready_time(self, total_tokens: int, now: float) -> float:
         """Batch-level KV transfer estimate.
@@ -102,7 +105,9 @@ class PDController:
         All requests in the batch share the same kv_ready_time.
         """
         transfer_dur = self._transfer_model.estimate(total_tokens, self._kv_model_cfg)
-        return now + transfer_dur
+        start = max(now, self._kv_link_busy_until)
+        self._kv_link_busy_until = start + transfer_dur
+        return self._kv_link_busy_until
 
     def poll_kv_ready(self, now: float) -> List[PDRequestState]:
         ready: List[PDRequestState] = []
@@ -172,6 +177,29 @@ class PDController:
             if req.decode_step_count >= req.output_length:
                 req.phase = RequestPhase.FINISHED
                 req.decode_end_time = now
+
+    def terminate_request(self, req: PDRequestState, now: float) -> None:
+        """Synchronize an externally-finished or cancelled request.
+
+        SGLang may finish before ``max_new_tokens`` because of EOS/stop, or
+        remove a request because it was aborted.  This transition is
+        intentionally idempotent and removes the request from every controller
+        queue before marking it finished.
+        """
+        self._prefill_waiting = deque(
+            queued for queued in self._prefill_waiting if queued.rid != req.rid
+        )
+        self._kv_transit = [
+            queued for queued in self._kv_transit if queued.rid != req.rid
+        ]
+        self._decode_waiting = deque(
+            queued for queued in self._decode_waiting if queued.rid != req.rid
+        )
+        if req.phase == RequestPhase.FINISHED:
+            return
+        req.phase = RequestPhase.FINISHED
+        if req.decode_start_time is not None:
+            req.decode_end_time = now
 
     @staticmethod
     def _require_phase(

@@ -299,17 +299,21 @@ def finalize_prefill_batch(
         key = ("batch", batch_id) if batch_id is not None else ("legacy", 0)
         groups.setdefault(key, []).append(state)
 
+    scheduled_groups = []
     for key, group in groups.items():
-        group_end = (
-            now
-            if key == ("legacy", 0)
-            else max(
-                state.prefill_end_time
-                if state.prefill_end_time is not None
-                else now
-                for state in group
-            )
+        group_end = now if key == ("legacy", 0) else max(
+            state.prefill_end_time
+            if state.prefill_end_time is not None
+            else now
+            for state in group
         )
+        scheduled_groups.append((group_end, key, group))
+
+    # All PD replicas share the configured transfer link. Submit handoffs in
+    # physical completion order so a later-finishing wave cannot reserve the
+    # NIC ahead of an earlier one merely because of caller list order.
+    scheduled_groups.sort(key=lambda item: item[0])
+    for group_end, _key, group in scheduled_groups:
         total_tokens = sum(state.input_length for state in group)
         kv_ready = backend.compute_batch_kv_ready_time(total_tokens, group_end)
         for state in group:

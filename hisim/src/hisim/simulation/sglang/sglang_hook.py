@@ -656,15 +656,18 @@ class C_SchedulerHook(BaseHook):
 
             disagg_cfg = ConfigManager.get_disagg_config()
             if disagg_cfg.enabled and disagg_cfg.decode is not None:
-                decode_capacity = disagg_cfg.decode_admission_capacity()
+                pd_capacity = min(
+                    disagg_cfg.prefill_admission_capacity(),
+                    disagg_cfg.decode_admission_capacity(),
+                )
                 configured_capacity = getattr(
                     server_args, "max_running_requests", None
                 )
                 if configured_capacity is not None:
-                    decode_capacity = min(
-                        int(configured_capacity), int(decode_capacity)
+                    pd_capacity = min(
+                        int(configured_capacity), int(pd_capacity)
                     )
-                setattr(server_args, "max_running_requests", decode_capacity)
+                setattr(server_args, "max_running_requests", pd_capacity)
 
             original_init(self, *args, **kwargs)
             cfg_closed_loop = False
@@ -684,38 +687,30 @@ class C_SchedulerHook(BaseHook):
                 "PD closed-loop TTFT mode: %s",
                 C_SchedulerHook.PD_CLOSED_LOOP,
             )
-            try:
-                model = ConfigManager.get_model_info(
-                    self.model_config.hf_config.__dict__
-                )
-                hw = ConfigManager.get_accelerator_info()
-                sched_config = ConfigManager.get_scheduler_config(
-                    self.server_args.__dict__,
-                    "sglang",
-                    self.model_config.hf_config.__dict__,
-                )
-                ConfigManager.set_scheduler_config(sched_config)
-                ConfigManager.set_model_info(model)
+            model = ConfigManager.get_model_info(
+                self.model_config.hf_config.__dict__
+            )
+            hw = ConfigManager.get_accelerator_info()
+            sched_config = ConfigManager.get_scheduler_config(
+                self.server_args.__dict__,
+                "sglang",
+                self.model_config.hf_config.__dict__,
+            )
+            ConfigManager.set_scheduler_config(sched_config)
+            ConfigManager.set_model_info(model)
 
+            try:
                 C_SchedulerHook.INFERENCE_PREDICTOR = (
                     ConfigManager.get_inference_time_predictor(model, hw, sched_config)
                 )
             except Exception as e:
                 if disagg_cfg.enabled:
-                    # In PD mode, decode still uses INFERENCE_PREDICTOR latency.
-                    # If the aggregated predictor config is unavailable, fall back
-                    # to the disagg decode-role predictor so launch can proceed.
-                    from hisim.simulation.pd_factory import build_disagg
-
-                    bundle = build_disagg(
-                        model=model,
-                        base_sched_config=sched_config,
-                        disagg_config=disagg_cfg,
-                    )
-                    C_SchedulerHook.INFERENCE_PREDICTOR = bundle.decode
+                    # Extend/decode batches are priced exclusively by the PD
+                    # backend. An unavailable aggregate predictor is harmless.
+                    C_SchedulerHook.INFERENCE_PREDICTOR = None
                     logger.warning(
                         "Failed to initialize global inference predictor (%s); "
-                        "falling back to disagg decode-role predictor.",
+                        "PD role predictors remain authoritative.",
                         e,
                     )
                 else:
@@ -847,6 +842,46 @@ class C_SchedulerHook(BaseHook):
                     heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
 
             now = time.time()
+            if C_SchedulerHook.PD_BACKEND is not None:
+                from hisim.simulation.pd_metrics import (
+                    flush_finished_states,
+                    populate_request_stats,
+                )
+                from hisim.simulation.pd_sglang_lifecycle import abort_request_ids
+
+                aborted_rids = set()
+                for message in recv_reqs:
+                    aborted_rids.update(abort_request_ids(message))
+                if aborted_rids:
+                    termination_time = (
+                        now
+                        if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING
+                        else StateManager.get_global_clock()
+                    )
+                    for rid in aborted_rids:
+                        state = C_SchedulerHook.PD_REQUEST_STATES.get(rid)
+                        if state is not None:
+                            state.output_length = state.decode_step_count
+                            C_SchedulerHook.PD_BACKEND.terminate_request(
+                                state, termination_time
+                            )
+                            stats = C_SchedulerHook.REQUEST_STATS.get(rid)
+                            if stats is not None:
+                                stats.output_length = state.decode_step_count
+                                populate_request_stats(stats, state)
+                        C_SchedulerHook.PD_PREFILL_KV_SERVICE.pop(rid, None)
+                        C_SchedulerHook.PD_CHUNK_ACCUM.pop(rid, None)
+                    flush_finished_states(
+                        C_SchedulerHook.PD_REQUEST_STATES,
+                        C_SchedulerHook.REQUEST_STATS,
+                    )
+                    if C_SchedulerHook.FUTURE_QUEUE:
+                        C_SchedulerHook.FUTURE_QUEUE = [
+                            item
+                            for item in C_SchedulerHook.FUTURE_QUEUE
+                            if getattr(item[2], "rid", None) not in aborted_rids
+                        ]
+                        heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
             for req in recv_reqs:
                 if req.__class__.__name__ in [
                     "BatchTokenizedGenerateReqInput",
@@ -1005,12 +1040,24 @@ class C_SchedulerHook(BaseHook):
 
                 if not hisim_batch.is_empty():
                     StateManager.inc_iteration()
-                    predicted_latency = (
-                        C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
-                            hisim_batch
+                    pd_priced_batch = (
+                        C_SchedulerHook.PD_BACKEND is not None
+                        and (
+                            batch.forward_mode.is_extend()
+                            or batch.forward_mode.is_decode()
                         )
                     )
-                    predicted_latency = float(predicted_latency)
+                    if pd_priced_batch:
+                        # The role-specific backend below is authoritative.
+                        # Avoid a redundant aggregate predictor call whose result
+                        # would be discarded immediately.
+                        predicted_latency = 0.0
+                    else:
+                        predicted_latency = float(
+                            C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
+                                hisim_batch
+                            )
+                        )
 
                     # Phase 2b.4a: when PD is active, override prefill latency
                     # with the BackendA prefill pool clock. Decode path still
@@ -1362,6 +1409,12 @@ class C_SchedulerHook(BaseHook):
                                     logger.debug(
                                         "[PD] flushed %d finished states", flushed
                                     )
+                            elif batch.reqs:
+                                raise RuntimeError(
+                                    "PD decode batch contained no admissible "
+                                    "request state; native and PD capacity/state "
+                                    "tracking diverged"
+                                )
                         else:
                             step_start = (
                                 C_SchedulerHook.PD_BACKEND.earliest_pool_time(
@@ -1445,6 +1498,12 @@ class C_SchedulerHook(BaseHook):
                                     logger.debug(
                                         "[PD] flushed %d finished states", flushed
                                     )
+                            else:
+                                raise RuntimeError(
+                                    "PD decode batch contained no admissible "
+                                    "request state; native and PD capacity/state "
+                                    "tracking diverged"
+                                )
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
@@ -1464,13 +1523,14 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
-            ret = original_process_batch_result(self, *args, **kwargs)
-
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            batch_reqs = list(batch.reqs) if batch is not None else []
+            ret = original_process_batch_result(self, *args, **kwargs)
+
             if batch is not None:
-                if len(batch.reqs) == 0:
+                if not batch_reqs:
                     return ret
 
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
@@ -1508,8 +1568,53 @@ class C_SchedulerHook(BaseHook):
                         closed_loop_first_token_latency,
                     )
 
+                externally_finished_rids = set()
+                if C_SchedulerHook.PD_BACKEND is not None:
+                    from hisim.simulation.pd_types import RequestPhase
+                    from hisim.simulation.pd_sglang_lifecycle import (
+                        reconcile_decode_progress,
+                        request_actual_output_length,
+                        request_reports_finished,
+                    )
+
+                    for req in batch_reqs:
+                        state = C_SchedulerHook.PD_REQUEST_STATES.get(req.rid)
+                        actual_output_length = request_actual_output_length(req)
+                        if (
+                            state is not None
+                            and pd_decode_mode
+                            and actual_output_length is not None
+                            and state.phase in (
+                                RequestPhase.RUNNING_DECODE,
+                                RequestPhase.FINISHED,
+                            )
+                        ):
+                            reconcile_decode_progress(state, actual_output_length)
+                        if not request_reports_finished(req):
+                            continue
+                        if state is None:
+                            continue
+                        if actual_output_length is not None:
+                            state.output_length = actual_output_length
+                            stats = C_SchedulerHook.REQUEST_STATS.get(req.rid)
+                            if stats is not None:
+                                stats.output_length = actual_output_length
+                        termination_time = C_SchedulerHook.PD_BATCH_TOKEN_TIMES.get(
+                            req.rid
+                        )
+                        if termination_time is None:
+                            termination_time = (
+                                state.prefill_end_time
+                                if state.prefill_end_time is not None
+                                else request_response_time
+                            )
+                        C_SchedulerHook.PD_BACKEND.terminate_request(
+                            state, termination_time
+                        )
+                        externally_finished_rids.add(req.rid)
+
                 # Request statistics
-                for req in batch.reqs:
+                for req in batch_reqs:
                     if req.is_chunked == 0:
                         req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
                         # In PD disagg mode the extend (prefill) batch runs on
@@ -1595,6 +1700,16 @@ class C_SchedulerHook(BaseHook):
                                     token_time - req_stats.last_event_time
                                 )
                             req_stats.last_event_time = token_time
+                            actual_output_length = request_actual_output_length(req)
+                            if actual_output_length is not None:
+                                # Speculative decoding can emit multiple tokens
+                                # from one forward step. They share one completion
+                                # instant, so additional same-step ITLs are zero.
+                                while (
+                                    len(req_stats.gen_token_latencies)
+                                    < actual_output_length
+                                ):
+                                    req_stats.gen_token_latencies.append(0.0)
                         else:
                             req_stats.gen_token_latencies.append(
                                 request_response_time
@@ -1604,6 +1719,16 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request: nothing to do
                         pass
+                if externally_finished_rids:
+                    from hisim.simulation.pd_metrics import flush_finished_states
+
+                    flush_finished_states(
+                        C_SchedulerHook.PD_REQUEST_STATES,
+                        C_SchedulerHook.REQUEST_STATS,
+                    )
+                    for rid in externally_finished_rids:
+                        C_SchedulerHook.PD_PREFILL_KV_SERVICE.pop(rid, None)
+                        C_SchedulerHook.PD_CHUNK_ACCUM.pop(rid, None)
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
@@ -1666,11 +1791,14 @@ class C_SchedulerHook(BaseHook):
 
                 min_created_time = metrics_stats[0].created_time
                 # Align timestamps
+                from hisim.simulation.pd_metrics import shift_pd_time_origin
+
                 for item in stats:
                     item.created_time -= min_created_time
                     item.queue_start -= min_created_time
                     item.queue_end -= min_created_time
                     item.last_event_time -= min_created_time
+                    shift_pd_time_origin(item, min_created_time)
 
                 metrics = calc_metrics(metrics_stats)
                 metrics["time_cost"] = time.time() - C_SchedulerHook.LAST_FLUSH_TS

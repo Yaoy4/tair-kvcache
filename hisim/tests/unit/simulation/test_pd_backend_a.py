@@ -356,6 +356,44 @@ def test_single_replica_decode_admission_respects_capacity():
     assert ctrl.decode_waiting_count() == 1
 
 
+def test_external_termination_releases_single_decode_capacity():
+    be = BackendA(
+        _bundle(
+            decode_queue_mode="single_replica",
+            decode_max_running_per_replica=1,
+        )
+    )
+    ctrl = be.controller()
+    reqs = [_req("eos", output_len=8), _req("next", output_len=8)]
+    for req in reqs:
+        ctrl.on_request_arrival(req, 0.0)
+        ctrl.admit_prefill(1, 0.0)
+        ctrl.on_prefill_done(req, 0.0, 0.0)
+        ctrl.poll_kv_ready(0.0)
+
+    assert be.admit_decode_single_replica({"eos"}, 0.0) == [reqs[0]]
+    be.terminate_request(reqs[0], 0.1)
+    assert be.admit_decode_single_replica({"next"}, 0.1) == [reqs[1]]
+
+
+def test_external_termination_releases_chunked_prefill_capacity():
+    be = BackendA(
+        _bundle(
+            prefill_replicas=1,
+            prefill_max_running_per_replica=1,
+        )
+    )
+    aborted = _req("aborted")
+    aborted.prefill_is_final_chunk = False
+    be.try_admit_prefill_batch([aborted], now=0.0)
+
+    be.terminate_request(aborted, now=0.1)
+    fresh = _req("fresh")
+    be.try_admit_prefill_batch([fresh], now=0.1)
+
+    assert fresh.phase == RequestPhase.RUNNING_PREFILL
+
+
 def test_per_replica_decode_binding_avoids_full_replica():
     be = BackendA(
         _bundle(
@@ -484,6 +522,20 @@ def test_replica_local_prefill_batches_start_kv_handoff_independently():
     finalize_prefill_batch(be, [fast, slow], now=batch_end)
 
     assert fast.prefill_batch_id != slow.prefill_batch_id
+    assert fast.prefill_end_time < slow.prefill_end_time
+    assert fast.kv_ready_time < slow.kv_ready_time
+
+
+def test_kv_handoff_submission_is_ordered_by_prefill_completion():
+    be = BackendA(_bundle(prefill_device="fast", prefill_replicas=2))
+    fast = _req("fast", input_len=100)
+    slow = _req("slow", input_len=300)
+    _, batch_end = be.try_admit_prefill_batch([fast, slow], now=0.0)
+
+    # Deliberately reverse caller order. The later-finishing slow request must
+    # not reserve the shared link ahead of the already-complete fast request.
+    finalize_prefill_batch(be, [slow, fast], now=batch_end)
+
     assert fast.prefill_end_time < slow.prefill_end_time
     assert fast.kv_ready_time < slow.kv_ready_time
 

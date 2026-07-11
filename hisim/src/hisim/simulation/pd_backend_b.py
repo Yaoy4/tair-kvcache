@@ -705,6 +705,18 @@ class BackendB:
                         0, self._decode_running_count[replica_idx] - 1
                     )
 
+    def terminate_request(self, req: PDRequestState, now: float) -> None:
+        """Release every reservation for an EOS/stop/abort termination."""
+        self._controller.terminate_request(req, now)
+        self._release_prefill_slot(req)
+        self._prefill_replica_by_rid.pop(req.rid, None)
+        self._single_decode_running_rids.discard(req.rid)
+        replica_idx = self._decode_replica_by_rid.pop(req.rid, None)
+        if replica_idx is not None:
+            self._decode_running_count[replica_idx] = max(
+                0, self._decode_running_count[replica_idx] - 1
+            )
+
     def admit_decode_for_replica(
         self, replica_idx: int, rids: AbstractSet[str], now: float
     ) -> List[PDRequestState]:

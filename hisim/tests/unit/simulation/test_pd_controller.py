@@ -87,6 +87,15 @@ def test_compute_kv_ready_time_uses_bandwidth_model():
     assert ctrl.compute_kv_ready_time(req, now=1.0) == pytest.approx(expected, rel=1e-12)
 
 
+def test_kv_transfers_share_one_capacity_accounted_link():
+    ctrl = make_controller(bw_gbps=1.0, latency_us=10.0, kv_bytes_per_token=1024)
+    first = ctrl.compute_batch_kv_ready_time(total_tokens=100, now=1.0)
+    second = ctrl.compute_batch_kv_ready_time(total_tokens=100, now=1.0)
+    one_transfer = first - 1.0
+
+    assert second == pytest.approx(first + one_transfer)
+
+
 def test_on_prefill_done_uses_caller_supplied_kv_ready_time():
     ctrl = make_controller(bw_gbps=100.0, latency_us=10.0, kv_bytes_per_token=1024)
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=2048)
@@ -197,6 +206,46 @@ def test_on_decode_step_done_increments_state_and_finishes_when_done():
     assert req.decode_step_count == 2
     assert req.current_past_kv_length == 6
     assert req.phase == RequestPhase.FINISHED
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        RequestPhase.WAITING_PREFILL,
+        RequestPhase.RUNNING_PREFILL,
+        RequestPhase.KV_TRANSIT,
+        RequestPhase.WAITING_DECODE,
+        RequestPhase.RUNNING_DECODE,
+    ],
+)
+def test_terminate_request_is_idempotent_from_every_live_phase(phase):
+    ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
+    req = PDRequestState(
+        rid="terminated", arrival_time=0.0, input_length=4, output_length=8
+    )
+    ctrl.on_request_arrival(req, now=0.0)
+    if phase != RequestPhase.WAITING_PREFILL:
+        ctrl.admit_prefill(capacity=1, now=0.0)
+    if phase in (
+        RequestPhase.KV_TRANSIT,
+        RequestPhase.WAITING_DECODE,
+        RequestPhase.RUNNING_DECODE,
+    ):
+        ctrl.on_prefill_done(req, now=1.0, kv_ready_time=2.0)
+    if phase in (RequestPhase.WAITING_DECODE, RequestPhase.RUNNING_DECODE):
+        ctrl.poll_kv_ready(now=2.0)
+    if phase == RequestPhase.RUNNING_DECODE:
+        ctrl.admit_decode(capacity=1, now=2.0)
+
+    ctrl.terminate_request(req, now=3.0)
+    ctrl.terminate_request(req, now=4.0)
+
+    assert req.phase == RequestPhase.FINISHED
+    assert ctrl.prefill_waiting_count() == 0
+    assert ctrl.kv_transit_count() == 0
+    assert ctrl.decode_waiting_count() == 0
+    if phase == RequestPhase.RUNNING_DECODE:
+        assert req.decode_end_time == pytest.approx(3.0)
 
 
 def test_full_state_flow_end_to_end():

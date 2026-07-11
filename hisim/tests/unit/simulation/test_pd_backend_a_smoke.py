@@ -346,7 +346,7 @@ def test_4b_decode_bottleneck_grows_decode_queue_p95():
 
 
 def test_4c_kv_bandwidth_sweep_grows_kv_transfer_p95():
-    """Halve bw_gbps each step. kv_transfer_p95 must increase roughly 2x."""
+    """Lower bandwidth must monotonically increase shared-link transfer P95."""
     reqs_template = lambda: _mk_reqs(
         8, input_length=1024, output_length=4, arrival_stride=0.0
     )
@@ -368,13 +368,11 @@ def test_4c_kv_bandwidth_sweep_grows_kv_transfer_p95():
         assert p95s[i] > p95s[i - 1], (
             f"kv_transfer_p95 should grow as bw drops: bws={bws} p95s={p95s}"
         )
-    # Doubling check (loose): halving bw should ~double p95 within 30%.
-    for i in range(1, len(p95s)):
-        ratio = p95s[i] / max(p95s[i - 1], 1e-12)
-        assert 1.5 <= ratio <= 2.5, (
-            f"halving bw should roughly double kv_transfer_p95; "
-            f"got ratio={ratio:.3f} (p95s={p95s}, bws={bws})"
-        )
+    # With one shared link, p95 includes both transfer service and queueing.
+    # Queue buildup makes the end-to-end sensitivity stronger than the old
+    # independent-link ~2x assumption. An 8x bandwidth reduction must produce
+    # at least an 8x p95 increase.
+    assert p95s[-1] >= 8.0 * p95s[0]
 
 
 # ---------------------------------------------------------------------------

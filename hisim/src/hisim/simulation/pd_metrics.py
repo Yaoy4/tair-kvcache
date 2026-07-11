@@ -59,6 +59,25 @@ def populate_request_stats(
     stats.decode_queue_wait = d["decode_queue_wait"]
 
 
+PD_ABSOLUTE_TIME_FIELDS = (
+    "pd_arrival_time",
+    "pd_prefill_queue_start_time",
+    "pd_prefill_start_time",
+    "pd_prefill_end_time",
+    "pd_kv_ready_time",
+    "pd_decode_start_time",
+    "pd_decode_end_time",
+)
+
+
+def shift_pd_time_origin(stats: "RequestStats", origin: float) -> None:
+    """Align optional PD timestamps with RequestStats' relative time axis."""
+    for name in PD_ABSOLUTE_TIME_FIELDS:
+        value = getattr(stats, name, None)
+        if value is not None:
+            setattr(stats, name, float(value) - float(origin))
+
+
 def flush_finished_states(
     pd_states: dict,
     request_stats: dict,

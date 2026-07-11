@@ -17,6 +17,7 @@ from hisim.simulation.pd_metrics import (
     compute_stage_durations,
     flush_finished_states,
     populate_request_stats,
+    shift_pd_time_origin,
 )
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
 from hisim.simulation.pd_timeline import (
@@ -139,6 +140,26 @@ def test_populate_request_stats_writes_durations():
     assert stats.prefill_queue_wait == pytest.approx(0.5)
     assert stats.kv_transfer_time == pytest.approx(0.25)
     assert stats.decode_queue_wait == pytest.approx(0.15)
+
+
+def test_shift_pd_time_origin_aligns_all_optional_pd_timestamps():
+    state = _make_finished_state(
+        "r1", 10.0, 11.0, 12.0, 13.0, 14.0
+    )
+    state.prefill_queue_start_time = 10.5
+    state.decode_end_time = 15.0
+    stats = RequestStats(rid="r1")
+    populate_request_stats(stats, state)
+
+    shift_pd_time_origin(stats, 10.0)
+
+    assert stats.pd_arrival_time == pytest.approx(0.0)
+    assert stats.pd_prefill_queue_start_time == pytest.approx(0.5)
+    assert stats.pd_prefill_start_time == pytest.approx(1.0)
+    assert stats.pd_prefill_end_time == pytest.approx(2.0)
+    assert stats.pd_kv_ready_time == pytest.approx(3.0)
+    assert stats.pd_decode_start_time == pytest.approx(4.0)
+    assert stats.pd_decode_end_time == pytest.approx(5.0)
 
 
 def _make_completed_request_stats(

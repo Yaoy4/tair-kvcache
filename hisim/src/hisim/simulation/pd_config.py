@@ -107,3 +107,17 @@ class DisaggConfig:
             else 1
         )
         return self.decode.max_running_per_replica * replicas
+
+    def prefill_admission_capacity(self) -> int:
+        """Native running-request cap compatible with prefill routing.
+
+        Chunked-prefill requests retain their slot across scheduler iterations,
+        so the native scheduler must never activate more requests than the
+        complete prefill pool can hold.
+        """
+        if not self.enabled or self.prefill is None:
+            return DEFAULT_MAX_RUNNING
+        return (
+            self.prefill.max_running_per_replica
+            * self.prefill.replicas
+        )

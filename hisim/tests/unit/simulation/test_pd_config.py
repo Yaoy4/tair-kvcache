@@ -152,3 +152,15 @@ def test_decode_admission_capacity_matches_queue_mode():
     assert DisaggConfig(
         **common, decode_queue_mode="per_replica_queue"
     ).decode_admission_capacity() == 21
+
+
+def test_prefill_admission_capacity_uses_all_service_replicas():
+    cfg = DisaggConfig(
+        enabled=True,
+        prefill=RolePredictorConfig(
+            device_name="p", replicas=4, max_running_per_replica=3
+        ),
+        decode=RolePredictorConfig(device_name="d"),
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    assert cfg.prefill_admission_capacity() == 12

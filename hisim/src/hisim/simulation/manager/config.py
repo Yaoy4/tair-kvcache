@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 
 from hisim.spec import ModelInfo, AcceleratorInfo, DataType
@@ -8,10 +10,7 @@ from hisim.simulation.utils import (
     calc_kv_cache_cell_elems,
     calc_kv_cache_per_layer_elems,
 )
-from hisim.time_predictor import (
-    InferTimePredictor,
-    AIConfiguratorTimePredictor,
-)
+from hisim.time_predictor import InferTimePredictor
 from hisim.utils import get_logger
 
 
@@ -187,6 +186,10 @@ class ConfigManager:
             config: dict = json.load(f)
         predictor_config = config.get("predictor", {})
         if predictor_config.get("name") == "aiconfigurator":
+            # AIC is an optional runtime dependency. Configuration parsing and
+            # non-AIC simulation paths must remain importable without its SDK.
+            from hisim.time_predictor import AIConfiguratorTimePredictor
+
             device_name = predictor_config.get("device_name")
             hw.name = device_name
             database_mode = predictor_config.get("database_mode", "SILICON")

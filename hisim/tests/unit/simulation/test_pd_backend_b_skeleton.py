@@ -211,6 +211,25 @@ def test_chunked_prefill_holds_backend_b_capacity_across_calls():
         assert fresh.phase == RequestPhase.WAITING_PREFILL
 
 
+def test_external_termination_releases_backend_b_prefill_capacity():
+    with BackendB(
+        bundle=_make_bundle(
+            prefill_replicas=1,
+            prefill_max_running_per_replica=1,
+        ),
+        prefill_predictor_factory=make_prefill_predictor,
+        decode_predictor_factory=make_decode_predictor,
+    ) as backend:
+        aborted = _req("aborted", input_len=100)
+        aborted.prefill_is_final_chunk = False
+        backend.try_admit_prefill_batch([aborted], now=0.0)
+        backend.terminate_request(aborted, now=0.1)
+
+        fresh = _req("fresh", input_len=100)
+        backend.try_admit_prefill_batch([fresh], now=0.1)
+        assert fresh.phase == RequestPhase.RUNNING_PREFILL
+
+
 def test_api_parity_with_backend_a():
     """Same predictor + same bundle → BackendA and BackendB return identical end_time."""
     bundle_a = _make_bundle()

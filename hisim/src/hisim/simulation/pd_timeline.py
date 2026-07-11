@@ -137,13 +137,10 @@ def advance_after_decode_step(step_start: float, step_lat: float) -> float:
 
 
 def has_unsupported_chunked(reqs) -> bool:
-    """True if any request in an extend batch is mid chunked-prefill.
+    """Return whether an extend batch contains a non-final prefill chunk.
 
-    SGLang flags non-final chunks with ``is_chunked != 0``. The PD glue assumes
-    one extend batch per request (input_length / kv_ready / decode-base captured
-    once), so a chunked request would corrupt those quantities. The hook uses
-    this to emit a single clear warning instead of silently producing bad PD
-    numbers. Requests without an ``is_chunked`` attribute are treated as
-    unchunked (0).
+    Retained as a compatibility helper for callers that want to report chunked
+    traffic. PD now supports chunk affinity, per-chunk prediction and full-
+    prompt KV sizing; a true result no longer means the workload is unsupported.
     """
     return any(getattr(req, "is_chunked", 0) != 0 for req in reqs)

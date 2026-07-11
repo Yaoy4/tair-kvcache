@@ -46,6 +46,7 @@ _REQUIRED_METHODS = (
     "try_admit_decode_batch",
     "on_decode_step_done",
     "on_decode_step_done_batch",
+    "terminate_request",
     "admit_decode_for_replica",
     "admit_decode_single_replica",
 )

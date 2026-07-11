@@ -1,12 +1,14 @@
 # HiSim PD Disaggregation — Modeling Review
 
-> **Status note (post-v1.6 working tree):** This is the historical review that
+> **Status note (post-v1.7 fixes):** This is the historical review that
 > motivated the fixes. The implementation now uses backend-owned per-replica
 > clocks, persistent capacity-aware admission, replica-local fused prefill
-> batches and KV handoff, strict phase guards, and `queue_end`-gated prefill
-> timing. Findings 1–4, 6, and 7 below describe the pre-fix implementation.
-> Shared-link NIC congestion and the single native SGLang batch-composition
-> loop remain modeling limits.
+> batches, a shared capacity-accounted KV link, strict phase guards,
+> `queue_end`-gated prefill timing, and SGLang-driven EOS/stop/abort cleanup.
+> The findings below describe the pre-fix implementation. The single native
+> SGLang batch-composition loop remains an explicit simulation architecture
+> boundary; Backend B uses predictor workers rather than two real SGLang
+> scheduler services.
 
 **Scope:** Correctness review of the prefill/decode (PD) disaggregation feature built on top of HiSim (single-process **Backend A** path, integrated through the SGLang hook).
 
