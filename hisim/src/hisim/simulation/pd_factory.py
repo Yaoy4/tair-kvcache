@@ -37,6 +37,7 @@ class DisaggPredictors:
     prefill_replicas: int = 1
     decode_replicas: int = 1
     decode_queue_mode: str = "single_replica"
+    max_running_per_replica: int = (1 << 31) - 1
 
 
 def _as_dtype(value) -> Optional[DataType]:
@@ -205,4 +206,5 @@ def build_disagg(
         prefill_replicas=disagg_config.prefill.replicas,
         decode_replicas=disagg_config.decode.replicas,
         decode_queue_mode=disagg_config.decode_queue_mode,
+        max_running_per_replica=disagg_config.decode.max_running_per_replica,
     )

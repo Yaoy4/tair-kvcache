@@ -23,8 +23,9 @@ AIConfigurator predictor holds DB handles that do not survive ``spawn``.
 from __future__ import annotations
 
 import multiprocessing as mp
-from dataclasses import dataclass, field
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import AbstractSet, Callable, Iterable, List, Optional, Sequence, Tuple
 
 from hisim.simulation.pd_controller import PDController
 from hisim.simulation.pd_factory import DisaggPredictors
@@ -172,8 +173,14 @@ class BackendB:
         self._ctx = mp_context or mp.get_context("spawn")
         self._prefill_factory = prefill_predictor_factory
         self._decode_factory = decode_predictor_factory
+        self._decode_queue_mode = getattr(bundle, "decode_queue_mode", "single_replica")
         self._prefill_workers: List[_WorkerHandle] = []
         self._decode_workers: List[_WorkerHandle] = []
+        self._decode_replica_by_rid: dict[str, int] = {}
+        self._decode_running_count: dict[int, int] = defaultdict(int)
+        self._max_running_per_replica: int = getattr(
+            bundle, "max_running_per_replica", (1 << 31) - 1
+        )
         self._next_job_id = 0
         self._started = False
 
@@ -232,12 +239,58 @@ class BackendB:
     def decode_pool_size(self) -> int:
         return self._bundle.decode_replicas
 
+    def decode_queue_mode(self) -> str:
+        return self._decode_queue_mode
+
     def earliest_pool_time(self, pool: str) -> float:
+        """See BackendA.earliest_pool_time for the full rationale.
+
+        BackendB mirrors BackendA's decode queue modes:
+
+        * ``single_replica``: one decode call bundles the whole cohort onto
+          a single worker, so the next call is floored by the LAST decode
+          completion (max busy_until).
+        * ``per_replica_queue``: requests stick to individual decode workers,
+          so independent replicas advance on their own timelines and the next
+          admission floor is the earliest free worker (min busy_until).
+        """
         if pool == "prefill":
             return min(w.busy_until for w in self._prefill_workers)
         if pool == "decode":
-            return min(w.busy_until for w in self._decode_workers)
+            if self._decode_queue_mode == "per_replica_queue":
+                return min(w.busy_until for w in self._decode_workers)
+            return max(w.busy_until for w in self._decode_workers)
         raise ValueError(f"unknown pool {pool!r}; expected 'prefill' or 'decode'")
+
+    def bind_decode_replicas(
+        self, reqs: Sequence[PDRequestState]
+    ) -> dict[str, int]:
+        if not reqs:
+            return {}
+        if self._decode_queue_mode != "per_replica_queue":
+            idx, _ = self._earliest_worker(self._decode_workers)
+            return {req.rid: idx for req in reqs}
+
+        replica_order = sorted(
+            range(len(self._decode_workers)),
+            key=lambda i: self._decode_workers[i].busy_until,
+        )
+        if not replica_order:
+            raise ValueError("decode pool requires at least one replica")
+
+        next_replica_slot = 0
+        mapping: dict[str, int] = {}
+        for req in reqs:
+            replica_idx = self._decode_replica_by_rid.get(req.rid)
+            if replica_idx is None:
+                replica_idx = replica_order[next_replica_slot % len(replica_order)]
+                self._decode_replica_by_rid[req.rid] = replica_idx
+                next_replica_slot += 1
+            mapping[req.rid] = replica_idx
+        return mapping
+
+    def decode_replica_time(self, replica_idx: int) -> float:
+        return self._decode_workers[replica_idx].busy_until
 
     # ---- internals ----
     def _earliest_worker(
@@ -340,7 +393,11 @@ class BackendB:
         self, req: PDRequestState, now: float
     ) -> Tuple[int, float]:
         self._require_started()
-        idx, worker = self._earliest_worker(self._decode_workers)
+        if self._decode_queue_mode == "per_replica_queue":
+            idx = self.bind_decode_replicas([req])[req.rid]
+            worker = self._decode_workers[idx]
+        else:
+            idx, worker = self._earliest_worker(self._decode_workers)
         start = max(now, worker.busy_until)
         job_id = self._next_id()
         worker.in_q.put(
@@ -361,6 +418,8 @@ class BackendB:
         if not reqs:
             raise ValueError("try_admit_decode_batch requires at least one request")
         self._require_started()
+        if self._decode_queue_mode == "per_replica_queue":
+            return self._try_admit_decode_batch_per_replica(reqs, now)
         idx, worker = self._earliest_worker(self._decode_workers)
         start = max(now, worker.busy_until)
         past_kv = tuple(int(r.current_past_kv_length) for r in reqs)
@@ -373,10 +432,73 @@ class BackendB:
         worker.busy_until = end
         return idx, end
 
+    def _try_admit_decode_batch_per_replica(
+        self, reqs: Sequence[PDRequestState], now: float
+    ) -> Tuple[int, float]:
+        mapping = self.bind_decode_replicas(reqs)
+        replica_order = sorted(
+            range(len(self._decode_workers)),
+            key=lambda i: self._decode_workers[i].busy_until,
+        )
+        if not replica_order:
+            raise ValueError("decode pool requires at least one replica")
+
+        buckets: dict[int, list[PDRequestState]] = defaultdict(list)
+        for req in reqs:
+            buckets[mapping[req.rid]].append(req)
+
+        first_replica_idx: Optional[int] = None
+        max_end = now
+        for replica_idx in replica_order:
+            bucket = buckets.get(replica_idx)
+            if not bucket:
+                continue
+            worker = self._decode_workers[replica_idx]
+            start = max(now, worker.busy_until)
+            past_kv = tuple(int(r.current_past_kv_length) for r in bucket)
+            job_id = self._next_id()
+            worker.in_q.put(
+                _DecodeJob(job_id=job_id, batch_size=len(bucket), past_kv=past_kv)
+            )
+            res = self._await_result(worker, job_id, role="decode", idx=replica_idx)
+            end = start + res.duration
+            worker.busy_until = end
+            if end > max_end:
+                max_end = end
+            if first_replica_idx is None:
+                first_replica_idx = replica_idx
+        if first_replica_idx is None:
+            first_replica_idx = replica_order[0]
+        return first_replica_idx, max_end
+
     def on_decode_step_done(self, req: PDRequestState, now: float) -> None:
         self._controller.on_decode_step_done([req], now)
+        if req.phase == RequestPhase.FINISHED:
+            replica_idx = self._decode_replica_by_rid.pop(req.rid, None)
+            if replica_idx is not None:
+                self._decode_running_count[replica_idx] = max(
+                    0, self._decode_running_count[replica_idx] - 1
+                )
 
     def on_decode_step_done_batch(
         self, reqs: Iterable[PDRequestState], now: float
     ) -> None:
         self._controller.on_decode_step_done(reqs, now)
+        for req in reqs:
+            if req.phase == RequestPhase.FINISHED:
+                replica_idx = self._decode_replica_by_rid.pop(req.rid, None)
+                if replica_idx is not None:
+                    self._decode_running_count[replica_idx] = max(
+                        0, self._decode_running_count[replica_idx] - 1
+                    )
+
+    def admit_decode_for_replica(
+        self, replica_idx: int, rids: AbstractSet[str], now: float
+    ) -> List[PDRequestState]:
+        """Admit requests for a specific decode replica, respecting max_running_per_replica."""
+        capacity = max(
+            0, self._max_running_per_replica - self._decode_running_count[replica_idx]
+        )
+        admitted = self._controller.admit_decode_targeted(rids, now, max_count=capacity)
+        self._decode_running_count[replica_idx] += len(admitted)
+        return admitted

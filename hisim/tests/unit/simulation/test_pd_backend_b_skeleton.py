@@ -54,7 +54,9 @@ def make_decode_predictor():
 
 
 def _make_bundle(
-    prefill_replicas: int = 1, decode_replicas: int = 1
+    prefill_replicas: int = 1,
+    decode_replicas: int = 1,
+    decode_queue_mode: str = "single_replica",
 ) -> DisaggPredictors:
     return DisaggPredictors(
         prefill=_AnalyticPrefillPredictor(),
@@ -64,6 +66,7 @@ def _make_bundle(
         transfer_model=BandwidthTransferModel(bw_gbps=200.0, latency_us=0.0),
         prefill_replicas=prefill_replicas,
         decode_replicas=decode_replicas,
+        decode_queue_mode=decode_queue_mode,
     )
 
 
@@ -124,6 +127,30 @@ def test_try_admit_decode_batch_uses_predictor():
         assert idx == 0
         expected = _DECODE_US_PER_STEP * (1 + 0.05 * 1) * 1e-6
         assert end == pytest.approx(expected, rel=1e-9)
+
+
+def test_try_admit_decode_batch_per_replica_queue_spreads_across_workers():
+    with BackendB(
+        bundle=_make_bundle(
+            decode_replicas=2,
+            decode_queue_mode="per_replica_queue",
+        ),
+        prefill_predictor_factory=make_prefill_predictor,
+        decode_predictor_factory=make_decode_predictor,
+    ) as backend:
+        r1 = _req("r1", input_len=10)
+        r1.current_past_kv_length = 10
+        r2 = _req("r2", input_len=20)
+        r2.current_past_kv_length = 20
+        r3 = _req("r3", input_len=30)
+        r3.current_past_kv_length = 30
+        idx, end = backend.try_admit_decode_batch([r1, r2, r3], now=0.0)
+        busy = sorted(w.busy_until for w in backend._decode_workers)
+        assert backend.decode_queue_mode() == "per_replica_queue"
+        assert busy[0] > 0.0
+        assert busy[1] > busy[0]
+        assert idx in {0, 1}
+        assert end == pytest.approx(busy[1], rel=1e-9)
 
 
 def test_multi_replica_load_spread():

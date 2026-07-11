@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import AbstractSet, Deque, Iterable, List
+from typing import AbstractSet, Deque, Iterable, List, Optional
 
 from hisim.simulation.pd_transfer import KVModelConfig, TransferModel
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
@@ -125,13 +125,16 @@ class PDController:
         return admitted
 
     def admit_decode_targeted(
-        self, rids: AbstractSet[str], now: float
+        self, rids: AbstractSet[str], now: float, max_count: Optional[int] = None
     ) -> List[PDRequestState]:
         """Admit only the requested rids from the decode-waiting queue.
 
         This lets the SGLang hook stamp ``decode_start_time`` only for the
         requests that are actually present in the current decode batch, instead
         of greedily popping unrelated waiters from the queue.
+
+        If ``max_count`` is given, at most that many requests are admitted;
+        excess matching rids stay in the waiting queue for the next round.
         """
         if not rids:
             return []
@@ -140,6 +143,9 @@ class PDController:
         while self._decode_waiting:
             req = self._decode_waiting.popleft()
             if req.rid in rids:
+                if max_count is not None and len(admitted) >= max_count:
+                    remaining.append(req)
+                    continue
                 req.phase = RequestPhase.RUNNING_DECODE
                 req.decode_start_time = now
                 req.current_past_kv_length = req.input_length

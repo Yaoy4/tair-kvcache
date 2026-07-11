@@ -87,7 +87,7 @@ class _StubHW:
         self.name = name
 
 
-def _backend(bw_gbps=100.0, latency_us=10.0):
+def _backend(bw_gbps=100.0, latency_us=10.0, decode_queue_mode="single_replica"):
     cfg = DisaggConfig(
         enabled=True,
         backend="single_process",
@@ -98,7 +98,7 @@ def _backend(bw_gbps=100.0, latency_us=10.0):
             device_name="fast", tp_size=1, replicas=2, max_running_per_replica=64
         ),
         kv_transfer=BandwidthTransferConfig(bw_gbps=bw_gbps, latency_us=latency_us),
-        decode_queue_mode="single_replica",
+        decode_queue_mode=decode_queue_mode,
     )
     bundle = build_disagg(
         model=_model(),
@@ -168,7 +168,62 @@ class HookDriver:
         self.old_global_clock += pd_latency + max(kv_extra, 0.0)
 
     def decode(self, batch_rids):
-        step_start = self.decode_clock
+        ctrl = self.backend.controller()
+        if self.backend.decode_queue_mode() == "per_replica_queue":
+            batch_states = [self.states[rid] for rid in batch_rids if rid in self.states]
+            replica_by_rid = self.backend.bind_decode_replicas(batch_states)
+            bucket_rids = {}
+            for rid in batch_rids:
+                state = self.states.get(rid)
+                if state is None:
+                    continue
+                bucket_rids.setdefault(replica_by_rid[rid], []).append(rid)
+
+            token_times = {}
+            bucket_step_starts = []
+            bucket_step_ends = []
+            for replica_idx in sorted(bucket_rids, key=self.backend.decode_replica_time):
+                step_start = self.backend.decode_replica_time(replica_idx)
+                for rid in bucket_rids[replica_idx]:
+                    s = self.states[rid]
+                    if s.phase in (
+                        RequestPhase.KV_TRANSIT,
+                        RequestPhase.WAITING_DECODE,
+                    ):
+                        step_start = sync_decode_start(step_start, s.kv_ready_time)
+                ctrl.poll_kv_ready(step_start)
+                ctrl.admit_decode_targeted(set(bucket_rids[replica_idx]), step_start)
+                states = [
+                    self.states[rid]
+                    for rid in bucket_rids[replica_idx]
+                    if self.states[rid].phase == RequestPhase.RUNNING_DECODE
+                ]
+                if not states:
+                    continue
+                pd_latency = decode_batch_latency(self.backend, states, step_start)
+                step_end = step_start + pd_latency
+                self.backend.on_decode_step_done_batch(states, step_end)
+                bucket_step_starts.append(step_start)
+                bucket_step_ends.append(step_end)
+                for s in states:
+                    token_times[s.rid] = step_end
+            if not token_times:
+                return
+            self.decode_clock = max(bucket_step_ends)
+            self.last_decode_step_end = self.decode_clock
+            self.old_global_clock += max(bucket_step_ends) - min(bucket_step_starts)
+            for rid, token_time in token_times.items():
+                self.gen[rid].append(token_time - self.last_event[rid])
+                self.last_event[rid] = token_time
+            return
+
+        # Decode's "engine free" floor is likewise read off the backend
+        # (mode-aware: pool min under per_replica_queue, pool max otherwise --
+        # see BackendA.earliest_pool_time), not a hand-tracked scalar. This
+        # mirrors the sglang_hook.py fix. self.decode_clock is still updated
+        # below for the p1-02 decoupling assertion, but no longer gates
+        # `step_start`.
+        step_start = self.backend.earliest_pool_time("decode")
         for rid in batch_rids:
             s = self.states.get(rid)
             if s is not None and s.phase in (
@@ -176,7 +231,6 @@ class HookDriver:
                 RequestPhase.WAITING_DECODE,
             ):
                 step_start = sync_decode_start(step_start, s.kv_ready_time)
-        ctrl = self.backend.controller()
         ctrl.poll_kv_ready(step_start)
         ctrl.admit_decode_targeted(set(batch_rids), step_start)
         states = [
@@ -319,3 +373,56 @@ def test_concurrent_extend_batches_use_idle_replica_not_busy_one():
     # wait for A's (unrelated) replica to free up.
     assert b_start == pytest.approx(0.0, abs=1e-9)
     assert b_start < a_end
+
+
+# ---------------------------------------------------------------------------
+# Regression: under decode_queue_mode="per_replica_queue", decode replicas
+# hold disjoint, independently-progressing requests (sticky rid->replica
+# assignment). A heavily-loaded replica must not hold back a different,
+# lightly-loaded replica's own continuing requests -- even though every
+# SGLang decode iteration bundles all running requests into one shared call.
+# ---------------------------------------------------------------------------
+def test_concurrent_decode_replicas_use_own_busy_until_not_slowest():
+    d = HookDriver(_backend(decode_queue_mode="per_replica_queue"))
+    # "a": heavy request (large KV) and "b": light request (tiny KV) become
+    # decode-ready together and get sticky round-robin assigned to DIFFERENT
+    # decode replicas.
+    d.extend([("a", 100_000, 10, 0.0)])
+    d.extend([("b", 10, 10, 0.0)])
+    d.decode(["a", "b"])  # tick 1: bundled together, as SGLang really does it
+
+    a_idx = d.backend._decode_replica_by_rid["a"]
+    b_idx = d.backend._decode_replica_by_rid["b"]
+    assert a_idx != b_idx
+    a_busy_after_tick1 = d.backend._decode_pool.busy_until[a_idx]
+    b_busy_after_tick1 = d.backend._decode_pool.busy_until[b_idx]
+    # "a" is genuinely the much slower replica after tick 1.
+    assert a_busy_after_tick1 > b_busy_after_tick1
+
+    d.decode(["a", "b"])  # tick 2: still bundled together (both continuing)
+    b_busy_after_tick2 = d.backend._decode_pool.busy_until[b_idx]
+
+    # "b"'s own second step must be bound by ITS OWN replica's prior busy_until,
+    # not forced to wait for "a"'s much slower replica to finish tick 1.
+    assert b_busy_after_tick2 < a_busy_after_tick1
+
+
+def test_new_decode_waiter_on_other_replica_does_not_block_running_request():
+    d = HookDriver(
+        _backend(bw_gbps=1.0, decode_queue_mode="per_replica_queue")
+    )
+    d.extend([("a", 100, 5, 0.0)])
+    d.decode(["a"])
+    d.decode(["a"])
+    a_itl_baseline = d.gen["a"][-1]
+
+    d.extend([("b", 8_000, 2, 0.0)])
+    assert d.states["b"].kv_ready_time > d.last_event["a"]
+
+    d.decode(["a", "b"])
+
+    a_idx = d.backend._decode_replica_by_rid["a"]
+    b_idx = d.backend._decode_replica_by_rid["b"]
+    assert a_idx != b_idx
+    assert d.gen["a"][-1] == pytest.approx(a_itl_baseline, abs=1e-6)
+    assert d.last_event["a"] < d.states["b"].decode_start_time
