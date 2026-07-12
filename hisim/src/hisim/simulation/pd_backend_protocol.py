@@ -73,6 +73,10 @@ class PDBackendProtocol(Protocol):
         self, req: PDRequestState, now: float, kv_ready_time: float
     ) -> None: ...
 
+    def on_prefill_token_sampled(
+        self, req: PDRequestState, now: float
+    ) -> None: ...
+
     def advance_to_kv_ready(
         self, req: PDRequestState, now: float
     ) -> None: ...

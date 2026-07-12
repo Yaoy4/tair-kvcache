@@ -25,7 +25,10 @@ from hisim.simulation.pd_config import (
 from hisim.simulation.pd_factory import build_disagg
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
 from hisim.simulation.pd_backend_a import BackendA
-from hisim.simulation.pd_runtime import finalize_prefill_batch
+from hisim.simulation.pd_runtime import (
+    finalize_prefill_batch,
+    record_prefill_sampled_tokens,
+)
 
 
 def _model():
@@ -574,4 +577,78 @@ def test_compute_batch_kv_ready_time_uses_total_tokens():
     total_tokens = 4
     expected = 10e-6 + 4 * 131072 / 100e9
     assert be.compute_batch_kv_ready_time(total_tokens, now=0.0) == pytest.approx(expected)
+
+
+def test_final_prefill_token_is_sampled_without_decode_forward():
+    be = BackendA(_bundle(prefill_replicas=1, decode_replicas=1))
+    req = _req("osl-one", input_len=128, output_len=1)
+    _, prefill_end = be.try_admit_prefill_batch([req], now=0.0)
+    finalize_prefill_batch(be, [req], now=prefill_end)
+
+    token_times = record_prefill_sampled_tokens(be, [req])
+
+    assert token_times[req.rid] == req.kv_ready_time
+    assert req.kv_ready_time > prefill_end
+    assert be.decode_replica_time(0) == 0.0
+    assert req.decode_start_time is None
+    assert req.decode_step_count == 1
+    assert req.current_past_kv_length == 0
+    assert req.phase == RequestPhase.FINISHED
+    assert req.decode_end_time == token_times[req.rid]
+    assert be.controller().kv_transit_count() == 0
+
+
+def test_prefill_sample_plus_explicit_decode_steps_reaches_osl():
+    be = BackendA(_bundle(prefill_replicas=1, decode_replicas=1))
+    req = _req("osl-three", input_len=128, output_len=3)
+    _, prefill_end = be.try_admit_prefill_batch([req], now=0.0)
+    finalize_prefill_batch(be, [req], now=prefill_end)
+
+    token_times = record_prefill_sampled_tokens(be, [req])
+    assert req.decode_step_count == 1
+    assert req.current_past_kv_length == 0
+    assert req.phase == RequestPhase.KV_TRANSIT
+    assert token_times[req.rid] == req.kv_ready_time
+    assert be.controller().kv_transit_count() == 1
+
+    be.controller().poll_kv_ready(req.kv_ready_time)
+    admitted = be.admit_decode_single_replica({req.rid}, req.kv_ready_time)
+    assert admitted == [req]
+    assert req.current_past_kv_length == 128
+
+    _, second_end = be.try_admit_decode_batch([req], req.kv_ready_time)
+    be.on_decode_step_done_batch([req], second_end)
+    assert req.decode_step_count == 2
+    assert req.phase == RequestPhase.RUNNING_DECODE
+
+    _, third_end = be.try_admit_decode_batch([req], second_end)
+    be.on_decode_step_done_batch([req], third_end)
+    assert req.decode_step_count == 3
+    assert req.phase == RequestPhase.FINISHED
+
+
+def test_prefill_sampling_binds_decode_instances_without_running_forward():
+    be = BackendA(
+        _bundle(
+            prefill_replicas=2,
+            decode_replicas=2,
+            decode_queue_mode="per_replica_queue",
+        )
+    )
+    reqs = [
+        _req("sample-a", input_len=128, output_len=3),
+        _req("sample-b", input_len=128, output_len=3),
+    ]
+    _, prefill_end = be.try_admit_prefill_batch(reqs, now=0.0)
+    finalize_prefill_batch(be, reqs, now=prefill_end)
+
+    token_times = record_prefill_sampled_tokens(be, reqs)
+    mapping = be.bind_decode_replicas(reqs)
+
+    assert set(mapping.values()) == {0, 1}
+    assert token_times == {req.rid: req.kv_ready_time for req in reqs}
+    assert all(req.decode_step_count == 1 for req in reqs)
+    assert all(req.current_past_kv_length == 0 for req in reqs)
+    assert be.decode_replica_time(0) == 0.0
+    assert be.decode_replica_time(1) == 0.0
 

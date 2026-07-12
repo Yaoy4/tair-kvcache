@@ -18,7 +18,7 @@ from hisim.simulation.pd_backend_a import BackendA
 from hisim.simulation.pd_backend_protocol import PDBackendProtocol
 from hisim.simulation.pd_config import DisaggConfig
 from hisim.simulation.pd_factory import build_disagg
-from hisim.simulation.pd_types import PDRequestState
+from hisim.simulation.pd_types import PDRequestState, RequestPhase
 from hisim.simulation.types import SchedulerConfig
 
 PredictorFactory = Callable[..., object]
@@ -276,6 +276,46 @@ def decode_batch_latency(
         return 0.0
     _, end_t = backend.try_admit_decode_batch(states, now)
     return end_t - now
+
+
+def record_prefill_sampled_tokens(
+    backend: PDBackendProtocol,
+    states: Sequence[PDRequestState],
+) -> dict[str, float]:
+    """Credit first tokens sampled from final-prefill logits.
+
+    SGLang appends one sampled token while processing each final extend result.
+    Sampling is not a decode forward, so this helper does not call the decode
+    predictor, reserve decode capacity, or advance a decode replica clock.
+    Prefill logits/KV are first transferred to a decode instance; with sampling
+    latency currently modeled as zero, token completion is ``kv_ready_time``.
+    """
+    if not states:
+        return {}
+    if len({state.rid for state in states}) != len(states):
+        raise ValueError("prefill-sampling batch contains duplicate request ids")
+
+    for state in states:
+        if state.phase != RequestPhase.KV_TRANSIT:
+            raise ValueError(
+                "decode-side sampling requires finalized KV_TRANSIT state: "
+                f"rid={state.rid!r}, phase={state.phase.value}"
+            )
+    # Select the D instance that receives logits/KV. In per-replica mode this
+    # also preserves affinity for the later full decode forwards, but it does
+    # not consume running-request capacity yet.
+    backend.bind_decode_replicas(states)
+    token_times: dict[str, float] = {}
+    for state in states:
+        token_time = state.kv_ready_time
+        if token_time is None:
+            raise ValueError(
+                f"prefill-sampled token has no completion time for rid={state.rid!r}"
+            )
+        backend.on_prefill_token_sampled(state, token_time)
+        if state.output_length > 0:
+            token_times[state.rid] = token_time
+    return token_times
 
 
 def finalize_prefill_batch(

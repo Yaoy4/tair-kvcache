@@ -1069,6 +1069,7 @@ class C_SchedulerHook(BaseHook):
                         from hisim.simulation.pd_runtime import (
                             admit_prefill_batch_latency,
                             finalize_prefill_batch,
+                            record_prefill_sampled_tokens,
                         )
                         from hisim.simulation.pd_types import (
                             PDRequestState,
@@ -1165,7 +1166,7 @@ class C_SchedulerHook(BaseHook):
                                 # accuracy (one forward pass ≈ chunk_len tokens).
                                 s.input_length = chunk_len
                             s.prefill_is_final_chunk = (
-                                getattr(req, "is_chunked", 0) == 0
+                                getattr(req, "is_chunked", 0) <= 0
                             )
                             states.append(s)
 
@@ -1179,14 +1180,14 @@ class C_SchedulerHook(BaseHook):
                         )
 
                         # Finalize only requests at their final (or only) chunk.
-                        # is_chunked == 0: this extend batch completes the
+                        # is_chunked <= 0: this extend batch completes the
                         # request's prefill phase.  is_chunked != 0: more chunks
                         # follow, so leave the request in RUNNING_PREFILL.
                         # Before finalizing, set input_length to the full prompt
                         # so KV transfer sizing and decode KV base are accurate.
                         final_states = []
                         for req, s in zip(batch.reqs, states):
-                            if getattr(req, "is_chunked", 0) == 0:
+                            if getattr(req, "is_chunked", 0) <= 0:
                                 if (
                                     hasattr(req, "origin_input_ids")
                                     and req.origin_input_ids
@@ -1202,14 +1203,26 @@ class C_SchedulerHook(BaseHook):
                                 C_SchedulerHook.PD_CHUNK_ACCUM.pop(req.rid, None)
                                 final_states.append(s)
 
-                        # Move finalized requests into KV_TRANSIT so the
-                        # controller is ready for the next KV-ready poll.
+                        # Transfer final-prefill logits/KV to the selected D
+                        # instance, then sample the first token there. Sampling
+                        # has no full decode-forward cost in the current model.
                         if final_states:
                             finalize_prefill_batch(
                                 C_SchedulerHook.PD_BACKEND,
                                 final_states,
                                 now_clock + pd_latency,
                             )
+                            first_token_times = record_prefill_sampled_tokens(
+                                C_SchedulerHook.PD_BACKEND,
+                                final_states,
+                            )
+                            C_SchedulerHook.PD_BATCH_TOKEN_TIMES.update(
+                                first_token_times
+                            )
+                            if first_token_times:
+                                C_SchedulerHook.PD_LAST_DECODE_STEP_END = max(
+                                    first_token_times.values()
+                                )
 
                         # Record prefill+KV service time (closed-loop TTFT) and
                         # populate diagnostic stats for finalized requests only.
@@ -1274,7 +1287,6 @@ class C_SchedulerHook(BaseHook):
                         from hisim.simulation.pd_types import RequestPhase
                         from hisim.simulation.pd_metrics import (
                             populate_request_stats,
-                            flush_finished_states,
                         )
                         from hisim.simulation.pd_timeline import (
                             sync_decode_start,
@@ -1401,14 +1413,6 @@ class C_SchedulerHook(BaseHook):
                                 predicted_latency = max(bucket_step_ends) - min(
                                     bucket_step_starts
                                 )
-                                flushed = flush_finished_states(
-                                    C_SchedulerHook.PD_REQUEST_STATES,
-                                    C_SchedulerHook.REQUEST_STATS,
-                                )
-                                if flushed:
-                                    logger.debug(
-                                        "[PD] flushed %d finished states", flushed
-                                    )
                             elif batch.reqs:
                                 raise RuntimeError(
                                     "PD decode batch contained no admissible "
@@ -1490,14 +1494,6 @@ class C_SchedulerHook(BaseHook):
                                     step_end,
                                 )
                                 predicted_latency = pd_latency
-                                flushed = flush_finished_states(
-                                    C_SchedulerHook.PD_REQUEST_STATES,
-                                    C_SchedulerHook.REQUEST_STATS,
-                                )
-                                if flushed:
-                                    logger.debug(
-                                        "[PD] flushed %d finished states", flushed
-                                    )
                             else:
                                 raise RuntimeError(
                                     "PD decode batch contained no admissible "
@@ -1555,96 +1551,48 @@ class C_SchedulerHook(BaseHook):
                         + hicache_l2_backup_dur
                     )
                     request_response_time = StateManager.get_global_clock()
-                pd_decode_mode = (
+                pd_role_token_mode = (
                     C_SchedulerHook.PD_BACKEND is not None
                     and hasattr(batch, "forward_mode")
-                    and batch.forward_mode.is_decode()
+                    and (
+                        batch.forward_mode.is_extend()
+                        or batch.forward_mode.is_decode()
+                    )
                 )
                 pd_closed_loop = (
-                    pd_decode_mode and C_SchedulerHook.PD_CLOSED_LOOP
+                    pd_role_token_mode and C_SchedulerHook.PD_CLOSED_LOOP
                 )
                 if pd_closed_loop:
                     from hisim.simulation.pd_timeline import (
                         closed_loop_first_token_latency,
                     )
 
-                externally_finished_rids = set()
-                if C_SchedulerHook.PD_BACKEND is not None:
-                    from hisim.simulation.pd_types import RequestPhase
-                    from hisim.simulation.pd_sglang_lifecycle import (
-                        reconcile_decode_progress,
-                        request_actual_output_length,
-                        request_reports_finished,
-                    )
-
-                    for req in batch_reqs:
-                        state = C_SchedulerHook.PD_REQUEST_STATES.get(req.rid)
-                        actual_output_length = request_actual_output_length(req)
-                        if (
-                            state is not None
-                            and pd_decode_mode
-                            and actual_output_length is not None
-                            and state.phase in (
-                                RequestPhase.RUNNING_DECODE,
-                                RequestPhase.FINISHED,
-                            )
-                        ):
-                            reconcile_decode_progress(state, actual_output_length)
-                        if not request_reports_finished(req):
-                            continue
-                        if state is None:
-                            continue
-                        if actual_output_length is not None:
-                            state.output_length = actual_output_length
-                            stats = C_SchedulerHook.REQUEST_STATS.get(req.rid)
-                            if stats is not None:
-                                stats.output_length = actual_output_length
-                        termination_time = C_SchedulerHook.PD_BATCH_TOKEN_TIMES.get(
-                            req.rid
-                        )
-                        if termination_time is None:
-                            termination_time = (
-                                state.prefill_end_time
-                                if state.prefill_end_time is not None
-                                else request_response_time
-                            )
-                        C_SchedulerHook.PD_BACKEND.terminate_request(
-                            state, termination_time
-                        )
-                        externally_finished_rids.add(req.rid)
-
                 # Request statistics
                 for req in batch_reqs:
-                    if req.is_chunked == 0:
+                    if req.is_chunked <= 0:
                         req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
-                        # In PD disagg mode the extend (prefill) batch runs on
-                        # the P node and produces NO output tokens.  The first
-                        # token is generated by the first decode batch on the D
-                        # node.  Skip recording here so that last_event_time
-                        # stays at the request's arrival time; then
-                        # gen_token_latencies[0], written during the first
-                        # decode step, captures the full TTFT
-                        # (prefill + KV-transfer + first-decode), matching
-                        # pd_demo.py semantics and the existing unit-test
-                        # expectations.
+                        # SGLang samples one token while processing the final
+                        # extend result.  PD prices that token on the D pool;
+                        # PD_BATCH_TOKEN_TIMES therefore decides whether this
+                        # concrete extend/decode result contributes a token.
                         if (
                             C_SchedulerHook.PD_BACKEND is not None
                             and hasattr(batch, "forward_mode")
-                            and batch.forward_mode.is_extend()
-                        ):
-                            pass  # no token emitted by P-node; TTFT recorded at first decode
-                        elif (
-                            C_SchedulerHook.PD_BACKEND is not None
-                            and hasattr(batch, "forward_mode")
-                            and batch.forward_mode.is_decode()
+                            and (
+                                batch.forward_mode.is_extend()
+                                or batch.forward_mode.is_decode()
+                            )
                             and req.rid
                             not in C_SchedulerHook.PD_BATCH_TOKEN_TIMES
                         ):
-                            pass  # this PD decode batch did not emit a token for this rid
+                            pass  # this PD role batch did not emit a token for this rid
                         elif (
                             C_SchedulerHook.PD_BACKEND is not None
                             and hasattr(batch, "forward_mode")
-                            and batch.forward_mode.is_decode()
+                            and (
+                                batch.forward_mode.is_extend()
+                                or batch.forward_mode.is_decode()
+                            )
                         ):
                             # P1: record the decode token on the decode role
                             # clock (PD_LAST_DECODE_STEP_END) instead of the
@@ -1700,16 +1648,6 @@ class C_SchedulerHook(BaseHook):
                                     token_time - req_stats.last_event_time
                                 )
                             req_stats.last_event_time = token_time
-                            actual_output_length = request_actual_output_length(req)
-                            if actual_output_length is not None:
-                                # Speculative decoding can emit multiple tokens
-                                # from one forward step. They share one completion
-                                # instant, so additional same-step ITLs are zero.
-                                while (
-                                    len(req_stats.gen_token_latencies)
-                                    < actual_output_length
-                                ):
-                                    req_stats.gen_token_latencies.append(0.0)
                         else:
                             req_stats.gen_token_latencies.append(
                                 request_response_time
@@ -1719,16 +1657,27 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request: nothing to do
                         pass
-                if externally_finished_rids:
+                if C_SchedulerHook.PD_BACKEND is not None:
+                    # Flush only after token statistics have consumed the
+                    # terminal state.  This is required for OSL=1, which
+                    # finishes on the token sampled by final prefill.
                     from hisim.simulation.pd_metrics import flush_finished_states
+                    from hisim.simulation.pd_types import RequestPhase
 
-                    flush_finished_states(
+                    finished_rids = {
+                        rid
+                        for rid, state in C_SchedulerHook.PD_REQUEST_STATES.items()
+                        if state.phase == RequestPhase.FINISHED
+                    }
+                    flushed = flush_finished_states(
                         C_SchedulerHook.PD_REQUEST_STATES,
                         C_SchedulerHook.REQUEST_STATS,
                     )
-                    for rid in externally_finished_rids:
+                    for rid in finished_rids:
                         C_SchedulerHook.PD_PREFILL_KV_SERVICE.pop(rid, None)
                         C_SchedulerHook.PD_CHUNK_ACCUM.pop(rid, None)
+                    if flushed:
+                        logger.debug("[PD] flushed %d finished states", flushed)
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {

@@ -185,7 +185,7 @@ def test_admit_decode_targeted_only_starts_requested_rids():
     assert [r.rid for r in later] == ["r0", "r2"]
 
 
-def test_on_decode_step_done_increments_state_and_finishes_when_done():
+def test_decode_forward_advances_one_output_token_until_osl():
     ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=4, output_length=2)
     ctrl.on_request_arrival(req, now=0.0)
@@ -206,6 +206,7 @@ def test_on_decode_step_done_increments_state_and_finishes_when_done():
     assert req.decode_step_count == 2
     assert req.current_past_kv_length == 6
     assert req.phase == RequestPhase.FINISHED
+    assert req.decode_end_time == 10.2
 
 
 @pytest.mark.parametrize(

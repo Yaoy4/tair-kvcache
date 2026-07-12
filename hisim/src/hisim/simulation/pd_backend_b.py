@@ -576,6 +576,15 @@ class BackendB:
         self._release_prefill_slot(req)
         self._prefill_replica_by_rid.pop(req.rid, None)
 
+    def on_prefill_token_sampled(
+        self, req: PDRequestState, now: float
+    ) -> None:
+        self._controller.on_prefill_token_sampled(req, now)
+        if req.phase == RequestPhase.FINISHED:
+            self._release_prefill_slot(req)
+            self._prefill_replica_by_rid.pop(req.rid, None)
+            self._decode_replica_by_rid.pop(req.rid, None)
+
     def advance_to_kv_ready(self, req: PDRequestState, now: float) -> None:
         self._controller.poll_kv_ready(now)
 
@@ -706,7 +715,7 @@ class BackendB:
                     )
 
     def terminate_request(self, req: PDRequestState, now: float) -> None:
-        """Release every reservation for an EOS/stop/abort termination."""
+        """Release every reservation for an external abort/cancellation."""
         self._controller.terminate_request(req, now)
         self._release_prefill_slot(req)
         self._prefill_replica_by_rid.pop(req.rid, None)

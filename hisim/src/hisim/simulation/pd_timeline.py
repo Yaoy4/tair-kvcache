@@ -91,17 +91,26 @@ def closed_loop_first_token_latency(
 
     For the first emitted token we therefore stitch the request's service spans:
 
+    For a token produced by an explicit decode forward:
+
     ``(kv_ready_time - prefill_start_time) + (token_time - decode_start_time)``
 
-    which equals ``prefill + KV transfer + first decode step`` and excludes the
-    synthetic pre-admission/cap wait. Returns ``None`` when any required
-    timestamp is missing so callers can fall back to open-loop accounting.
+    For the first token sampled directly from final-prefill logits,
+    ``decode_start_time`` is ``None`` and the result is simply
+    ``token_time - prefill_start_time`` (prefill + logits/KV handoff +
+    decode-side sampling).
+
+    Both forms exclude the synthetic pre-admission/cap wait. Returns ``None``
+    when a timestamp required by the selected form is missing so callers can
+    fall back to open-loop accounting.
     """
-    if (
-        prefill_start_time is None
-        or kv_ready_time is None
-        or decode_start_time is None
-    ):
+    if prefill_start_time is None:
+        return None
+    if decode_start_time is None:
+        if kv_ready_time is None:
+            return None
+        return max(token_time - prefill_start_time, 0.0)
+    if kv_ready_time is None:
         return None
     prefill_and_kv = max(kv_ready_time - prefill_start_time, 0.0)
     first_decode_step = max(token_time - decode_start_time, 0.0)

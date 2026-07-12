@@ -227,12 +227,12 @@ def test_closed_loop_first_token_latency_returns_none_when_missing_timestamps():
         )
         is None
     )
-    assert (
-        closed_loop_first_token_latency(
-            5.0,
-            prefill_start_time=1.0,
-            kv_ready_time=1.5,
-            decode_start_time=None,
-        )
-        is None
-    )
+
+
+def test_closed_loop_prefill_sampled_token_has_no_decode_forward_cost():
+    assert closed_loop_first_token_latency(
+        1.5,
+        prefill_start_time=1.0,
+        kv_ready_time=1.5,
+        decode_start_time=None,
+    ) == pytest.approx(0.5)

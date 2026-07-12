@@ -16,6 +16,10 @@ import pytest
 from hisim.simulation.pd_backend_a import BackendA
 from hisim.simulation.pd_backend_b import BackendB
 from hisim.simulation.pd_factory import DisaggPredictors
+from hisim.simulation.pd_runtime import (
+    finalize_prefill_batch,
+    record_prefill_sampled_tokens,
+)
 from hisim.simulation.pd_transfer import BandwidthTransferModel, KVModelConfig
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
 
@@ -254,3 +258,23 @@ def test_use_before_start_raises():
     )
     with pytest.raises(RuntimeError, match="start"):
         backend.try_admit_prefill(_req(), now=0.0)
+
+
+def test_backend_b_samples_final_prefill_token_without_decode_worker():
+    with BackendB(
+        bundle=_make_bundle(),
+        prefill_predictor_factory=make_prefill_predictor,
+        decode_predictor_factory=make_decode_predictor,
+    ) as backend:
+        req = _req("osl-one", input_len=128)
+        req.output_length = 1
+        _, prefill_end = backend.try_admit_prefill_batch([req], now=0.0)
+        finalize_prefill_batch(backend, [req], now=prefill_end)
+
+        token_times = record_prefill_sampled_tokens(backend, [req])
+
+        assert token_times[req.rid] == req.kv_ready_time
+        assert req.kv_ready_time > prefill_end
+        assert backend.decode_replica_time(0) == 0.0
+        assert req.decode_step_count == 1
+        assert req.phase == RequestPhase.FINISHED

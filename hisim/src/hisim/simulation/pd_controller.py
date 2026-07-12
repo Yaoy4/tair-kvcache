@@ -123,6 +123,26 @@ class PDController:
         self._kv_transit = remaining
         return ready
 
+    def on_prefill_token_sampled(
+        self, req: PDRequestState, now: float
+    ) -> None:
+        """Credit the first output token sampled from final-prefill logits.
+
+        Sampling does not run a decode forward: it neither consumes decode
+        capacity nor materializes another token in the KV cache.  The existing
+        ``decode_step_count`` field is the total generated-token count used for
+        OSL completion, despite its historical name.
+        """
+        self._require_phase(req, RequestPhase.KV_TRANSIT, "prefill token sampling")
+        if req.output_length > 0:
+            req.decode_step_count += 1
+        if req.decode_step_count >= req.output_length:
+            self._kv_transit = [
+                queued for queued in self._kv_transit if queued.rid != req.rid
+            ]
+            req.phase = RequestPhase.FINISHED
+            req.decode_end_time = now
+
     def admit_decode(self, capacity: int, now: float) -> List[PDRequestState]:
         admitted: List[PDRequestState] = []
         while capacity > 0 and self._decode_waiting:
@@ -172,6 +192,10 @@ class PDController:
     ) -> None:
         for req in reqs:
             self._require_phase(req, RequestPhase.RUNNING_DECODE, "decode completion")
+            # Standard HiSim sets ignore_eos=True and treats output_length as
+            # the workload OSL.  One virtual decode step therefore advances
+            # exactly one token; SGLang output_ids must not overwrite this
+            # simulation counter.
             req.decode_step_count += 1
             req.current_past_kv_length += 1
             if req.decode_step_count >= req.output_length:
@@ -179,12 +203,12 @@ class PDController:
                 req.decode_end_time = now
 
     def terminate_request(self, req: PDRequestState, now: float) -> None:
-        """Synchronize an externally-finished or cancelled request.
+        """Remove an externally aborted/cancelled request from PD state.
 
-        SGLang may finish before ``max_new_tokens`` because of EOS/stop, or
-        remove a request because it was aborted.  This transition is
-        intentionally idempotent and removes the request from every controller
-        queue before marking it finished.
+        Standard HiSim requests use ``ignore_eos=True`` and finish naturally
+        when their OSL is reached.  This separate, idempotent transition is
+        only for explicit external cancellation and removes the request from
+        every controller queue before marking it finished.
         """
         self._prefill_waiting = deque(
             queued for queued in self._prefill_waiting if queued.rid != req.rid
