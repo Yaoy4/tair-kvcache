@@ -412,11 +412,15 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         xgb_model_path: Optional[str] = None,
         prefill_scale_factor: float = 1,
         decode_scale_factor: float = 1,
+        prefill_overhead_ms: float = 0.0,
+        decode_overhead_ms: float = 0.0,
     ):
         super().__init__(model, hw, config)
 
         self.prefill_scale_factor = prefill_scale_factor
         self.decode_scale_factor = decode_scale_factor
+        self.prefill_overhead_ms = prefill_overhead_ms
+        self.decode_overhead_ms = decode_overhead_ms
 
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
@@ -554,6 +558,8 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             infer_time = -infer_time
         if batch.is_decode():
             infer_time *= self.decode_scale_factor
+            infer_time += self.decode_overhead_ms
         else:
             infer_time *= self.prefill_scale_factor
+            infer_time += self.prefill_overhead_ms
         return infer_time / 1e3

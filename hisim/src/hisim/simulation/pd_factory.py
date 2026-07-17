@@ -139,6 +139,8 @@ def _build_role_predictor(
         kwargs["database_path"] = role.database_path
     kwargs["prefill_scale_factor"] = role.prefill_scale_factor
     kwargs["decode_scale_factor"] = role.decode_scale_factor
+    kwargs["prefill_overhead_ms"] = role.prefill_overhead_ms
+    kwargs["decode_overhead_ms"] = role.decode_overhead_ms
     return predictor_factory(model, hw=hw, config=sched, **kwargs)
 
 

@@ -36,12 +36,17 @@ class RolePredictorConfig:
     max_running_per_replica: int = DEFAULT_MAX_RUNNING
     prefill_scale_factor: float = 1.0
     decode_scale_factor: float = 1.0
+    prefill_overhead_ms: float = 0.0
+    decode_overhead_ms: float = 0.0
 
     def __post_init__(self) -> None:
         for name in ("tp_size", "ep_size", "dp_size", "pp_size",
                      "replicas", "max_running_per_replica"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}")
+        for name in ("prefill_overhead_ms", "decode_overhead_ms"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
 
 
 @dataclass

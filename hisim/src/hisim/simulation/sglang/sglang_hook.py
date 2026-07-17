@@ -736,9 +736,16 @@ class C_SchedulerHook(BaseHook):
                         disagg_config=disagg_cfg,
                     )
                     C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
-                    # Fresh run: PD_LAST_DECODE_STEP_END is the only clock left
-                    # to reset -- both role floors live on the freshly-built
-                    # backend's own busy_until pools, which start at 0 already.
+                    # Fresh run: clear every rid-keyed dict tied to the
+                    # previous backend instance, not just the clocks.
+                    # PD_REQUEST_STATES/REQUEST_STATS used to be left for
+                    # wrapped_profile() to clear, but that only runs on a
+                    # clean /profile_start flush -- a mid-run crash or an
+                    # in-process Scheduler re-instantiation would otherwise
+                    # leak stale (possibly terminal-phase) rid entries into
+                    # this fresh run.
+                    C_SchedulerHook.PD_REQUEST_STATES.clear()
+                    C_SchedulerHook.REQUEST_STATS.clear()
                     C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                     C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
                     C_SchedulerHook.PD_CHUNK_ACCUM.clear()
@@ -1007,6 +1014,8 @@ class C_SchedulerHook(BaseHook):
                         disagg_config=disagg_cfg,
                     )
                     C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
+                    C_SchedulerHook.PD_REQUEST_STATES.clear()
+                    C_SchedulerHook.REQUEST_STATS.clear()
                     C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
                     C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
                     C_SchedulerHook.PD_CHUNK_ACCUM.clear()
@@ -1336,6 +1345,26 @@ class C_SchedulerHook(BaseHook):
                                     state.rid
                                 )
 
+                            # Single poll per scheduler iteration instead of
+                            # once per replica bucket: _kv_transit is shared
+                            # across all replicas, so the old per-replica call
+                            # rescanned the same list N times (O(N*K) instead
+                            # of O(K)). Using the earliest replica clock in
+                            # this iteration as `now` is safe: it is <= every
+                            # replica's own step_start computed below (
+                            # sync_decode_start only ever advances a clock
+                            # forward), so nothing can be marked
+                            # WAITING_DECODE earlier than it would have been
+                            # under the old per-replica polling, and
+                            # admit_decode_for_replica below still gates each
+                            # replica on its own step_start as before.
+                            ctrl.poll_kv_ready(
+                                min(
+                                    C_SchedulerHook.PD_BACKEND.decode_replica_time(idx)
+                                    for idx in bucket_rids
+                                )
+                            )
+
                             token_times: dict[str, float] = {}
                             bucket_step_starts = []
                             bucket_step_ends = []
@@ -1358,7 +1387,6 @@ class C_SchedulerHook(BaseHook):
                                         step_start = sync_decode_start(
                                             step_start, s.kv_ready_time
                                         )
-                                ctrl.poll_kv_ready(step_start)
                                 C_SchedulerHook.PD_BACKEND.admit_decode_for_replica(
                                     replica_idx,
                                     set(bucket_rids[replica_idx]),

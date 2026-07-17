@@ -80,6 +80,8 @@ class AICPredictorFactory:
             kwargs["database_path"] = self.role.database_path
         kwargs["prefill_scale_factor"] = self.role.prefill_scale_factor
         kwargs["decode_scale_factor"] = self.role.decode_scale_factor
+        kwargs["prefill_overhead_ms"] = self.role.prefill_overhead_ms
+        kwargs["decode_overhead_ms"] = self.role.decode_overhead_ms
         base = predictor_factory(self.model, hw=hw, config=sched, **kwargs)
         return AICPredictorAdapter(base)
 
