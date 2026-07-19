@@ -236,8 +236,6 @@ The config file is a JSON with three main sections:
 }
 ```
 
-Here is the English translation of your Markdown content, polished for clarity and technical accuracy:
-
 ---
 
 ## Examples
