@@ -129,6 +129,9 @@ class HookDriver:
         self.gen = {}  # rid -> list[float]
         # old single-global-clock makespan, for the regression comparison
         self.old_global_clock = 0.0
+        # mirrors production's `predicted_latency`: the round's reported
+        # real-time cost (what time.sleep() would be given in sglang_hook.py).
+        self.last_round_latency = 0.0
 
     def extend(self, reqs):
         """reqs: list of (rid, input_len, output_len, created_time)."""
@@ -160,6 +163,7 @@ class HookDriver:
         pd_latency = admit_prefill_batch_latency(self.backend, states, now_clock)
         finalize_prefill_batch(self.backend, states, now_clock + pd_latency)
         self.prefill_clock = now_clock + pd_latency
+        self.last_round_latency = pd_latency
         # old path: global clock absorbed prefill + the slowest KV transfer.
         kv_extra = max(
             (s.kv_ready_time - (now_clock + pd_latency) for s in states),
@@ -179,20 +183,47 @@ class HookDriver:
                     continue
                 bucket_rids.setdefault(replica_by_rid[rid], []).append(rid)
 
-            token_times = {}
-            bucket_step_starts = []
-            bucket_step_ends = []
-            for replica_idx in sorted(bucket_rids, key=self.backend.decode_replica_time):
+            # Mirrors the sglang_hook.py fix: compute every bucket's own
+            # synced step_start BEFORE polling, then poll once with the MAX
+            # across buckets (not the min -- see sglang_hook.py for why the
+            # min under-promotes requests on a bucket whose own floor is
+            # later, leaving them stuck in KV_TRANSIT and un-admittable).
+            bucket_step_start = {}
+            for replica_idx, rids in bucket_rids.items():
                 step_start = self.backend.decode_replica_time(replica_idx)
-                for rid in bucket_rids[replica_idx]:
+                for rid in rids:
                     s = self.states[rid]
                     if s.phase in (
                         RequestPhase.KV_TRANSIT,
                         RequestPhase.WAITING_DECODE,
                     ):
                         step_start = sync_decode_start(step_start, s.kv_ready_time)
-                ctrl.poll_kv_ready(step_start)
-                ctrl.admit_decode_targeted(set(bucket_rids[replica_idx]), step_start)
+                bucket_step_start[replica_idx] = step_start
+            ctrl.poll_kv_ready(max(bucket_step_start.values()))
+
+            token_times = {}
+            bucket_step_starts = []
+            bucket_step_ends = []
+            for replica_idx in sorted(bucket_rids, key=self.backend.decode_replica_time):
+                step_start = bucket_step_start[replica_idx]
+                # Mirrors the sglang_hook.py fix: call the backend's own
+                # admit_decode_for_replica (not the raw controller method) so
+                # this harness exercises the same capacity accounting AND
+                # sticky-binding side effects production relies on. Only
+                # offer rids that actually need (re-)admission this round --
+                # a continuing RUNNING_DECODE rid was never a candidate for
+                # admission, and admit_decode_for_replica un-binds anything
+                # it doesn't admit, so including it would spuriously strip
+                # its sticky replica assignment every round.
+                pending_rids = {
+                    rid
+                    for rid in bucket_rids[replica_idx]
+                    if self.states[rid].phase != RequestPhase.RUNNING_DECODE
+                }
+                if pending_rids:
+                    self.backend.admit_decode_for_replica(
+                        replica_idx, pending_rids, step_start
+                    )
                 states = [
                     self.states[rid]
                     for rid in bucket_rids[replica_idx]
@@ -208,10 +239,27 @@ class HookDriver:
                 for s in states:
                     token_times[s.rid] = step_end
             if not token_times:
+                if batch_rids:
+                    raise RuntimeError(
+                        "PD decode batch contained no admissible request "
+                        "state; native and PD capacity/state tracking "
+                        "diverged"
+                    )
                 return
             self.decode_clock = max(bucket_step_ends)
             self.last_decode_step_end = self.decode_clock
             self.old_global_clock += max(bucket_step_ends) - min(bucket_step_starts)
+            # Mirrors the sglang_hook.py fix: the round's reported real-time
+            # cost is the SLOWEST bucket's OWN step latency (its own
+            # step_end - step_start), never a span mixing one bucket's start
+            # with a different bucket's end -- buckets are independent
+            # replica clocks and must never be forced to "catch up" to one
+            # another just because they happen to share one native-scheduler
+            # round.
+            self.last_round_latency = max(
+                end - start
+                for start, end in zip(bucket_step_starts, bucket_step_ends)
+            )
             for rid, token_time in token_times.items():
                 self.gen[rid].append(token_time - self.last_event[rid])
                 self.last_event[rid] = token_time
@@ -246,6 +294,7 @@ class HookDriver:
         self.decode_clock = step_end
         self.last_decode_step_end = step_end
         self.old_global_clock += pd_latency
+        self.last_round_latency = pd_latency
         # process_batch_result mirror: record one token per decoding rid.
         for s in states:
             self.gen[s.rid].append(self.last_decode_step_end - self.last_event[s.rid])
@@ -425,4 +474,175 @@ def test_new_decode_waiter_on_other_replica_does_not_block_running_request():
     b_idx = d.backend._decode_replica_by_rid["b"]
     assert a_idx != b_idx
     assert d.gen["a"][-1] == pytest.approx(a_itl_baseline, abs=1e-6)
+    # "b" must actually be admitted in this SAME decode() call (not silently
+    # dropped) -- an explicit check, rather than relying on the TypeError a
+    # still-None decode_start_time would otherwise raise below.
+    assert d.states["b"].phase == RequestPhase.RUNNING_DECODE
+    assert d.states["b"].decode_start_time is not None
     assert d.last_event["a"] < d.states["b"].decode_start_time
+
+
+# ---------------------------------------------------------------------------
+# Regression: reproduces the exact live-1P2D crash --
+# "RuntimeError: PD decode batch contained no admissible request state;
+# native and PD capacity/state tracking diverged" -- raised spuriously by
+# sglang_hook.py even though the native SGLang batch was non-empty.
+#
+# Root cause: with decode_queue_mode="per_replica_queue" and 2+ decode
+# replicas whose busy_until has diverged (one replica previously did real
+# work, the other is still pristine), the hook polled KV-readiness ONCE per
+# scheduler iteration using the MINIMUM raw replica busy_until across all
+# active buckets, then computed each bucket's own (correctly synced, later)
+# admission floor separately -- but never re-polled at that later floor.
+# Any request whose kv_ready_time fell strictly between the minimum and its
+# own bucket's floor was left stuck in KV_TRANSIT and could not be admitted
+# by admit_decode_for_replica, which only promotes requests already marked
+# WAITING_DECODE by a prior poll. When every bucket hits this, token_times
+# stays empty for a round where the native scheduler batch is non-empty,
+# raising the divergence error. This reproduces it with exactly 2 fresh,
+# never-before-decoded requests landing on 2 replicas with different
+# busy_until, and asserts BOTH are admitted in the same round instead.
+# ---------------------------------------------------------------------------
+def test_decode_admits_both_buckets_when_busy_until_diverges_from_kv_ready():
+    d = HookDriver(_backend(bw_gbps=1.0, decode_queue_mode="per_replica_queue"))
+
+    # Warm up replica 0 (first-ever bind ties go to the lower index) with a
+    # short-lived request so it ends with a positive busy_until, then
+    # finishes and frees its slot. Replica 1 stays pristine at busy_until ==
+    # 0.0, so the two replicas now have genuinely different raw floors.
+    d.extend([("warm", 50, 1, 0.0)])
+    d.decode(["warm"])
+    warm_idx = d.backend._decode_replica_by_rid.get("warm")
+    assert warm_idx is None  # popped on FINISHED
+    assert d.states["warm"].phase == RequestPhase.FINISHED
+    busy_until = list(d.backend._decode_pool.busy_until)
+    assert max(busy_until) > 0.0 and min(busy_until) == 0.0
+
+    # Two brand-new requests, never decoded before: sticky assignment prefers
+    # the least-loaded replica first (the pristine one, busy_until == 0.0),
+    # then the other (the warmed-up one, busy_until > 0.0). Both are still
+    # KV_TRANSIT once bound -- neither has a pre-existing RUNNING_DECODE
+    # state to fall back on, so if either bucket fails to admit this round,
+    # its states list is empty.
+    d.extend([("p", 50, 5, 0.0), ("q", 4_000, 5, 0.0)])
+    assert d.states["p"].kv_ready_time > 0.0
+    assert d.states["q"].kv_ready_time > 0.0
+
+    # Must not raise "PD decode batch contained no admissible request state".
+    d.decode(["p", "q"])
+
+    p_idx = d.backend._decode_replica_by_rid["p"]
+    q_idx = d.backend._decode_replica_by_rid["q"]
+    assert p_idx != q_idx
+    assert d.states["p"].phase == RequestPhase.RUNNING_DECODE
+    assert d.states["q"].phase == RequestPhase.RUNNING_DECODE
+    assert d.states["p"].decode_start_time is not None
+    assert d.states["q"].decode_start_time is not None
+    assert d.gen["p"] and d.gen["q"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: admit_decode_for_replica un-binds any rid it does not admit
+# this round -- correct for a genuine capacity rejection, but a request
+# already RUNNING_DECODE (continuing from a prior round, simply bundled into
+# this same native decode batch alongside other replicas' requests) is never
+# a candidate for (re-)admission in the first place. If the caller offers
+# such a rid to admit_decode_for_replica anyway, its sticky replica binding
+# gets silently popped even though the request is still very much running --
+# and on the very next round, bind_decode_replicas treats it as unbound and
+# may reassign it to a DIFFERENT replica, which has no physical meaning (a
+# request's KV cache lives on one specific replica; it cannot silently hop
+# to another mid-generation) and would corrupt that replica's busy_until /
+# running-count bookkeeping. This asserts a continuing request's replica
+# assignment is stable across many rounds sharing a batch with unrelated,
+# newly-admitted requests on other replicas.
+# ---------------------------------------------------------------------------
+def test_running_decode_request_keeps_sticky_replica_across_rounds():
+    d = HookDriver(_backend(decode_queue_mode="per_replica_queue"))
+
+    d.extend([("a", 100_000, 20, 0.0)])
+    d.decode(["a"])  # tick 1: "a" admitted, bound to whichever replica is idle.
+    a_idx_after_tick1 = d.backend._decode_replica_by_rid["a"]
+    assert d.states["a"].phase == RequestPhase.RUNNING_DECODE
+
+    d.decode(["a"])  # tick 2: "a" alone, continuing -- no new admission at all.
+    assert d.backend._decode_replica_by_rid.get("a") == a_idx_after_tick1
+
+    # tick 3: "a" (still running, from replica a_idx_after_tick1) is bundled
+    # together with a brand-new request "b" that lands on the OTHER replica.
+    # Before the fix, offering "a" to admit_decode_for_replica here (it is
+    # never actually admitted, since it is not WAITING_DECODE) would pop
+    # "a"'s binding as a side effect.
+    d.extend([("b", 50, 5, 0.0)])
+    d.decode(["a", "b"])
+    assert d.backend._decode_replica_by_rid["a"] == a_idx_after_tick1
+    assert d.states["a"].phase == RequestPhase.RUNNING_DECODE
+
+    # tick 4: repeat once more to confirm the binding survives a second
+    # shared round, not just a single grace round.
+    d.decode(["a", "b"])
+    assert d.backend._decode_replica_by_rid["a"] == a_idx_after_tick1
+    assert d.states["a"].phase == RequestPhase.RUNNING_DECODE
+
+
+# ---------------------------------------------------------------------------
+# Regression: reproduces the live-server latency-inflation bug found when
+# re-validating the two crash fixes above at scale -- under
+# decode_queue_mode="per_replica_queue", E2E/TTFT/TPOT got *worse* the more
+# decode replicas were added (e.g. a live 1P16D run showed +7434% TTFT vs the
+# 1P1D baseline), the opposite of what adding decode capacity should ever do.
+#
+# Root cause: sglang_hook.py reported each decode round's real-time cost
+# (predicted_latency, the value handed to time.sleep()) as
+# max(bucket_step_ends) - min(bucket_step_starts) -- a SPAN across every
+# active bucket's own local clock. Buckets are independent replica clocks by
+# design (a lightly-loaded bucket legitimately runs ahead of a heavily-loaded
+# one -- see test_concurrent_decode_replicas_use_own_busy_until_not_slowest
+# above), so min(bucket_step_starts) can be a bucket that has been genuinely
+# idle (not "behind") for a long time. The old formula mistook that idle gap
+# for extra round latency and re-charged it via time.sleep() on EVERY
+# subsequent round; since one request can span up to output_len decode
+# rounds, even a small per-round overcount compounds into multi-second
+# E2E/TTFT inflation -- worse the more decode replicas exist (more chances
+# for an idle/busy split).
+# ---------------------------------------------------------------------------
+def test_decode_round_latency_ignores_idle_bucket_clock_skew():
+    d = HookDriver(_backend(decode_queue_mode="per_replica_queue"))
+    # "a": heavy request, "b": light request -- sticky-bound to different
+    # replicas (mirrors test_concurrent_decode_replicas_use_own_busy_until_
+    # not_slowest's setup, which already proves these land on different
+    # buckets). "a" carries a much larger past_kv_length than "b" every
+    # round, so its own per-round latency is consistently bigger and its
+    # bucket clock keeps pulling further ahead of "b"'s round after round --
+    # mirroring how the real bug compounds over many decode rounds instead
+    # of just one.
+    d.extend([("a", 100_000, 20, 0.0)])
+    d.extend([("b", 10, 20, 0.0)])
+    for _ in range(5):
+        d.decode(["a", "b"])  # ticks 1-5: let the bucket clocks diverge.
+
+    a_idx = d.backend._decode_replica_by_rid["a"]
+    b_idx = d.backend._decode_replica_by_rid["b"]
+    a_step_start = d.backend._decode_pool.busy_until[a_idx]
+    b_step_start = d.backend._decode_pool.busy_until[b_idx]
+    # Sanity check (also asserted by the sibling test above): "a"'s replica
+    # clock is genuinely far ahead of "b"'s after several shared rounds.
+    assert a_step_start > b_step_start
+
+    d.decode(["a", "b"])  # tick 6: both continuing, no new admission at all.
+    a_step_end = d.backend._decode_pool.busy_until[a_idx]
+    b_step_end = d.backend._decode_pool.busy_until[b_idx]
+    a_pd_latency = a_step_end - a_step_start
+    b_pd_latency = b_step_end - b_step_start
+
+    # What the OLD buggy formula would have reported for this same round:
+    # a cross-bucket SPAN that bakes in the entire accumulated clock gap
+    # between "a" and "b" on top of the round's own latency.
+    old_buggy_latency = max(a_step_end, b_step_end) - min(a_step_start, b_step_start)
+
+    # The fixed formula must equal the SLOWEST bucket's OWN tick-6 step
+    # latency (never mixing one bucket's start with the other's end)...
+    assert d.last_round_latency == pytest.approx(max(a_pd_latency, b_pd_latency))
+    # ...which must be strictly less than what the old buggy formula would
+    # have reported, since the gap accumulated over ticks 1-5 is nonzero.
+    assert d.last_round_latency < old_buggy_latency

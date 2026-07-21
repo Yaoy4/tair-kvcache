@@ -1345,25 +1345,57 @@ class C_SchedulerHook(BaseHook):
                                     state.rid
                                 )
 
-                            # Single poll per scheduler iteration instead of
-                            # once per replica bucket: _kv_transit is shared
-                            # across all replicas, so the old per-replica call
-                            # rescanned the same list N times (O(N*K) instead
-                            # of O(K)). Using the earliest replica clock in
-                            # this iteration as `now` is safe: it is <= every
-                            # replica's own step_start computed below (
-                            # sync_decode_start only ever advances a clock
-                            # forward), so nothing can be marked
-                            # WAITING_DECODE earlier than it would have been
-                            # under the old per-replica polling, and
-                            # admit_decode_for_replica below still gates each
-                            # replica on its own step_start as before.
-                            ctrl.poll_kv_ready(
-                                min(
-                                    C_SchedulerHook.PD_BACKEND.decode_replica_time(idx)
-                                    for idx in bucket_rids
+                            # Compute every bucket's own synced step_start
+                            # BEFORE polling. Each bucket's floor starts at
+                            # that replica's own busy_until and is then
+                            # advanced (sync_decode_start only ever moves
+                            # forward) past the kv_ready_time of its own
+                            # in-flight requests -- so one bucket's floor can
+                            # end up strictly later than another's.
+                            #
+                            # Bug fix: polling with only the MINIMUM raw
+                            # replica clock (as this used to do) under-
+                            # promotes: any request whose kv_ready_time falls
+                            # between that minimum and its OWN bucket's later
+                            # synced step_start never leaves KV_TRANSIT, so
+                            # admit_decode_for_replica can't admit it even
+                            # though its own bucket's step_start has genuinely
+                            # reached its kv_ready_time. When this happens to
+                            # every bucket in the round, token_times stays
+                            # empty and the "no admissible request state"
+                            # RuntimeError below fires spuriously -- a real
+                            # bug that only surfaces with 2+ decode replicas
+                            # whose busy_until/kv_ready_time straddle that
+                            # minimum (e.g. live 1P2D traffic).
+                            #
+                            # Polling once with the MAXIMUM of the buckets'
+                            # floors instead of the minimum keeps this a
+                            # single O(K) scan of the shared _kv_transit list
+                            # (not O(N*K), one scan per bucket) while still
+                            # promoting every request each bucket will
+                            # actually need this round: poll_kv_ready is
+                            # monotonic, so polling once with the max is
+                            # equivalent to polling per bucket in increasing
+                            # order.
+                            bucket_step_start: dict[int, float] = {}
+                            for replica_idx, rids in bucket_rids.items():
+                                step_start = (
+                                    C_SchedulerHook.PD_BACKEND.decode_replica_time(
+                                        replica_idx
+                                    )
                                 )
-                            )
+                                for rid in rids:
+                                    s = C_SchedulerHook.PD_REQUEST_STATES[rid]
+                                    if s.phase in (
+                                        RequestPhase.KV_TRANSIT,
+                                        RequestPhase.WAITING_DECODE,
+                                    ):
+                                        step_start = sync_decode_start(
+                                            step_start, s.kv_ready_time
+                                        )
+                                bucket_step_start[replica_idx] = step_start
+
+                            ctrl.poll_kv_ready(max(bucket_step_start.values()))
 
                             token_times: dict[str, float] = {}
                             bucket_step_starts = []
@@ -1373,25 +1405,32 @@ class C_SchedulerHook(BaseHook):
                                 bucket_rids,
                                 key=C_SchedulerHook.PD_BACKEND.decode_replica_time,
                             ):
-                                step_start = (
-                                    C_SchedulerHook.PD_BACKEND.decode_replica_time(
-                                        replica_idx
+                                step_start = bucket_step_start[replica_idx]
+                                # Only offer requests that actually need
+                                # (re-)admission this round. admit_decode_for_
+                                # replica un-binds any rid it doesn't admit --
+                                # correct for a genuine capacity rejection, but
+                                # a request already RUNNING_DECODE (continuing
+                                # from a prior round, bundled into this same
+                                # native batch) was never a candidate for
+                                # admission in the first place. Including it
+                                # here would spuriously strip its sticky
+                                # replica binding every single round, letting
+                                # bind_decode_replicas silently reassign it to
+                                # a different replica next time -- breaking the
+                                # very stickiness this mode exists to provide.
+                                pending_rids = {
+                                    rid
+                                    for rid in bucket_rids[replica_idx]
+                                    if C_SchedulerHook.PD_REQUEST_STATES[rid].phase
+                                    != RequestPhase.RUNNING_DECODE
+                                }
+                                if pending_rids:
+                                    C_SchedulerHook.PD_BACKEND.admit_decode_for_replica(
+                                        replica_idx,
+                                        pending_rids,
+                                        step_start,
                                     )
-                                )
-                                for rid in bucket_rids[replica_idx]:
-                                    s = C_SchedulerHook.PD_REQUEST_STATES[rid]
-                                    if s.phase in (
-                                        RequestPhase.KV_TRANSIT,
-                                        RequestPhase.WAITING_DECODE,
-                                    ):
-                                        step_start = sync_decode_start(
-                                            step_start, s.kv_ready_time
-                                        )
-                                C_SchedulerHook.PD_BACKEND.admit_decode_for_replica(
-                                    replica_idx,
-                                    set(bucket_rids[replica_idx]),
-                                    step_start,
-                                )
                                 states = [
                                     C_SchedulerHook.PD_REQUEST_STATES[rid]
                                     for rid in bucket_rids[replica_idx]
@@ -1428,19 +1467,40 @@ class C_SchedulerHook(BaseHook):
                                 C_SchedulerHook.PD_LAST_DECODE_STEP_END = max(
                                     bucket_step_ends
                                 )
+                                # Bug fix: report the round's real-time cost as
+                                # the SLOWEST bucket's OWN step latency (its own
+                                # step_end - step_start), not the span from the
+                                # earliest bucket's start to the latest bucket's
+                                # end. Buckets are deliberately independent replica
+                                # clocks (see decode_replica_time / the "own
+                                # busy_until, not the slowest" regression test) --
+                                # a bucket that finished a lighter batch earlier is
+                                # correctly idle, not "behind"; the previous
+                                # max(ends) - min(starts) formula mistook that
+                                # idle gap for extra round latency and re-charged
+                                # it (via time.sleep) every single round. Because a
+                                # request can take up to output_len decode rounds,
+                                # even a small per-round overcount compounds into
+                                # multi-second inflation as decode replica count
+                                # (and therefore the chance of an idle/busy split)
+                                # grows -- exactly the E2E/TTFT blowup observed
+                                # empirically in 1P2D..1P16D live-server runs.
+                                round_latency = max(
+                                    end - start
+                                    for start, end in zip(
+                                        bucket_step_starts, bucket_step_ends
+                                    )
+                                )
                                 logger.debug(
                                     "[PD] decode batch: %d reqs across %d decode replicas, "
                                     "agg_pred=%.6fs, pd_pred=%.6fs, decode_clock=%.6fs",
                                     running_count,
                                     len(bucket_step_ends),
                                     predicted_latency,
-                                    max(bucket_step_ends)
-                                    - min(bucket_step_starts),
+                                    round_latency,
                                     C_SchedulerHook.PD_LAST_DECODE_STEP_END,
                                 )
-                                predicted_latency = max(bucket_step_ends) - min(
-                                    bucket_step_starts
-                                )
+                                predicted_latency = round_latency
                             elif batch.reqs:
                                 raise RuntimeError(
                                     "PD decode batch contained no admissible "
