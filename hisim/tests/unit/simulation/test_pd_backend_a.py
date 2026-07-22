@@ -397,6 +397,120 @@ def test_external_termination_releases_chunked_prefill_capacity():
     assert fresh.phase == RequestPhase.RUNNING_PREFILL
 
 
+# ---------------------------------------------------------------------------
+# 0721-Retract regression: SGLang's real KV-cache-pool-full retraction evicts
+# a running-decode request and re-queues the same rid for a fresh prefill.
+# Before this fix, HiSim's PD_REQUEST_STATES entry stayed at RUNNING_DECODE,
+# so the re-prefill crashed the whole scheduler process with:
+#   ValueError: cannot schedule prefill for rid=... in phase=running_decode
+# ---------------------------------------------------------------------------
+
+
+def test_retract_from_running_decode_allows_reprefill_without_crash():
+    """Reproduces the crash end-to-end via realistic backend calls (prefill
+    -> finalize -> sample first token -> admit decode -> one decode step),
+    then retracts and re-admits the SAME rid to prefill. Before the fix, the
+    final try_admit_prefill_batch call below raised ValueError.
+    """
+    be = BackendA(_bundle(prefill_replicas=1, decode_replicas=1))
+    req = _req("retract-me", input_len=128, output_len=8)
+    _, prefill_end = be.try_admit_prefill_batch([req], now=0.0)
+    finalize_prefill_batch(be, [req], now=prefill_end)
+    record_prefill_sampled_tokens(be, [req])
+    be.controller().poll_kv_ready(req.kv_ready_time)
+    be.admit_decode_single_replica({req.rid}, req.kv_ready_time)
+    _, decode_end = be.try_admit_decode_batch([req], req.kv_ready_time)
+    be.on_decode_step_done_batch([req], decode_end)
+    assert req.phase == RequestPhase.RUNNING_DECODE
+    progress_before_retract = req.decode_step_count
+    kv_before_retract = req.current_past_kv_length
+
+    # SGLang retracts: evicts KV, re-queues the same rid for a fresh prefill.
+    be.reset_for_retract(req, now=decode_end)
+    assert req.phase == RequestPhase.WAITING_PREFILL
+
+    # This exact call used to raise:
+    # ValueError: cannot schedule prefill for rid=... in phase=running_decode
+    _, reprefill_end = be.try_admit_prefill_batch([req], now=decode_end)
+
+    assert req.phase == RequestPhase.RUNNING_PREFILL
+    assert reprefill_end > decode_end
+    # Already-generated output tokens must not be rewound: SGLang preserves
+    # them across retraction and only rebuilds their KV cache.
+    assert req.decode_step_count == progress_before_retract
+    assert req.current_past_kv_length == kv_before_retract
+    assert req.output_length == 8
+
+
+def test_retract_releases_single_replica_decode_capacity():
+    be = BackendA(
+        _bundle(
+            decode_queue_mode="single_replica",
+            decode_max_running_per_replica=1,
+        )
+    )
+    ctrl = be.controller()
+    reqs = [_req("retracted", output_len=8), _req("next", output_len=8)]
+    for req in reqs:
+        ctrl.on_request_arrival(req, 0.0)
+        ctrl.admit_prefill(1, 0.0)
+        ctrl.on_prefill_done(req, 0.0, 0.0)
+        ctrl.poll_kv_ready(0.0)
+
+    assert be.admit_decode_single_replica({"retracted"}, 0.0) == [reqs[0]]
+    # Replica is already at capacity (1/1): a second request cannot be admitted.
+    assert be.admit_decode_single_replica({"next"}, 0.0) == []
+
+    be.reset_for_retract(reqs[0], 0.1)
+    assert be.admit_decode_single_replica({"next"}, 0.1) == [reqs[1]]
+
+
+def test_retract_releases_per_replica_decode_capacity_and_prefill_stickiness():
+    be = BackendA(
+        _bundle(
+            prefill_replicas=1,
+            prefill_max_running_per_replica=1,
+            decode_queue_mode="per_replica_queue",
+            decode_replicas=1,
+            decode_max_running_per_replica=1,
+        )
+    )
+    req = _req("retract-me", input_len=64, output_len=8)
+    _, prefill_end = be.try_admit_prefill_batch([req], now=0.0)
+    finalize_prefill_batch(be, [req], now=prefill_end)
+    record_prefill_sampled_tokens(be, [req])
+    be.controller().poll_kv_ready(req.kv_ready_time)
+    idx = be.bind_decode_replicas([req])[req.rid]
+    be.admit_decode_for_replica(idx, {req.rid}, req.kv_ready_time)
+    assert req.phase == RequestPhase.RUNNING_DECODE
+    retract_time = req.kv_ready_time
+
+    be.reset_for_retract(req, now=retract_time)
+
+    # Decode-side reservation must be fully released, or this replica's
+    # capacity would be leaked forever.
+    assert req.rid not in be._decode_replica_by_rid
+    assert be._decode_running_count[idx] == 0
+    # Prefill-side sticky binding must also be cleared: otherwise the
+    # re-admission below would silently bypass max_running_per_replica by
+    # reusing the stale replica_idx without a capacity check.
+    assert req.rid not in be._prefill_replica_by_rid
+
+    # Saturate the sole prefill replica with a different, still-in-flight
+    # (non-final-chunk) request so it is genuinely at capacity.
+    occupier = _req("occupier", input_len=64, output_len=1)
+    occupier.prefill_is_final_chunk = False
+    be.try_admit_prefill_batch([occupier], now=retract_time)
+    assert be._prefill_running_count[0] == 1
+
+    # With the stale binding cleared, re-admitting the retracted request must
+    # go through the real capacity check -- and since the only replica is
+    # already full, it must be rejected rather than silently double-booked
+    # via a leftover sticky replica_idx that skips the capacity check.
+    with pytest.raises(RuntimeError, match="prefill capacity exhausted"):
+        be.try_admit_prefill_batch([req], now=retract_time)
+
+
 def test_per_replica_decode_binding_avoids_full_replica():
     be = BackendA(
         _bundle(

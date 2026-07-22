@@ -25,3 +25,33 @@ def abort_request_ids(message: Any) -> Set[str]:
         elif isinstance(value, Iterable):
             result.update(str(item) for item in value if item is not None)
     return result
+
+
+def retracted_request_ids(
+    waiting_queue: Iterable[Any], candidate_rids: Set[str]
+) -> Set[str]:
+    """Find requests in ``waiting_queue`` that SGLang just retracted.
+
+    When SGLang's KV-cache pool is full it evicts an in-flight decode
+    request's KV cache and re-queues the same ``rid`` (stamping
+    ``req.is_retracted = True``) so it re-enters prefill and rebuilds KV.
+    That flag is cleared again once a fresh extend batch actually picks the
+    request back up, so membership in ``waiting_queue`` with the flag still
+    set is a precise, version-tolerant retraction signal.
+
+    ``candidate_rids`` should be the rids that were in the running (decode)
+    batch immediately before the call that may have triggered retraction.
+    Scoping to that set ensures an already-retracted request still sitting in
+    the waiting queue from a *previous* call (not yet re-admitted to a fresh
+    prefill batch) is never reprocessed a second time.
+    """
+    if not candidate_rids:
+        return set()
+    result: Set[str] = set()
+    for req in waiting_queue:
+        rid = getattr(req, "rid", None)
+        if rid is None or rid not in candidate_rids:
+            continue
+        if getattr(req, "is_retracted", False):
+            result.add(rid)
+    return result

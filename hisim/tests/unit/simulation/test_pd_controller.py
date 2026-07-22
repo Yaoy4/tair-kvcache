@@ -249,6 +249,75 @@ def test_terminate_request_is_idempotent_from_every_live_phase(phase):
         assert req.decode_end_time == pytest.approx(3.0)
 
 
+@pytest.mark.parametrize(
+    "phase",
+    [
+        RequestPhase.KV_TRANSIT,
+        RequestPhase.WAITING_DECODE,
+        RequestPhase.RUNNING_DECODE,
+    ],
+)
+def test_reset_for_retract_reverts_to_waiting_prefill_and_preserves_progress(phase):
+    # Reproduces the "0721-Retract" bug scenario: real SGLang evicts an
+    # in-flight decode request's KV cache under memory pressure and re-queues
+    # the same rid for a fresh prefill. HiSim's PD phase for that rid can be
+    # in any of KV_TRANSIT / WAITING_DECODE / RUNNING_DECODE at that instant
+    # (its virtual PD clock is decoupled from real SGLang's), and must be
+    # reset to WAITING_PREFILL -- but decode progress already produced
+    # (decode_step_count / current_past_kv_length) must NOT be rewound, since
+    # real SGLang keeps already-generated output tokens across retraction and
+    # only rebuilds their KV cache.
+    ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
+    req = PDRequestState(
+        rid="retracted", arrival_time=0.0, input_length=4, output_length=8
+    )
+    ctrl.on_request_arrival(req, now=0.0)
+    ctrl.admit_prefill(capacity=1, now=0.0)
+    ctrl.on_prefill_done(req, now=1.0, kv_ready_time=2.0)
+    if phase in (RequestPhase.WAITING_DECODE, RequestPhase.RUNNING_DECODE):
+        ctrl.poll_kv_ready(now=2.0)
+    if phase == RequestPhase.RUNNING_DECODE:
+        ctrl.admit_decode(capacity=1, now=2.0)
+        ctrl.on_decode_step_done([req], now=2.1)
+        ctrl.on_decode_step_done([req], now=2.2)
+
+    progress_before = req.decode_step_count
+    kv_before = req.current_past_kv_length
+
+    ctrl.reset_for_retract(req, now=3.0)
+
+    assert req.phase == RequestPhase.WAITING_PREFILL
+    assert ctrl.prefill_waiting_count() == 0
+    assert ctrl.kv_transit_count() == 0
+    assert ctrl.decode_waiting_count() == 0
+    # Progress counters must survive the reset unchanged.
+    assert req.decode_step_count == progress_before
+    assert req.current_past_kv_length == kv_before
+    assert req.output_length == 8
+
+    # The request must be re-admittable exactly like a fresh arrival.
+    ctrl.on_request_arrival(req, now=3.0)
+    admitted = ctrl.admit_prefill(capacity=1, now=3.0)
+    assert admitted == [req]
+    assert req.phase == RequestPhase.RUNNING_PREFILL
+
+
+def test_reset_for_retract_rejects_already_finished_request():
+    ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
+    req = PDRequestState(rid="done", arrival_time=0.0, output_length=1)
+    ctrl.on_request_arrival(req, now=0.0)
+    ctrl.admit_prefill(capacity=1, now=0.0)
+    ctrl.on_prefill_done(req, now=1.0, kv_ready_time=1.0)
+    ctrl.poll_kv_ready(now=1.0)
+    ctrl.admit_decode(capacity=1, now=1.0)
+    ctrl.on_decode_step_done([req], now=1.1)
+    assert req.phase == RequestPhase.FINISHED
+
+    with pytest.raises(ValueError, match="already-finished"):
+        ctrl.reset_for_retract(req, now=2.0)
+
+
+
 def test_full_state_flow_end_to_end():
     ctrl = make_controller(bw_gbps=100.0, latency_us=10.0, kv_bytes_per_token=1024)
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=512, output_length=1)

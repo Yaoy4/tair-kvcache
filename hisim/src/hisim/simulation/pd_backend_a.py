@@ -550,6 +550,42 @@ class BackendA:
                 0, self._decode_running_count[replica_idx] - 1
             )
 
+    def reset_for_retract(self, req: PDRequestState, now: float) -> None:
+        """Re-sync PD state when SGLang retracts an in-flight decode request.
+
+        Releases every prefill- and decode-side reservation so the request's
+        upcoming re-prefill goes through normal capacity admission instead of
+        (a) illegally reusing its stale sticky prefill-replica binding for
+        free (bypassing ``max_running_per_replica`` -- sticky lookups skip
+        the capacity check by design, which is correct for chunk
+        continuations but wrong for a request starting over), or (b)
+        permanently leaking a decode-replica capacity slot that nothing else
+        will ever release.
+
+        Mirrors :meth:`terminate_request`'s reservation cleanup but delegates
+        the phase transition to :meth:`PDController.reset_for_retract`
+        (WAITING_PREFILL, not FINISHED) and leaves decode-progress fields
+        (``decode_step_count`` / ``current_past_kv_length`` /
+        ``output_length``) untouched -- see that method's docstring for why.
+        """
+        self._controller.reset_for_retract(req, now)
+        self._release_prefill_slot(req)
+        self._prefill_replica_by_rid.pop(req.rid, None)
+        self._single_decode_running_rids.discard(req.rid)
+        replica_idx = self._decode_replica_by_rid.pop(req.rid, None)
+        if replica_idx is not None:
+            self._decode_running_count[replica_idx] = max(
+                0, self._decode_running_count[replica_idx] - 1
+            )
+        req.prefill_replica_idx = None
+        req.prefill_batch_id = None
+        req.prefill_start_time = None
+        req.prefill_end_time = None
+        req.kv_ready_time = None
+        req.decode_start_time = None
+        req.decode_end_time = None
+        req.prefill_is_final_chunk = True
+
     def admit_decode_for_replica(
         self, replica_idx: int, rids: "AbstractSet[str]", now: float
     ) -> List[PDRequestState]:

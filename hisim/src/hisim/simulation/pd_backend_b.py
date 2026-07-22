@@ -726,6 +726,33 @@ class BackendB:
                 0, self._decode_running_count[replica_idx] - 1
             )
 
+    def reset_for_retract(self, req: PDRequestState, now: float) -> None:
+        """Re-sync PD state when SGLang retracts an in-flight decode request.
+
+        Mirrors :meth:`BackendA.reset_for_retract` -- see that method's
+        docstring. The underlying real SGLang process (and its KV-cache
+        pressure / retraction behavior) is shared infrastructure outside both
+        backends; only the *predictor* call is offloaded to a worker process
+        here, so the same PDController-level resync applies unchanged.
+        """
+        self._controller.reset_for_retract(req, now)
+        self._release_prefill_slot(req)
+        self._prefill_replica_by_rid.pop(req.rid, None)
+        self._single_decode_running_rids.discard(req.rid)
+        replica_idx = self._decode_replica_by_rid.pop(req.rid, None)
+        if replica_idx is not None:
+            self._decode_running_count[replica_idx] = max(
+                0, self._decode_running_count[replica_idx] - 1
+            )
+        req.prefill_replica_idx = None
+        req.prefill_batch_id = None
+        req.prefill_start_time = None
+        req.prefill_end_time = None
+        req.kv_ready_time = None
+        req.decode_start_time = None
+        req.decode_end_time = None
+        req.prefill_is_final_chunk = True
+
     def admit_decode_for_replica(
         self, replica_idx: int, rids: AbstractSet[str], now: float
     ) -> List[PDRequestState]:

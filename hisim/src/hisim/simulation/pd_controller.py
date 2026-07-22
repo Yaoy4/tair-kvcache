@@ -225,6 +225,43 @@ class PDController:
         if req.decode_start_time is not None:
             req.decode_end_time = now
 
+    def reset_for_retract(self, req: PDRequestState, now: float) -> None:
+        """Re-queue a request that SGLang retracted for KV-cache pressure.
+
+        Real SGLang can evict an in-flight decode request's KV cache when the
+        pool is full (``ScheduleBatch.retract_decode``), then re-queue the
+        *same* rid so it re-enters prefill and rebuilds KV over (original
+        prompt + already-generated output). Crucially, real SGLang does NOT
+        discard the tokens already generated -- only their KV cache is
+        rebuilt -- so this reset must only touch PD *phase* and prefill-side
+        bookkeeping. ``decode_step_count`` / ``current_past_kv_length`` /
+        ``output_length`` (total generation progress) are left untouched:
+        resetting them would make HiSim simulate more decode steps than
+        SGLang will actually run, double-counting work already done.
+
+        Purges every phase-specific controller queue the request might
+        currently sit in (whichever one HiSim's virtual PD clock has it in at
+        the moment real SGLang retracts it -- KV_TRANSIT, WAITING_DECODE, or
+        RUNNING_DECODE are all possible since the two clocks are decoupled),
+        then resets phase to WAITING_PREFILL so the next extend batch admits
+        it exactly like a fresh arrival.
+        """
+        self._prefill_waiting = deque(
+            queued for queued in self._prefill_waiting if queued.rid != req.rid
+        )
+        self._kv_transit = [
+            queued for queued in self._kv_transit if queued.rid != req.rid
+        ]
+        self._decode_waiting = deque(
+            queued for queued in self._decode_waiting if queued.rid != req.rid
+        )
+        if req.phase == RequestPhase.FINISHED:
+            raise ValueError(
+                f"cannot retract already-finished request rid={req.rid!r}; "
+                "this indicates PD state desynced from SGLang before retract"
+            )
+        req.phase = RequestPhase.WAITING_PREFILL
+
     @staticmethod
     def _require_phase(
         req: PDRequestState, expected: RequestPhase, operation: str

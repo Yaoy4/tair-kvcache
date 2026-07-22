@@ -633,6 +633,7 @@ class C_SchedulerHook(BaseHook):
         original_init = target.__init__
         original_recv_requests = target.recv_requests
         original_get_new_batch_prefill = target.get_new_batch_prefill
+        original_update_running_batch = target.update_running_batch
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
@@ -964,6 +965,57 @@ class C_SchedulerHook(BaseHook):
 
             return new_batch
 
+        def wrapped_update_running_batch(self, batch, *args, **kwargs):
+            # SGLang's KV-cache-pressure retraction (ScheduleBatch.retract_decode)
+            # runs *inside* the original call below: it evicts a running-decode
+            # request's KV cache and re-queues the same rid (stamping
+            # `is_retracted=True`) so it re-enters prefill and rebuilds KV over
+            # (original prompt + already-generated output). HiSim's
+            # PD_REQUEST_STATES entry for that rid is still parked wherever its
+            # own (decoupled) virtual PD clock left it -- KV_TRANSIT,
+            # WAITING_DECODE, or RUNNING_DECODE are all possible -- and must be
+            # snapped back to WAITING_PREFILL here, before the *next* scheduler
+            # iteration's get_new_batch_prefill call can pick the retracted
+            # request back up. (get_new_batch_prefill always runs before
+            # update_running_batch within the same iteration -- see
+            # get_next_batch_to_run's call order -- so a retraction detected
+            # here is guaranteed to land one full iteration ahead of the
+            # re-prefill that would otherwise crash on a stale RUNNING_DECODE
+            # phase: "cannot schedule prefill for rid=... in phase=running_decode".)
+            pre_rids = (
+                {req.rid for req in batch.reqs}
+                if batch is not None and getattr(batch, "reqs", None)
+                else set()
+            )
+            result = original_update_running_batch(self, batch, *args, **kwargs)
+
+            if pre_rids and C_SchedulerHook.PD_BACKEND is not None:
+                from hisim.simulation.pd_sglang_lifecycle import (
+                    retracted_request_ids,
+                )
+
+                retracted_rids = retracted_request_ids(self.waiting_queue, pre_rids)
+                if retracted_rids:
+                    now = (
+                        time.time()
+                        if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING
+                        else StateManager.get_global_clock()
+                    )
+                    logger.info(
+                        "SGLang retracted %d request(s) for KV-cache pressure; "
+                        "resetting PD state to WAITING_PREFILL: %s",
+                        len(retracted_rids),
+                        sorted(retracted_rids),
+                    )
+                    for rid in retracted_rids:
+                        state = C_SchedulerHook.PD_REQUEST_STATES.get(rid)
+                        if state is not None:
+                            C_SchedulerHook.PD_BACKEND.reset_for_retract(state, now)
+                        C_SchedulerHook.PD_CHUNK_ACCUM.pop(rid, None)
+                        C_SchedulerHook.PD_PREFILL_KV_SERVICE.pop(rid, None)
+
+            return result
+
         def wrapped_run_batch(self, *args, **kwargs):
             ret = original_run_batch(self, *args, **kwargs)
 
@@ -1192,12 +1244,28 @@ class C_SchedulerHook(BaseHook):
                         # is_chunked <= 0: this extend batch completes the
                         # request's prefill phase.  is_chunked != 0: more chunks
                         # follow, so leave the request in RUNNING_PREFILL.
-                        # Before finalizing, set input_length to the full prompt
-                        # so KV transfer sizing and decode KV base are accurate.
+                        # Before finalizing, set input_length to the full
+                        # rebuilt-KV length so KV transfer sizing and decode KV
+                        # base are accurate.
                         final_states = []
                         for req, s in zip(batch.reqs, states):
                             if getattr(req, "is_chunked", 0) <= 0:
-                                if (
+                                fill_ids = getattr(req, "fill_ids", None)
+                                if fill_ids:
+                                    # fill_ids = origin_input_ids + output_ids.
+                                    # For a request's first-ever prefill,
+                                    # output_ids is always empty here, so this
+                                    # is numerically identical to the
+                                    # origin_input_ids-only value below. For a
+                                    # retracted request's re-prefill, SGLang
+                                    # rebuilds KV over the original prompt AND
+                                    # every token already generated before the
+                                    # retraction, so origin_input_ids alone
+                                    # would silently under-count the true
+                                    # rebuilt KV length by however many tokens
+                                    # had already been decoded.
+                                    s.input_length = len(fill_ids)
+                                elif (
                                     hasattr(req, "origin_input_ids")
                                     and req.origin_input_ids
                                 ):
@@ -1888,6 +1956,7 @@ class C_SchedulerHook(BaseHook):
         target.__init__ = wrapped_init
         target.recv_requests = wrapped_recv_requests
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
+        target.update_running_batch = wrapped_update_running_batch
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
         target.profile = wrapped_profile
