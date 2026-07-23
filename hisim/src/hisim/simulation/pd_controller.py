@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import AbstractSet, Deque, Iterable, List, Optional
+from typing import AbstractSet, Callable, Deque, Iterable, List, Optional
 
 from hisim.simulation.pd_transfer import KVModelConfig, TransferModel
 from hisim.simulation.pd_types import PDRequestState, RequestPhase
@@ -156,7 +156,12 @@ class PDController:
         return admitted
 
     def admit_decode_targeted(
-        self, rids: AbstractSet[str], now: float, max_count: Optional[int] = None
+        self,
+        rids: AbstractSet[str],
+        now: float,
+        max_count: Optional[int] = None,
+        token_budget: Optional[int] = None,
+        token_cost: Optional[Callable[[PDRequestState], int]] = None,
     ) -> List[PDRequestState]:
         """Admit only the requested rids from the decode-waiting queue.
 
@@ -166,22 +171,39 @@ class PDController:
 
         If ``max_count`` is given, at most that many requests are admitted;
         excess matching rids stay in the waiting queue for the next round.
+
+        If ``token_budget`` is given (together with ``token_cost``), a request
+        is only admitted while the running sum of ``token_cost(req)`` for
+        already-admitted requests stays within budget. This lets callers cap
+        admission by KV-memory footprint, not just by request count, so a
+        replica already near its real HBM capacity stops accepting further
+        long-context requests instead of silently overcommitting it. Requests
+        that don't fit stay queued for a later round -- exactly like requests
+        that don't fit under ``max_count``.
         """
         if not rids:
             return []
         admitted: List[PDRequestState] = []
         remaining: Deque[PDRequestState] = deque()
+        tokens_used = 0
         while self._decode_waiting:
             req = self._decode_waiting.popleft()
             self._require_phase(req, RequestPhase.WAITING_DECODE, "targeted decode admission")
             if req.rid in rids:
-                if max_count is not None and len(admitted) >= max_count:
+                over_count = max_count is not None and len(admitted) >= max_count
+                over_budget = False
+                cost = 0
+                if not over_count and token_budget is not None and token_cost is not None:
+                    cost = token_cost(req)
+                    over_budget = tokens_used + cost > token_budget
+                if over_count or over_budget:
                     remaining.append(req)
                     continue
                 req.phase = RequestPhase.RUNNING_DECODE
                 req.decode_start_time = now
                 req.current_past_kv_length = req.input_length
                 admitted.append(req)
+                tokens_used += cost
             else:
                 remaining.append(req)
         self._decode_waiting = remaining

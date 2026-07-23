@@ -75,3 +75,5 @@ def test_get_disagg_config_round_trip(tmp_path, monkeypatch):
     assert isinstance(cfg.kv_transfer, BandwidthTransferConfig)
     assert cfg.kv_transfer.bw_gbps == 50.0
     assert cfg.kv_transfer.latency_us == 20.0
+    # 2 prefill + 4 decode replicas == 6 total devices for KV budget scaling.
+    assert cfg.total_replica_count() == 6

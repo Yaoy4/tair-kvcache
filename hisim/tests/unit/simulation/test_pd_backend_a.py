@@ -766,3 +766,596 @@ def test_prefill_sampling_binds_decode_instances_without_running_forward():
     assert be.decode_replica_time(0) == 0.0
     assert be.decode_replica_time(1) == 0.0
 
+
+# ---------------------------------------------------------------------------
+# Live occupancy / available_admission_budget (sum-fix crash guard support)
+#
+# These back the native-aware backpressure hook (C_SchedulerHook's wrap of
+# SGLang's get_num_allocatable_reqs): with `max_running_requests` set to the
+# combined prefill+decode capacity, native SGLang's own admission control has
+# no notion of hisim's separate, smaller per-role sub-capacities, so it can
+# admit more concurrently-running requests than either sub-pool can safely
+# absorb once they occupy a slot. available_admission_budget() reports live
+# headroom in the tighter sub-pool so admission can be throttled down to a
+# safe amount *before* bind_prefill_replicas/bind_decode_replicas would
+# otherwise hard-crash.
+# ---------------------------------------------------------------------------
+
+
+def test_prefill_batch_capacity_matches_replicas_times_per_replica_cap():
+    be = BackendA(_bundle(prefill_replicas=3, prefill_max_running_per_replica=5))
+    assert be.prefill_batch_capacity() == 15
+
+
+def test_current_prefill_occupancy_tracks_in_flight_non_final_chunks():
+    be = BackendA(_bundle(prefill_replicas=1, prefill_max_running_per_replica=8))
+    assert be.current_prefill_occupancy() == 0
+
+    holder = _req("holder", input_len=64)
+    holder.prefill_is_final_chunk = False
+    be.try_admit_prefill_batch([holder], now=0.0)
+    # Non-final chunk: the slot stays reserved across scheduler iterations.
+    assert be.current_prefill_occupancy() == 1
+
+    be._release_prefill_slot(holder)
+    assert be.current_prefill_occupancy() == 0
+
+
+def test_current_prefill_occupancy_ignores_immediately_released_final_chunks():
+    be = BackendA(_bundle(prefill_replicas=1, prefill_max_running_per_replica=8))
+    # Default prefill_is_final_chunk=True: single-chunk requests release
+    # their slot within the same try_admit_prefill_batch call.
+    be.try_admit_prefill_batch([_req("single-chunk", input_len=64)], now=0.0)
+    assert be.current_prefill_occupancy() == 0
+
+
+def test_current_decode_occupancy_per_replica_queue_mode():
+    be = BackendA(_bundle(decode_queue_mode="per_replica_queue", decode_replicas=2))
+    assert be.current_decode_occupancy() == 0
+    be._decode_running_count[0] = 3
+    be._decode_running_count[1] = 2
+    assert be.current_decode_occupancy() == 5
+
+
+def test_current_decode_occupancy_single_replica_mode():
+    be = BackendA(_bundle(decode_queue_mode="single_replica"))
+    assert be.current_decode_occupancy() == 0
+    be._single_decode_running_rids.update({"a", "b", "c"})
+    assert be.current_decode_occupancy() == 3
+
+
+def test_available_admission_budget_idle_pools_equals_smaller_capacity():
+    be = BackendA(
+        _bundle(
+            prefill_replicas=1,
+            prefill_max_running_per_replica=64,
+            decode_queue_mode="per_replica_queue",
+            decode_replicas=2,
+            decode_max_running_per_replica=64,
+        )
+    )
+    # prefill_batch_capacity=64, decode_batch_capacity=128, both idle: the
+    # tighter (prefill) pool's full capacity is the safe admission budget.
+    assert be.prefill_batch_capacity() == 64
+    assert be.decode_batch_capacity() == 128
+    assert be.available_admission_budget() == 64
+
+
+def test_available_admission_budget_shrinks_as_decode_pool_fills():
+    be = BackendA(
+        _bundle(
+            prefill_replicas=1,
+            prefill_max_running_per_replica=64,
+            decode_queue_mode="per_replica_queue",
+            decode_replicas=2,
+            decode_max_running_per_replica=64,
+        )
+    )
+    # Fill decode to 118/128: decode room (10) is now tighter than prefill
+    # room (64), so the budget must track decode, not prefill.
+    be._decode_running_count[0] = 60
+    be._decode_running_count[1] = 58
+    # available_admission_budget() measures decode room against
+    # total_admitted_open_count(), which is the wider "admitted, not yet
+    # finished" set (see that method's docstring) -- populate it to match
+    # the 118 requests this test is simulating as already decode-bound.
+    be._admitted_open_rids.update(f"r{i}" for i in range(118))
+    assert be.current_decode_occupancy() == 118
+    assert be.total_admitted_open_count() == 118
+    assert be.available_admission_budget() == 10
+
+
+def test_available_admission_budget_clamped_to_zero_when_saturated():
+    be = BackendA(_bundle(prefill_replicas=1, prefill_max_running_per_replica=4))
+    holders = [_req(f"h{i}", input_len=64) for i in range(4)]
+    for req in holders:
+        req.prefill_is_final_chunk = False
+    be.try_admit_prefill_batch(holders, now=0.0)
+
+    assert be.current_prefill_occupancy() == 4
+    assert be.prefill_batch_capacity() == 4
+    # Prefill pool is fully saturated: no new admissions are safe right now,
+    # even though decode is completely idle.
+    assert be.available_admission_budget() == 0
+
+
+def test_available_admission_budget_shrinks_with_kv_capacity():
+    """Regression for the "PD decode batch contained no admissible request
+    state" crash: a long-context workload can make the flat count cap far
+    looser than the real per-replica KV budget that admit_decode_for_replica
+    enforces. available_admission_budget() must shrink to match the KV
+    dimension too, so native SGLang's own admission never outpaces what any
+    decode replica can actually hold -- otherwise native keeps pulling
+    requests whose eventual admit_decode_for_replica call is guaranteed to
+    defer them, and if that happens to every rid in one native batch
+    simultaneously, sglang_hook's consistency check trips."""
+    bundle = _bundle(
+        prefill_replicas=1,
+        prefill_max_running_per_replica=64,
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=2,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 1000
+    be = BackendA(bundle)
+    # Count-wise decode has plenty of room (128 total - 10 open = 118), but
+    # KV-wise only 2000 tokens exist total and 10 already-open requests have
+    # committed 1800 of them (180 each) -- only 200 tokens remain, room for
+    # exactly one more 180-token request, not 118.
+    be._admitted_open_rids.update(f"r{i}" for i in range(10))
+    be._admitted_open_kv_by_rid.update({f"r{i}": 180 for i in range(10)})
+    be._decode_max_seen_token_cost = 180
+    assert be.available_admission_budget() == 1
+
+
+def test_available_admission_budget_zero_when_kv_capacity_exhausted():
+    bundle = _bundle(
+        prefill_replicas=1,
+        prefill_max_running_per_replica=64,
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=2,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 1000
+    be = BackendA(bundle)
+    # 2000 total KV tokens, already fully committed -- no room for any new
+    # request even though the count-based sub-pool is nearly empty.
+    be._admitted_open_rids.update(f"r{i}" for i in range(2))
+    be._admitted_open_kv_by_rid.update({"r0": 1000, "r1": 1000})
+    be._decode_max_seen_token_cost = 1000
+    assert be.available_admission_budget() == 0
+
+
+def test_available_admission_budget_unaffected_when_kv_capacity_none():
+    """The default (no KV-aware admission) bundle must keep the exact
+    pre-existing pure count-based behaviour -- decode_kv_capacity_per_replica
+    defaults to None, so the new KV term must be a complete no-op."""
+    be = BackendA(
+        _bundle(
+            prefill_replicas=1,
+            prefill_max_running_per_replica=64,
+            decode_queue_mode="per_replica_queue",
+            decode_replicas=2,
+            decode_max_running_per_replica=64,
+        )
+    )
+    be._admitted_open_rids.update(f"r{i}" for i in range(118))
+    assert be.available_admission_budget() == 10
+
+
+# ---------------------------------------------------------------------------
+# _decode_token_cost() / total_input_length regression: chunked-prefill hang.
+#
+# For a multi-chunk request, sglang_hook.py deliberately overwrites
+# ``input_length`` to each individual chunk's OWN token count (for per-chunk
+# LATENCY prediction accuracy -- one forward pass ~= chunk_len tokens), while
+# the eventual, true KV footprint is input_length summed across every chunk
+# plus output_length. bind_prefill_replicas()/_reserve_prefill_slot() runs
+# ONCE, on the very first chunk, when input_length is still just that first
+# chunk's size -- using it directly for _decode_token_cost() (as the code
+# did before this fix) reserves against only a FRACTION of a request's real
+# footprint (e.g. one 4096-token slice of a 16384-token prompt).
+#
+# This under-reservation let available_admission_budget()'s aggregate KV
+# term think there was abundant headroom while each decode replica's own,
+# correctly-costed per-request budget (admit_decode_for_replica, computed
+# once input_length has been finalized to the full prompt length) was
+# already saturated -- native kept pulling requests out of its own
+# waiting_queue that could never actually get a real decode slot, a
+# live-reproducible permanent stall (not a crash) with any sufficiently
+# large chunked-prefill workload (observed with --chunked-prefill-size 4096,
+# --random-input-len 16384).
+#
+# total_input_length exists precisely to decouple "current chunk size for
+# latency" from "true total footprint for KV admission": callers that know
+# the distinction (sglang_hook.py, using origin_input_ids -- stable across
+# every chunk) set it explicitly; callers that don't (every pre-existing
+# test/caller here) leave it None and get the exact old input_length-based
+# behaviour via the fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_decode_token_cost_prefers_total_input_length_when_set():
+    """Direct unit check of the fallback semantics: total_input_length, when
+    provided, is authoritative over the chunk-scoped input_length."""
+    req_chunked = _req("a", input_len=4096, output_len=1024)
+    req_chunked.total_input_length = 16384
+    assert BackendA._decode_token_cost(req_chunked) == 16384 + 1024
+
+    # Backward compatibility: total_input_length left at its None default
+    # (every pre-existing caller) falls back to input_length unchanged.
+    req_legacy = _req("b", input_len=512, output_len=4)
+    assert req_legacy.total_input_length is None
+    assert BackendA._decode_token_cost(req_legacy) == 512 + 4
+
+
+def test_reserve_prefill_slot_uses_total_input_length_not_chunk_length():
+    """End-to-end reproduction of the hang's root cause via the real
+    bind_prefill_replicas() entry point: a request whose input_length
+    reflects only its FIRST chunk (4096, simulating one slice of a
+    16384-token prompt split by --chunked-prefill-size) must still commit
+    its FULL eventual KV cost (total_input_length + output_length) into
+    _admitted_open_kv_by_rid / _decode_max_seen_token_cost -- not the
+    chunk-sized, ~4x-too-small figure that let native over-admit past what
+    decode replicas could actually hold."""
+    bundle = _bundle(
+        prefill_replicas=1,
+        prefill_max_running_per_replica=8,
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=2,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 1_000_000
+    be = BackendA(bundle)
+
+    req = _req("a", input_len=4096, output_len=1024)
+    req.total_input_length = 16384  # true full prompt, known upfront
+    be.bind_prefill_replicas([req])
+
+    assert be._admitted_open_kv_by_rid["a"] == 16384 + 1024
+    assert be._decode_max_seen_token_cost == 16384 + 1024
+
+
+# ---------------------------------------------------------------------------
+# total_admitted_open_count() / available_admission_budget() race-condition
+# regression: a single-chunk request releases its prefill slot the instant
+# its one prefill wave finishes (on_prefill_done), but is not counted by
+# current_decode_occupancy() until it is later admitted into a real decode
+# replica slot. Before this fix, available_admission_budget() measured decode
+# room against current_decode_occupancy() alone, so several rapid
+# get_new_batch_prefill calls landing inside that gap could each see "decode
+# has room" and admit more work than decode capacity could actually hold once
+# they all transitioned together -- this is what let the sum-of-sub-caps fix
+# still crash with "decode replica capacity exhausted" in live testing.
+# ---------------------------------------------------------------------------
+
+
+def test_total_admitted_open_count_tracks_admission_through_completion():
+    be = BackendA(_bundle(prefill_replicas=1, decode_replicas=1))
+    assert be.total_admitted_open_count() == 0
+
+    req = _req("lifecycle", input_len=64, output_len=2)
+    be.try_admit_prefill_batch([req], now=0.0)
+    assert be.total_admitted_open_count() == 1
+
+    kv_ready = be.compute_kv_ready_time(req, now=req.prefill_end_time)
+    be.on_prefill_done(req, now=req.prefill_end_time, kv_ready_time=kv_ready)
+    be.advance_to_kv_ready(req, now=kv_ready)
+    assert be.total_admitted_open_count() == 1
+
+    for _ in range(req.output_length):
+        _, end_t = be.try_admit_decode_step(req, now=be.earliest_pool_time("decode"))
+        be.on_decode_step_done(req, now=end_t)
+    assert req.phase == RequestPhase.FINISHED
+    # True completion is the only thing that releases the count.
+    assert be.total_admitted_open_count() == 0
+
+
+def test_total_admitted_open_count_stays_elevated_during_prefill_to_decode_gap():
+    """The core regression test: reproduces the exact blind spot where BOTH
+    per-phase counters read 0 for a request that is still very much alive.
+    """
+    be = BackendA(
+        _bundle(
+            prefill_replicas=1,
+            decode_queue_mode="per_replica_queue",
+            decode_replicas=1,
+        )
+    )
+    req = _req("gap-req", input_len=64, output_len=4)
+
+    _, prefill_end = be.try_admit_prefill_batch([req], now=0.0)
+    assert be.total_admitted_open_count() == 1
+
+    finalize_prefill_batch(be, [req], now=prefill_end)
+    record_prefill_sampled_tokens(be, [req])
+    # The blind spot: the prefill slot is already released (single chunk)
+    # and the decode slot has not yet been committed (that only happens once
+    # try_admit_decode_step's internal admission call runs) -- both
+    # per-phase counters read 0 even though the request is guaranteed to
+    # need a decode slot imminently.
+    assert req.phase == RequestPhase.KV_TRANSIT
+    assert be.current_prefill_occupancy() == 0
+    assert be.current_decode_occupancy() == 0
+    assert be.total_admitted_open_count() == 1
+
+    be.controller().poll_kv_ready(req.kv_ready_time)
+    assert req.phase == RequestPhase.WAITING_DECODE
+    _, end_t = be.try_admit_decode_step(req, now=req.kv_ready_time)
+    # Now past the gap: decode occupancy catches up, total stays the same.
+    assert be.current_decode_occupancy() == 1
+    assert be.total_admitted_open_count() == 1
+    be.on_decode_step_done(req, now=end_t)
+
+    while req.phase != RequestPhase.FINISHED:
+        _, end_t = be.try_admit_decode_step(req, now=be.earliest_pool_time("decode"))
+        be.on_decode_step_done(req, now=end_t)
+    assert be.total_admitted_open_count() == 0
+
+
+def test_available_admission_budget_zero_during_gap_when_decode_saturated():
+    """Direct before/after regression test for the fixed formula.
+
+    With decode capacity of exactly 1 and one request sitting in the
+    prefill-released/decode-not-yet-committed gap, the OLD formula
+    (decode_batch_capacity() - current_decode_occupancy() == 1 - 0 == 1)
+    would have wrongly reported 1 spare slot. The fixed formula, measuring
+    against total_admitted_open_count() instead, correctly reports 0: this
+    gap-dwelling request has already committed the only decode slot that
+    exists, even though it is not yet formally bound to a replica.
+    """
+    be = BackendA(
+        _bundle(
+            prefill_replicas=1,
+            prefill_max_running_per_replica=10,
+            decode_queue_mode="per_replica_queue",
+            decode_replicas=1,
+            decode_max_running_per_replica=1,
+        )
+    )
+    req = _req("gap-req", input_len=64, output_len=4)
+    _, prefill_end = be.try_admit_prefill_batch([req], now=0.0)
+    finalize_prefill_batch(be, [req], now=prefill_end)
+    record_prefill_sampled_tokens(be, [req])
+
+    assert be.current_decode_occupancy() == 0
+    assert be.decode_batch_capacity() == 1
+    # The bug: an admission check keyed on current_decode_occupancy() alone
+    # would see 1 - 0 == 1 free slot here and admit another request that
+    # decode can never actually hold once both transition together.
+    assert be.available_admission_budget() == 0
+
+
+def test_total_admitted_open_count_unaffected_by_retract():
+    """Retraction restarts the request's prefill, it does not finish it --
+    the open count must stay elevated so a retracted request keeps its
+    already-committed claim on eventual decode capacity."""
+    be = BackendA(_bundle(prefill_replicas=1, decode_replicas=1))
+    req = _req("retract-me", input_len=128, output_len=8)
+    _, prefill_end = be.try_admit_prefill_batch([req], now=0.0)
+    finalize_prefill_batch(be, [req], now=prefill_end)
+    record_prefill_sampled_tokens(be, [req])
+    be.controller().poll_kv_ready(req.kv_ready_time)
+    be.admit_decode_single_replica({req.rid}, req.kv_ready_time)
+    _, decode_end = be.try_admit_decode_batch([req], req.kv_ready_time)
+    be.on_decode_step_done_batch([req], decode_end)
+    assert be.total_admitted_open_count() == 1
+
+    be.reset_for_retract(req, now=decode_end)
+    assert req.phase == RequestPhase.WAITING_PREFILL
+    assert be.total_admitted_open_count() == 1
+
+    # Re-admitting the same rid must not double-count it (set semantics).
+    be.try_admit_prefill_batch([req], now=decode_end)
+    assert be.total_admitted_open_count() == 1
+
+
+def test_total_admitted_open_count_decrements_on_terminate():
+    be = BackendA(_bundle(prefill_replicas=1, decode_replicas=1))
+    req = _req("terminate-me", input_len=64, output_len=4)
+    be.try_admit_prefill_batch([req], now=0.0)
+    assert be.total_admitted_open_count() == 1
+
+    be.terminate_request(req, now=1.0)
+    assert be.total_admitted_open_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-replica decode KV-token admission gating (0721 negative-TPOT/E2E fix)
+#
+# Backend A's flat max_running_per_replica request-COUNT cap has zero
+# awareness of each request's actual KV footprint. Under long-context
+# workloads this let too many large-context requests pile onto one decode
+# replica simultaneously and exceed its real per-accelerator HBM (as modeled
+# by AIConfigurator), which signals that overcommit by negating the returned
+# latency -- HiSim previously consumed that negative value as a literal time
+# delta, permanently corrupting the replica's simulated clock and producing
+# widespread negative per-token/TPOT/E2E latencies. These tests cover the
+# new worst-case-reservation admission gate that closes that gap.
+# ---------------------------------------------------------------------------
+
+
+def _land_in_waiting_decode(ctrl, rid, input_len, output_len):
+    """Push a fresh request through arrival -> prefill -> kv-ready so it
+    lands in the controller's WAITING_DECODE queue, exactly mirroring
+    test_pd_controller.py's admission-pipeline convention."""
+    req = _req(rid, input_len=input_len, output_len=output_len)
+    ctrl.on_request_arrival(req, now=0.0)
+    ctrl.admit_prefill(capacity=8, now=0.0)
+    ctrl.on_prefill_done(
+        req, now=1.0, kv_ready_time=ctrl.compute_kv_ready_time(req, 1.0)
+    )
+    ctrl.poll_kv_ready(now=10.0)
+    assert req.phase == RequestPhase.WAITING_DECODE
+    return req
+
+
+def test_decode_kv_capacity_none_disables_kv_gating():
+    """Bundles that don't provide decode_kv_capacity_per_replica (the
+    default) must behave exactly like before this fix -- pure count-based
+    admission, no token bookkeeping at all."""
+    be = BackendA(
+        _bundle(decode_queue_mode="per_replica_queue", decode_replicas=1)
+    )
+    assert be.decode_replica_kv_headroom(0) is None
+    ctrl = be.controller()
+    req = _land_in_waiting_decode(ctrl, "a", input_len=100000, output_len=100000)
+
+    admitted = be.admit_decode_for_replica(0, {"a"}, now=10.0)
+
+    assert [r.rid for r in admitted] == ["a"]
+    assert be.decode_replica_kv_headroom(0) is None
+
+
+def test_admit_decode_for_replica_defers_when_kv_budget_exceeded():
+    """Count capacity alone (64) would happily admit both requests, but the
+    KV token budget only has room for one -- the second must be deferred,
+    not admitted into a batch that would exceed real per-replica HBM."""
+    bundle = _bundle(
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=1,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 100
+    be = BackendA(bundle)
+    ctrl = be.controller()
+
+    req_a = _land_in_waiting_decode(ctrl, "a", input_len=60, output_len=30)  # cost 90
+    req_b = _land_in_waiting_decode(ctrl, "b", input_len=60, output_len=30)  # cost 90
+
+    admitted_a = be.admit_decode_for_replica(0, {"a"}, now=10.0)
+    assert [r.rid for r in admitted_a] == ["a"]
+    assert be.decode_replica_kv_headroom(0) == 10  # 100 - 90
+
+    # b's cost (90) exceeds the remaining headroom (10) -- must be deferred.
+    admitted_b = be.admit_decode_for_replica(0, {"b"}, now=10.0)
+    assert admitted_b == []
+    assert req_b.phase == RequestPhase.WAITING_DECODE
+    assert ctrl.decode_waiting_count() == 1
+
+
+def test_decode_kv_reservation_released_on_decode_finish():
+    """Completing decode must free the reserved KV tokens so a later,
+    equally large request can be admitted onto the same replica."""
+    bundle = _bundle(
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=1,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 100
+    be = BackendA(bundle)
+    ctrl = be.controller()
+
+    req_a = _land_in_waiting_decode(ctrl, "a", input_len=60, output_len=1)
+    be.bind_decode_replicas([req_a])
+    be.admit_decode_for_replica(0, {"a"}, now=10.0)
+    assert be.decode_replica_kv_headroom(0) == 100 - 61
+
+    # Drive req_a to FINISHED (output_length=1 -> one decode step suffices).
+    be.on_decode_step_done(req_a, now=10.1)
+    assert req_a.phase == RequestPhase.FINISHED
+    assert be.decode_replica_kv_headroom(0) == 100
+    assert "a" not in be._decode_rid_kv_reservation
+
+    # Full headroom is available again for a new, equally large request.
+    req_b = _land_in_waiting_decode(ctrl, "b", input_len=60, output_len=1)
+    be.bind_decode_replicas([req_b])
+    admitted_b = be.admit_decode_for_replica(0, {"b"}, now=10.1)
+    assert [r.rid for r in admitted_b] == ["b"]
+
+
+def test_decode_kv_reservation_released_on_terminate():
+    bundle = _bundle(
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=1,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 100
+    be = BackendA(bundle)
+    ctrl = be.controller()
+
+    req = _land_in_waiting_decode(ctrl, "a", input_len=60, output_len=30)
+    be.bind_decode_replicas([req])
+    be.admit_decode_for_replica(0, {"a"}, now=10.0)
+    assert be.decode_replica_kv_headroom(0) == 10
+
+    be.terminate_request(req, now=11.0)
+    assert be.decode_replica_kv_headroom(0) == 100
+    assert "a" not in be._decode_rid_kv_reservation
+
+
+def test_decode_kv_reservation_released_on_retract():
+    bundle = _bundle(
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=1,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 100
+    be = BackendA(bundle)
+    ctrl = be.controller()
+
+    req = _land_in_waiting_decode(ctrl, "a", input_len=60, output_len=30)
+    be.bind_decode_replicas([req])
+    be.admit_decode_for_replica(0, {"a"}, now=10.0)
+    assert be.decode_replica_kv_headroom(0) == 10
+
+    be.reset_for_retract(req, now=11.0)
+    assert req.phase == RequestPhase.WAITING_PREFILL
+    assert be.decode_replica_kv_headroom(0) == 100
+    assert "a" not in be._decode_rid_kv_reservation
+
+
+def test_bind_decode_replicas_avoids_kv_saturated_replica():
+    """Load balancing must consider KV headroom, not just request count: a
+    replica with fewer requests but a huge existing reservation should be
+    skipped in favour of one with real headroom, even though its count is
+    higher."""
+    bundle = _bundle(
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=2,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 100
+    be = BackendA(bundle)
+    # Replica 0: fewer requests by count (1) but almost no KV headroom left.
+    be._decode_running_count[0] = 1
+    be._decode_replica_kv_reserved[0] = 95
+    # Replica 1: more requests by count (5) but plenty of KV headroom.
+    be._decode_running_count[1] = 5
+    be._decode_replica_kv_reserved[1] = 10
+
+    req = _req("new", input_len=20, output_len=10)  # cost 30
+    req.phase = RequestPhase.WAITING_DECODE
+
+    mapping = be.bind_decode_replicas([req])
+
+    # cost 30 fits in replica 1's headroom (90) but not replica 0's (5).
+    assert mapping[req.rid] == 1
+
+
+def test_bind_decode_replicas_falls_back_when_all_kv_saturated():
+    """When every replica is KV-saturated, the STICKY BINDING must still
+    succeed (pick the least-count-loaded replica) rather than raise -- the
+    real backpressure happens later in admit_decode_for_replica's
+    token_budget check, which can gracefully defer the request instead."""
+    bundle = _bundle(
+        decode_queue_mode="per_replica_queue",
+        decode_replicas=2,
+        decode_max_running_per_replica=64,
+    )
+    bundle.decode_kv_capacity_per_replica = 100
+    be = BackendA(bundle)
+    be._decode_running_count[0] = 3
+    be._decode_replica_kv_reserved[0] = 95
+    be._decode_running_count[1] = 1
+    be._decode_replica_kv_reserved[1] = 98
+
+    req = _req("new", input_len=20, output_len=10)  # cost 30, doesn't fit either
+    req.phase = RequestPhase.WAITING_DECODE
+
+    mapping = be.bind_decode_replicas([req])
+
+    # No crash; falls back to the least-count-loaded replica (index 1).
+    assert mapping[req.rid] == 1
+
+

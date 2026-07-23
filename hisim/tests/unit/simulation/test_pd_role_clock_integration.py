@@ -87,7 +87,12 @@ class _StubHW:
         self.name = name
 
 
-def _backend(bw_gbps=100.0, latency_us=10.0, decode_queue_mode="single_replica"):
+def _backend(
+    bw_gbps=100.0,
+    latency_us=10.0,
+    decode_queue_mode="single_replica",
+    decode_kv_capacity_per_replica=None,
+):
     cfg = DisaggConfig(
         enabled=True,
         backend="single_process",
@@ -107,6 +112,8 @@ def _backend(bw_gbps=100.0, latency_us=10.0, decode_queue_mode="single_replica")
         predictor_factory=_StubPredictor,
         hw_factory=lambda name: _StubHW(name),
     )
+    if decode_kv_capacity_per_replica is not None:
+        bundle.decode_kv_capacity_per_replica = decode_kv_capacity_per_replica
     return BackendA(bundle)
 
 
@@ -239,6 +246,17 @@ class HookDriver:
                 for s in states:
                     token_times[s.rid] = step_end
             if not token_times:
+                if bucket_rids:
+                    # Every rid PD knows about this round was legitimately
+                    # deferred by admit_decode_for_replica's count/KV gate
+                    # (see test_decode_batch_soft_skips_when_kv_budget_
+                    # exhausted_by_other_replicas below) -- this is expected,
+                    # temporary backpressure once real KV-token admission
+                    # exists, not a divergence. Mirrors the sglang_hook.py
+                    # fix: contribute zero latency and let the caller retry
+                    # these same rids on a later round.
+                    self.last_round_latency = 0.0
+                    return
                 if batch_rids:
                     raise RuntimeError(
                         "PD decode batch contained no admissible request "
@@ -646,3 +664,90 @@ def test_decode_round_latency_ignores_idle_bucket_clock_skew():
     # ...which must be strictly less than what the old buggy formula would
     # have reported, since the gap accumulated over ticks 1-5 is nonzero.
     assert d.last_round_latency < old_buggy_latency
+
+
+# ---------------------------------------------------------------------------
+# Regression: reproduces the live-server crash found when re-validating the
+# per-replica decode-KV-budget fix (admit_decode_for_replica /
+# decode_kv_capacity_per_replica) at scale on topo_1P2D --
+# "RuntimeError: PD decode batch contained no admissible request state;
+# native and PD capacity/state tracking diverged" -- raised even though every
+# rid in the native batch WAS known to PD (bucket_rids was non-empty).
+#
+# Root cause: once decode admission became KV-token aware (not just
+# count-based), a native decode-mode batch composed ENTIRELY of requests
+# freshly transitioning out of prefill can legitimately fail to admit ANY of
+# them in a single round -- e.g. when both replicas' aggregate KV budget is
+# already fully committed by OTHER, already-running RUNNING_DECODE requests
+# that simply are not part of *this* batch_rids call (SGLang's native
+# scheduler does not always bundle "continuing decode" and "freshly
+# admitted" cohorts into the same run_batch invocation). Before per-replica
+# KV gating existed, native's own admission ceiling and PD's pure count
+# capacity were always aligned by construction, so "zero admissions this
+# round despite a non-empty native batch" could only mean a genuine
+# PD/native state-tracking divergence -- hence the unconditional raise. That
+# invariant no longer holds: this is temporary, self-resolving backpressure
+# (headroom frees up the moment any already-running neighbor finishes), not
+# a bug, and must be a soft skip (zero latency contribution, retry next
+# round) rather than a crash. The guard must still raise for the genuinely
+# buggy case: every rid entirely unknown to PD (bucket_rids empty).
+# ---------------------------------------------------------------------------
+def test_decode_batch_soft_skips_when_kv_budget_exhausted_by_other_replicas():
+    d = HookDriver(
+        _backend(
+            decode_queue_mode="per_replica_queue",
+            decode_kv_capacity_per_replica=100,
+        )
+    )
+
+    # Fill both replicas with a long-lived (output_length=5) request each,
+    # costing 90 + 5 = 95 tokens -- leaving only 5 tokens of headroom on
+    # EITHER replica. output_length=5 keeps them RUNNING_DECODE (holding
+    # their reservation) for several rounds, since one decode() call only
+    # ever advances one token.
+    d.extend([("f0", 90, 5, 0.0), ("f1", 90, 5, 0.0)])
+    d.decode(["f0", "f1"])
+    f0_idx = d.backend._decode_replica_by_rid["f0"]
+    f1_idx = d.backend._decode_replica_by_rid["f1"]
+    assert f0_idx != f1_idx
+    assert d.states["f0"].phase == RequestPhase.RUNNING_DECODE
+    assert d.states["f1"].phase == RequestPhase.RUNNING_DECODE
+    assert d.backend.decode_replica_kv_headroom(f0_idx) == 5
+    assert d.backend.decode_replica_kv_headroom(f1_idx) == 5
+
+    # Two brand-new requests fresh out of prefill, each costing 60 tokens --
+    # far more than the 5-token headroom left on EITHER replica. Whichever
+    # replica each lands on, admit_decode_for_replica must defer it: this is
+    # exactly the live crash's shape (a "fresh wave" batch that cannot fit
+    # anywhere while the fillers are still running elsewhere).
+    d.extend([("p", 50, 10, 0.0), ("q", 50, 10, 0.0)])
+
+    # Must NOT raise -- this is the core regression assertion. Before the
+    # fix, "zero admissions this round" was treated as unconditional proof
+    # of PD/native divergence and crashed here.
+    d.decode(["p", "q"])
+
+    # Both were legitimately deferred, not admitted (and not crashed): no
+    # token generated for them this round, ready to retry later.
+    assert d.states["p"].phase != RequestPhase.RUNNING_DECODE
+    assert d.states["q"].phase != RequestPhase.RUNNING_DECODE
+    assert d.gen["p"] == []
+    assert d.gen["q"] == []
+    # The fillers' own running state/reservations are wholly unaffected by
+    # their neighbors' deferred admission attempt.
+    assert d.states["f0"].phase == RequestPhase.RUNNING_DECODE
+    assert d.states["f1"].phase == RequestPhase.RUNNING_DECODE
+
+    # Backpressure is temporary and self-resolving: once the fillers finish
+    # and release their KV (4 more rounds to reach output_length=5; 1 token
+    # already spent above), the previously-deferred requests are admitted
+    # normally on a later round with no special handling required.
+    for _ in range(4):
+        d.decode(["f0", "f1"])
+    assert d.states["f0"].phase == RequestPhase.FINISHED
+    assert d.states["f1"].phase == RequestPhase.FINISHED
+
+    d.decode(["p", "q"])
+    assert d.states["p"].phase == RequestPhase.RUNNING_DECODE
+    assert d.states["q"].phase == RequestPhase.RUNNING_DECODE
+    assert d.gen["p"] and d.gen["q"]

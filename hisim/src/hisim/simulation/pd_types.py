@@ -24,6 +24,18 @@ class PDRequestState:
     prefill_queue_start_time: Optional[float] = None
     phase: RequestPhase = RequestPhase.WAITING_PREFILL
     input_length: int = 0
+    # Full prompt token count, stable across every chunk of a chunked
+    # prefill -- unlike ``input_length``, which the hook deliberately
+    # overwrites to each chunk's OWN token count for per-chunk latency
+    # accuracy (one forward pass ~= chunk_len tokens). Admission-time KV
+    # budgeting (``_decode_token_cost``) needs the TRUE total footprint a
+    # request will occupy once fully prefilled, which for any chunked
+    # (multi-forward-pass) prefill is NOT the same as the first chunk's
+    # ``input_length``. Left as None when the caller doesn't have (or
+    # doesn't need) the distinction, in which case ``input_length`` is used
+    # as a fallback -- exact for single-chunk requests and for every
+    # pre-existing test/caller that only ever sets ``input_length``.
+    total_input_length: Optional[int] = None
     # Scheduling metadata for the current prefill chunk.  The hook refreshes
     # ``prefill_is_final_chunk`` before every extend call; backends stamp the
     # replica and replica-local fused-batch id.
@@ -38,3 +50,4 @@ class PDRequestState:
     decode_step_count: int = 0
     current_past_kv_length: int = 0
     output_length: int = 0
+

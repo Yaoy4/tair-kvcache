@@ -5,6 +5,7 @@ import inspect
 import pytest
 
 from hisim.simulation.pd_config import (
+    DEFAULT_MAX_RUNNING,
     BandwidthTransferConfig,
     DisaggConfig,
     RolePredictorConfig,
@@ -164,3 +165,112 @@ def test_prefill_admission_capacity_uses_all_service_replicas():
         kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
     )
     assert cfg.prefill_admission_capacity() == 12
+
+
+def test_total_replica_count_disabled_defaults_to_one():
+    assert DisaggConfig().total_replica_count() == 1
+
+
+def test_total_replica_count_sums_prefill_and_decode_replicas():
+    cfg = DisaggConfig(
+        enabled=True,
+        prefill=RolePredictorConfig(device_name="p", replicas=1),
+        decode=RolePredictorConfig(device_name="d", replicas=2),
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    # 1P2D: one prefill device + two decode devices == 3 total devices.
+    assert cfg.total_replica_count() == 3
+
+
+def test_total_replica_count_scales_with_larger_topologies():
+    cfg = DisaggConfig(
+        enabled=True,
+        prefill=RolePredictorConfig(device_name="p", replicas=1),
+        decode=RolePredictorConfig(device_name="d", replicas=16),
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    # 1P16D: one prefill device + sixteen decode devices == 17 total devices.
+    assert cfg.total_replica_count() == 17
+
+
+def test_total_replica_count_ignores_max_running_per_replica():
+    # total_replica_count() counts physical devices (replicas), not the
+    # per-replica request-count admission cap -- those are orthogonal knobs.
+    cfg = DisaggConfig(
+        enabled=True,
+        prefill=RolePredictorConfig(
+            device_name="p", replicas=2, max_running_per_replica=1
+        ),
+        decode=RolePredictorConfig(
+            device_name="d", replicas=3, max_running_per_replica=999
+        ),
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    assert cfg.total_replica_count() == 5
+
+
+def test_combined_running_request_capacity_disabled_defaults_to_max_running():
+    assert (
+        DisaggConfig().combined_running_request_capacity() == DEFAULT_MAX_RUNNING
+    )
+
+
+def test_combined_running_request_capacity_sums_prefill_and_decode():
+    cfg = DisaggConfig(
+        enabled=True,
+        prefill=RolePredictorConfig(
+            device_name="p", replicas=1, max_running_per_replica=64
+        ),
+        decode=RolePredictorConfig(
+            device_name="d", replicas=2, max_running_per_replica=64
+        ),
+        decode_queue_mode="per_replica_queue",
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    # 1P2D (matching topo_1P2D.json's real settings): prefill_admission_
+    # capacity()=64 + decode_admission_capacity()=128. The merged single-
+    # process engine's shared native running-request pool must hold room for
+    # both roles' declared capacity at once, not just whichever role is
+    # smaller -- see the method's docstring.
+    assert cfg.prefill_admission_capacity() == 64
+    assert cfg.decode_admission_capacity() == 128
+    assert cfg.combined_running_request_capacity() == 192
+
+
+def test_combined_running_request_capacity_respects_decode_queue_mode():
+    cfg = DisaggConfig(
+        enabled=True,
+        prefill=RolePredictorConfig(
+            device_name="p", replicas=1, max_running_per_replica=64
+        ),
+        decode=RolePredictorConfig(
+            device_name="d", replicas=2, max_running_per_replica=64
+        ),
+        decode_queue_mode="single_replica",
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    # single_replica mode pools all decode replicas onto one virtual budget,
+    # so decode_admission_capacity() is 64 (not 128) here.
+    assert cfg.combined_running_request_capacity() == 64 + 64
+
+
+def test_combined_running_request_capacity_would_previously_use_min():
+    # Regression guard: the pre-fix behavior took min(prefill_cap,
+    # decode_cap), which silently shrinks the merged engine's shared running
+    # pool down to whichever role is smaller. Assert the sum is strictly
+    # larger than that old min() whenever the two caps differ, so this test
+    # fails loudly if the sum is ever accidentally reverted to a min().
+    cfg = DisaggConfig(
+        enabled=True,
+        prefill=RolePredictorConfig(
+            device_name="p", replicas=1, max_running_per_replica=64
+        ),
+        decode=RolePredictorConfig(
+            device_name="d", replicas=2, max_running_per_replica=64
+        ),
+        kv_transfer=BandwidthTransferConfig(bw_gbps=100.0, latency_us=0.0),
+    )
+    old_min_behavior = min(
+        cfg.prefill_admission_capacity(), cfg.decode_admission_capacity()
+    )
+    assert cfg.combined_running_request_capacity() > old_min_behavior

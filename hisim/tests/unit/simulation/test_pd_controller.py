@@ -185,6 +185,85 @@ def test_admit_decode_targeted_only_starts_requested_rids():
     assert [r.rid for r in later] == ["r0", "r2"]
 
 
+def test_admit_decode_targeted_respects_token_budget_over_count():
+    """A token_budget cap can defer admission even when max_count still has
+    room -- this is what lets Backend A stop a decode replica from
+    accepting a batch that would exceed its real per-accelerator KV-token
+    capacity, closing the gap that let the AIConfigurator predictor's
+    OOM-negation sentinel silently corrupt a replica's simulated clock.
+    """
+    ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
+    reqs = []
+    for i in range(3):
+        # input_length=8, output_length=2 -> token cost 10 each.
+        r = PDRequestState(
+            rid=f"r{i}", arrival_time=0.0, input_length=8, output_length=2
+        )
+        ctrl.on_request_arrival(r, now=0.0)
+        ctrl.admit_prefill(capacity=3, now=0.0)
+        ctrl.on_prefill_done(
+            r,
+            now=1.0,
+            kv_ready_time=ctrl.compute_kv_ready_time(r, 1.0),
+        )
+        reqs.append(r)
+    ctrl.poll_kv_ready(now=10.0)
+
+    def token_cost(req: PDRequestState) -> int:
+        return req.input_length + req.output_length
+
+    # max_count=3 (no count constraint) but token_budget=15 only fits ONE
+    # request (cost 10) before the running sum (20) would exceed budget.
+    admitted = ctrl.admit_decode_targeted(
+        {"r0", "r1", "r2"},
+        now=10.0,
+        max_count=3,
+        token_budget=15,
+        token_cost=token_cost,
+    )
+
+    assert [r.rid for r in admitted] == ["r0"]
+    assert reqs[0].phase == RequestPhase.RUNNING_DECODE
+    assert reqs[1].phase == RequestPhase.WAITING_DECODE
+    assert reqs[2].phase == RequestPhase.WAITING_DECODE
+    assert ctrl.decode_waiting_count() == 2
+
+    # Later round: budget freed up (e.g. r0 finished) -- both remaining
+    # requests now fit under a fresh, larger budget.
+    admitted_2 = ctrl.admit_decode_targeted(
+        {"r1", "r2"},
+        now=11.0,
+        max_count=3,
+        token_budget=20,
+        token_cost=token_cost,
+    )
+    assert {r.rid for r in admitted_2} == {"r1", "r2"}
+    assert ctrl.decode_waiting_count() == 0
+
+
+def test_admit_decode_targeted_token_budget_none_is_count_only():
+    """token_budget=None (the default) must behave exactly like the
+    pre-existing count-only admission -- backward compatible for every
+    caller that doesn't opt into KV-aware admission."""
+    ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
+    reqs = []
+    for i in range(2):
+        r = PDRequestState(
+            rid=f"r{i}", arrival_time=0.0, input_length=100000, output_length=100000
+        )
+        ctrl.on_request_arrival(r, now=0.0)
+        ctrl.admit_prefill(capacity=2, now=0.0)
+        ctrl.on_prefill_done(
+            r, now=1.0, kv_ready_time=ctrl.compute_kv_ready_time(r, 1.0)
+        )
+        reqs.append(r)
+    ctrl.poll_kv_ready(now=10.0)
+
+    admitted = ctrl.admit_decode_targeted({"r0", "r1"}, now=10.0, max_count=2)
+
+    assert {r.rid for r in admitted} == {"r0", "r1"}
+
+
 def test_decode_forward_advances_one_output_token_until_osl():
     ctrl = make_controller(bw_gbps=1e9, latency_us=0.0, kv_bytes_per_token=1)
     req = PDRequestState(rid="r1", arrival_time=0.0, input_length=4, output_length=2)

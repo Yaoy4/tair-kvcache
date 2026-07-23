@@ -126,3 +126,43 @@ class DisaggConfig:
             self.prefill.max_running_per_replica
             * self.prefill.replicas
         )
+
+    def total_replica_count(self) -> int:
+        """Total number of declared prefill + decode replicas (devices).
+
+        Backend A ("single_process") runs every declared replica through ONE
+        real (mocked) engine process, so any native, auto-estimated resource
+        budget derived from a single device's capacity (e.g. the KV cache
+        pool) would otherwise silently represent just one of the declared
+        devices, regardless of topology. Callers scale such budgets by this
+        count so the shared pool represents the aggregate of all declared
+        devices instead of under-provisioning multi-replica topologies.
+        Returns 1 when disaggregation is disabled (aggregated single-engine).
+        """
+        if not self.enabled or self.prefill is None or self.decode is None:
+            return 1
+        return self.prefill.replicas + self.decode.replicas
+
+    def combined_running_request_capacity(self) -> int:
+        """Shared native `max_running_requests` budget for the merged engine.
+
+        Backend A ("single_process") funnels both P and D role traffic
+        through ONE real SGLang scheduler with a single, undifferentiated
+        `max_running_requests` slot pool -- native SGLang has no concept of
+        "prefill-phase" vs "decode-phase" occupancy, it just tracks total
+        running requests. Sizing that shared pool at only one role's
+        capacity (or the smaller of the two) lets whichever role wasn't used
+        to size it starve the other: decode requests hold their slot for the
+        whole generation (duration scales with output length), so once they
+        fill the pool, new arrivals can't even be admitted for prefill --
+        regardless of real KV-cache token headroom. Summing both roles'
+        declared capacities lets the merged pool hold up to
+        ``prefill_admission_capacity()`` concurrent prefills AND up to
+        ``decode_admission_capacity()`` concurrent decodes at the same time,
+        matching how independent P/D hardware would behave.
+        Returns the shared ``DEFAULT_MAX_RUNNING`` fallback when disagg is
+        disabled (aggregated single-engine, no P/D split to sum).
+        """
+        if not self.enabled or self.prefill is None or self.decode is None:
+            return DEFAULT_MAX_RUNNING
+        return self.prefill_admission_capacity() + self.decode_admission_capacity()

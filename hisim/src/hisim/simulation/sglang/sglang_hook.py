@@ -112,8 +112,24 @@ class C_ModelRunnerHook(BaseHook):
             if self.server_args.max_total_tokens is not None:
                 self.max_total_num_tokens = self.server_args.max_total_tokens
             else:
-                self.max_total_num_tokens = estimate_kv_cache_pool_capacity(
-                    model, hw, config
+                # PD disaggregation ("single_process" backend) routes every
+                # declared prefill + decode replica through this ONE real
+                # (mocked) engine process, so without scaling, the native KV
+                # cache pool only ever represents a single device's memory --
+                # regardless of how many replicas the topology declares.
+                # total_replica_count() scales the auto-estimated capacity so
+                # the shared pool represents the aggregate memory of all
+                # declared devices (e.g. a 1P2D topology needs ~3x one
+                # device's KV budget, not 1x); otherwise prefill admission for
+                # new requests can be artificially starved by decode's KV
+                # occupancy once a single device's worth of capacity is
+                # exhausted. It returns 1 when disagg is disabled, so the
+                # aggregated (non-PD) path is unaffected. Explicit
+                # --max-total-tokens (above) is left untouched so callers can
+                # still opt out of this.
+                self.max_total_num_tokens = (
+                    estimate_kv_cache_pool_capacity(model, hw, config)
+                    * ConfigManager.get_disagg_config().total_replica_count()
                 )
 
             if hasattr(self, "page_size") and self.page_size > 1:
@@ -633,6 +649,7 @@ class C_SchedulerHook(BaseHook):
         original_init = target.__init__
         original_recv_requests = target.recv_requests
         original_get_new_batch_prefill = target.get_new_batch_prefill
+        original_get_num_allocatable_reqs = target.get_num_allocatable_reqs
         original_update_running_batch = target.update_running_batch
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
@@ -657,10 +674,13 @@ class C_SchedulerHook(BaseHook):
 
             disagg_cfg = ConfigManager.get_disagg_config()
             if disagg_cfg.enabled and disagg_cfg.decode is not None:
-                pd_capacity = min(
-                    disagg_cfg.prefill_admission_capacity(),
-                    disagg_cfg.decode_admission_capacity(),
-                )
+                # combined_running_request_capacity() sums (not min()'s) the
+                # prefill and decode admission caps: the merged single-process
+                # engine shares ONE native running-request pool across both
+                # roles, so it must hold room for both roles' declared
+                # capacity simultaneously, not just whichever is smaller --
+                # see the method's docstring for the full rationale.
+                pd_capacity = disagg_cfg.combined_running_request_capacity()
                 configured_capacity = getattr(
                     server_args, "max_running_requests", None
                 )
@@ -930,6 +950,23 @@ class C_SchedulerHook(BaseHook):
                 C_SchedulerHook.PD_CHUNK_ACCUM.clear()
 
             return recv_reqs
+
+        def wrapped_get_num_allocatable_reqs(self, running_bs, *args, **kwargs):
+            native_budget = original_get_num_allocatable_reqs(
+                self, running_bs, *args, **kwargs
+            )
+            backend = C_SchedulerHook.PD_BACKEND
+            if backend is None:
+                return native_budget
+            # Dynamically throttle how many NEW requests native SGLang may
+            # pull from its own waiting_queue this call, based on hisim's
+            # LIVE prefill/decode sub-capacity occupancy. This is what makes
+            # requests that would otherwise overflow a sub-capacity genuinely
+            # wait in native's waiting_queue instead of being admitted and
+            # later crashing in bind_prefill_replicas/bind_decode_replicas.
+            # See BackendA.available_admission_budget() for the full
+            # rationale.
+            return min(native_budget, backend.available_admission_budget())
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
@@ -1202,6 +1239,9 @@ class C_SchedulerHook(BaseHook):
                                     and st.created_time >= 0.0
                                 ):
                                     arrival = st.created_time
+                                origin_ids = getattr(
+                                    req, "origin_input_ids", None
+                                )
                                 s = PDRequestState(
                                     rid=req.rid,
                                     arrival_time=arrival,
@@ -1211,6 +1251,20 @@ class C_SchedulerHook(BaseHook):
                                     ),
                                     phase=RequestPhase.WAITING_PREFILL,
                                     input_length=chunk_len,
+                                    # origin_input_ids is the full prompt,
+                                    # fixed at Req construction and stable
+                                    # across every subsequent chunk -- unlike
+                                    # chunk_len (this forward pass's own
+                                    # extend_input_len), it is the correct
+                                    # basis for KV-budget admission even
+                                    # before the LAST chunk lands. See
+                                    # PDRequestState.total_input_length and
+                                    # BackendA._decode_token_cost.
+                                    total_input_length=(
+                                        len(origin_ids)
+                                        if origin_ids
+                                        else chunk_len
+                                    ),
                                     output_length=int(
                                         getattr(
                                             req.sampling_params,
@@ -1277,6 +1331,14 @@ class C_SchedulerHook(BaseHook):
                                             req.rid, s.input_length
                                         )
                                     )
+                                # Keep total_input_length (the KV-budget
+                                # basis, see PDRequestState's docstring) in
+                                # sync with this same, now-fully-accurate
+                                # rebuilt-KV length -- covers the retract
+                                # case where fill_ids legitimately exceeds
+                                # the origin_input_ids snapshot taken when
+                                # this state was first created.
+                                s.total_input_length = s.input_length
                                 C_SchedulerHook.PD_CHUNK_ACCUM.pop(req.rid, None)
                                 final_states.append(s)
 
@@ -1569,7 +1631,49 @@ class C_SchedulerHook(BaseHook):
                                     C_SchedulerHook.PD_LAST_DECODE_STEP_END,
                                 )
                                 predicted_latency = round_latency
+                            elif bucket_rids:
+                                # Every rid PD knows about in this native
+                                # decode batch was legitimately deferred by
+                                # admit_decode_for_replica's count/KV
+                                # admission gate (see
+                                # decode_kv_capacity_per_replica) -- e.g. a
+                                # fresh wave of prefill->decode transitions
+                                # landing while decode's aggregate KV budget
+                                # is still fully committed by OTHER,
+                                # already-admitted RUNNING_DECODE requests
+                                # elsewhere (a separate native batch this
+                                # same tick; per_replica_queue mode's
+                                # decode-continuation and first-admission
+                                # calls are not guaranteed to be the same
+                                # `batch.reqs`). This is temporary
+                                # backpressure, not a bug: native will keep
+                                # re-offering these same rids on later
+                                # ticks, and headroom frees up the moment
+                                # any already-admitted request on their
+                                # sticky replica finishes. Before KV-aware
+                                # admission existed this could never happen
+                                # (native's own admission budget was always
+                                # exactly aligned with PD's pure count
+                                # capacity), which is why this used to be a
+                                # hard invariant; it no longer is. Contribute
+                                # zero latency this round -- nothing was
+                                # actually computed for these specific rids
+                                # -- and let native retry them next tick.
+                                logger.debug(
+                                    "[PD] decode batch: %d reqs deferred this "
+                                    "round (count/KV admission gate not yet "
+                                    "satisfied for any of them); contributing "
+                                    "zero latency and retrying next tick",
+                                    len(batch.reqs),
+                                )
+                                predicted_latency = 0.0
                             elif batch.reqs:
+                                # Every rid in this native batch is entirely
+                                # unknown to PD_REQUEST_STATES (bucket_rids
+                                # is built by silently dropping unknown rids
+                                # -- see batch_states/bucket_rids above), so
+                                # this is a genuine state-tracking divergence
+                                # rather than a legitimate admission defer.
                                 raise RuntimeError(
                                     "PD decode batch contained no admissible "
                                     "request state; native and PD capacity/state "
@@ -1956,6 +2060,7 @@ class C_SchedulerHook(BaseHook):
         target.__init__ = wrapped_init
         target.recv_requests = wrapped_recv_requests
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
+        target.get_num_allocatable_reqs = wrapped_get_num_allocatable_reqs
         target.update_running_batch = wrapped_update_running_batch
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result

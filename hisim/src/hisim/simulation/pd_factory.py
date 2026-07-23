@@ -18,9 +18,15 @@ from typing import Callable, Optional
 
 from hisim.spec import AcceleratorInfo, DataType, ModelInfo
 from hisim.simulation.types import SchedulerConfig
-from hisim.simulation.utils import calc_kv_cache_cell_elems
+from hisim.simulation.utils import (
+    calc_kv_cache_cell_elems,
+    estimate_kv_cache_pool_capacity,
+)
 from hisim.simulation.pd_config import DisaggConfig, RolePredictorConfig
 from hisim.simulation.pd_transfer import BandwidthTransferModel, KVModelConfig
+from hisim.utils import get_logger
+
+logger = get_logger("hisim")
 
 
 PredictorFactory = Callable[..., object]
@@ -39,6 +45,13 @@ class DisaggPredictors:
     decode_queue_mode: str = "single_replica"
     prefill_max_running_per_replica: Optional[int] = None
     decode_max_running_per_replica: Optional[int] = None
+    # Real per-accelerator KV-token budget for ONE decode replica (tp/pp-size
+    # aware; same formula as override_initialize's aggregate KV estimate,
+    # computed once here for the decode role specifically). None means the
+    # caller opted out of KV-aware decode admission (e.g. older unit tests
+    # that build DisaggPredictors by hand) -- Backend A treats that as
+    # "no per-replica KV gating", matching the pre-existing behaviour.
+    decode_kv_capacity_per_replica: Optional[int] = None
     # Backward-compatible alias used by older tests/callers.  New backends
     # prefer the role-specific fields above.
     max_running_per_replica: int = (1 << 31) - 1
@@ -181,6 +194,37 @@ def build_disagg(
         hw_factory=hw_factory,
     )
 
+    # Real per-accelerator KV-token budget for ONE decode replica, using the
+    # exact same hw/tp/pp inputs the decode predictor itself was built with.
+    # This is deliberately independent of decode_pred's internals (pure calc
+    # from utils.py, no I/O) so it stays correct even when predictor_factory
+    # is swapped out for a fake/test double. estimate_kv_cache_pool_capacity
+    # internally loads a real AIConfigurator perf model from `model`/`hw`,
+    # which requires a fully-realistic ModelInfo -- callers that pass a
+    # minimal/synthetic ModelInfo (e.g. unit tests exercising only the role-
+    # wiring logic with a fake predictor_factory) can't satisfy that, so any
+    # failure here degrades gracefully to None (== "KV-aware decode
+    # admission disabled"), matching the pre-existing behaviour for those
+    # callers instead of breaking them.
+    decode_hw = hw_factory(disagg_config.decode.device_name)
+    decode_role_sched = _build_role_sched_config(
+        base_sched_config, disagg_config.decode, model
+    )
+    try:
+        decode_kv_capacity_per_replica: Optional[int] = (
+            estimate_kv_cache_pool_capacity(model, decode_hw, decode_role_sched)
+        )
+    except Exception as exc:
+        logger.warning(
+            "estimate_kv_cache_pool_capacity failed for decode role "
+            "(model=%r device=%r); disabling KV-aware decode admission "
+            "for this bundle (falling back to count-only capacity): %s",
+            getattr(model, "name", model),
+            disagg_config.decode.device_name,
+            exc,
+        )
+        decode_kv_capacity_per_replica = None
+
     # Derive KV bytes-per-token from the prefill role (KV is produced there).
     prefill_role = disagg_config.prefill
     kv_dtype = (
@@ -218,5 +262,6 @@ def build_disagg(
         decode_max_running_per_replica=(
             disagg_config.decode.max_running_per_replica
         ),
+        decode_kv_capacity_per_replica=decode_kv_capacity_per_replica,
         max_running_per_replica=disagg_config.decode.max_running_per_replica,
     )
