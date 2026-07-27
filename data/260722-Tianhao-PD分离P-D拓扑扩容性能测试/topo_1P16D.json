@@ -1,0 +1,64 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "rtx_pro_6000_server"
+    },
+    "disk_read_bandwidth_gb": 4,
+    "disk_write_bandwidth_gb": 4,
+    "memory_read_bandwidth_gb": 64,
+    "memory_write_bandwidth_gb": 64
+  },
+  "predictor": {
+    "name": "aiconfigurator",
+    "database_path": "/mnt/nfs02/users/tjiang/Gitrepo/aiconfigurator/src/aiconfigurator/systems",
+    "device_name": "rtx_pro_6000_server"
+  },
+  "scheduler": {
+    "tp_size": 1,
+    "ep_size": 1,
+    "dp_size": 1,
+    "data_type": "FP16",
+    "kv_cache_data_type": "FP16",
+    "backend_name": "sglang",
+    "backend_version": "0.5.10"
+  },
+  "disagg": {
+    "enabled": true,
+    "backend": "single_process",
+    "decode_queue_mode": "per_replica_queue",
+    "prefill": {
+      "device_name": "rtx_pro_6000_server",
+      "tp_size": 1,
+      "ep_size": 1,
+      "dp_size": 1,
+      "pp_size": 1,
+      "replicas": 1,
+      "max_running_per_replica": 64,
+      "data_type": "FP16",
+      "kv_cache_data_type": "FP16",
+      "prefill_scale_factor": 1.0,
+      "decode_scale_factor": 1.0,
+      "database_path": "/mnt/nfs02/users/tjiang/Gitrepo/aiconfigurator/src/aiconfigurator/systems",
+      "backend_version": "0.5.10"
+    },
+    "decode": {
+      "device_name": "rtx_pro_6000_server",
+      "tp_size": 1,
+      "ep_size": 1,
+      "dp_size": 1,
+      "pp_size": 1,
+      "replicas": 16,
+      "max_running_per_replica": 64,
+      "data_type": "FP16",
+      "kv_cache_data_type": "FP16",
+      "prefill_scale_factor": 1.0,
+      "decode_scale_factor": 1.0,
+      "database_path": "/mnt/nfs02/users/tjiang/Gitrepo/aiconfigurator/src/aiconfigurator/systems",
+      "backend_version": "0.5.10"
+    },
+    "kv_transfer": {
+      "bw_gbps": 128,
+      "latency_us": 20
+    }
+  }
+}
