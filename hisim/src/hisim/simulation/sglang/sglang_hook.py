@@ -1103,11 +1103,23 @@ class C_SchedulerHook(BaseHook):
                         disagg_config=disagg_cfg,
                     )
                     C_SchedulerHook.PD_BACKEND = start_pd_backend(backend)
-                    C_SchedulerHook.PD_REQUEST_STATES.clear()
-                    C_SchedulerHook.REQUEST_STATS.clear()
+                    # NOTE: deliberately do NOT clear REQUEST_STATS /
+                    # PD_REQUEST_STATES / PD_PREFILL_KV_SERVICE /
+                    # PD_CHUNK_ACCUM here. This lazy path only rebuilds the
+                    # PD_BACKEND object; genuine "fresh run" clearing is
+                    # already handled by wrapped_init (eager, at Scheduler
+                    # construction) and wrapped_profile (at the end of each
+                    # cell, after results are written). Clearing here raced
+                    # against wrapped_recv_requests: if the new cell's first
+                    # request had already been registered (real rid /
+                    # input_length / output_length / created_time) before
+                    # this lazy rebuild fired, the clear wiped that entry,
+                    # and the next REQUEST_STATS[req.rid] access in
+                    # wrapped_process_batch_result silently auto-vivified a
+                    # blank RequestStats() default (rid="", input_length=1,
+                    # output_length=1, created_time=-1) for an otherwise
+                    # real, fully-processed request.
                     C_SchedulerHook.PD_LAST_DECODE_STEP_END = 0.0
-                    C_SchedulerHook.PD_PREFILL_KV_SERVICE.clear()
-                    C_SchedulerHook.PD_CHUNK_ACCUM.clear()
                     logger.info(
                         "PD backend lazily initialized in run_batch (backend=%s, closed_loop=%s).",
                         disagg_cfg.backend,
@@ -2043,7 +2055,18 @@ class C_SchedulerHook(BaseHook):
 
             # Phase 5c.2: tear down PD backend workers (BackendB only).
             # atexit also fires shutdown_pd_backend; idempotent.
-            if C_SchedulerHook.PD_BACKEND is not None:
+            # BackendA (single_process) has no workers to tear down
+            # (shutdown_pd_backend is a no-op for it) -- nulling PD_BACKEND
+            # here would only leave it briefly None, racing the lazy
+            # rebuild in wrapped_run_batch against the next cell's
+            # already-in-flight requests and wiping their freshly
+            # registered REQUEST_STATS entries. Only reset it for
+            # BackendB, which genuinely owns worker processes that must be
+            # torn down and rebuilt between runs.
+            if (
+                C_SchedulerHook.PD_BACKEND is not None
+                and ConfigManager.get_disagg_config().backend == "two_process"
+            ):
                 from hisim.simulation.pd_runtime import shutdown_pd_backend
 
                 shutdown_pd_backend(C_SchedulerHook.PD_BACKEND)

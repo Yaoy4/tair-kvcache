@@ -105,3 +105,73 @@ def test_predict_decode_rejects_non_positive_batch_size():
     adapter = AICPredictorAdapter(_RecordingPredictor())
     with pytest.raises(ValueError):
         adapter.predict_decode_seconds(batch_size=0)
+
+
+def test_predict_prefill_seconds_raises_on_negative_oom_sentinel():
+    """A negative predictor result is an OOM sentinel, not a real time delta.
+
+    Silently consuming it would corrupt the simulated clock, so the adapter
+    must fail loudly instead (see pd_aic_adapter.py's guard comment).
+    """
+    base = _RecordingPredictor(return_value=-0.25)
+    adapter = AICPredictorAdapter(base)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.predict_prefill_seconds(512)
+
+    message = str(excinfo.value)
+    assert "OOM sentinel" in message
+    assert "negative prefill" in message
+    assert "result=-0.250000s" in message
+    assert "num_requests=1" in message
+    assert "batch_tokens=512" in message
+    assert "max_input_length=512" in message
+
+
+def test_predict_prefill_batch_seconds_raises_on_negative_oom_sentinel():
+    base = _RecordingPredictor(return_value=-1.5)
+    adapter = AICPredictorAdapter(base)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.predict_prefill_batch_seconds([100, 300, 500])
+
+    message = str(excinfo.value)
+    assert "OOM sentinel" in message
+    assert "num_requests=3" in message
+    assert "batch_tokens=900" in message
+    assert "max_input_length=500" in message
+
+
+def test_predict_decode_seconds_raises_on_negative_oom_sentinel():
+    """Mirrors the prefill guard: decode admission is supposed to keep
+
+    batches within decode_kv_capacity_per_replica before ever reaching the
+    predictor, so this should only fire if that gate has a genuine gap.
+    """
+    base = _RecordingPredictor(return_value=-0.001)
+    adapter = AICPredictorAdapter(base)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.predict_decode_seconds(batch_size=4, past_kv_length=128)
+
+    message = str(excinfo.value)
+    assert "OOM sentinel" in message
+    assert "negative decode" in message
+    assert "result=-0.001000s" in message
+    assert "batch_size=4" in message
+    assert "max_past_kv=128" in message
+    assert "mean_past_kv=128.0" in message
+    assert "decode_kv_capacity_per_replica" in message
+
+
+def test_predict_decode_seconds_raises_on_negative_oom_sentinel_with_varied_past_kv():
+    base = _RecordingPredictor(return_value=-2.0)
+    adapter = AICPredictorAdapter(base)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.predict_decode_seconds(batch_size=3, past_kv_length=[10, 20, 30])
+
+    message = str(excinfo.value)
+    assert "batch_size=3" in message
+    assert "max_past_kv=30" in message
+    assert "mean_past_kv=20.0" in message
