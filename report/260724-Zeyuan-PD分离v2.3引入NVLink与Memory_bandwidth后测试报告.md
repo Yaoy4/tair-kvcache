@@ -4,13 +4,13 @@
 **仿真后端：** SGLang 0.5.6post2 + HiSim + AIConfigurator  
 **测试日期：** 2026-07-24 至 2026-07-27  
 **数据规模：** 11 套配置、198 个 workload、每个 workload 200 条请求  
-**状态：** 负载趋势总体合理；存在特殊请求污染、TP/Replica 扩展非单调
+**状态：** 负载趋势总体合理；存在特殊请求污染、TP/Replica 扩展非单调；带宽参数已进入直接受控路径，但均未成为当前 workload 的关键瓶颈
 
 ---
 
 ## 1. 执行摘要
 
-本报告评估新版 HiSim 在更新 Host Memory Bandwidth、KV 传输带宽和相关 bug 修复后的性能表现。测试覆盖两套 PD 合并配置、四套基于 TP 的 PD 分离配置，以及五套基于 Replica 的 PD 分离配置，统一使用 `seed=1`。
+本报告评估新版 HiSim 在更新 Host Memory Bandwidth、KV 传输带宽和相关 bug 修复后的性能表现。测试覆盖两套 PD 合并拓扑、四套基于 TP 的 PD 分离拓扑、五套基于 Replica 的 PD 分离拓扑，以及三套同拓扑带宽敏感性对照，统一使用 `seed=1`。
 
 核心结论如下：
 
@@ -19,8 +19,9 @@
 3. **增加 Prefill Replica 的边际收益接近零。** Replica P2D2 扩至 P4D2 后，平均 E2E 仅降低 0.4%、吞吐仅提高 0.4%；P3D1 相对 P1D1 的平均 E2E 反而增加 7.8%、吞吐下降 5.3%。这说明当前长输入场景没有随 Prefill Replica 数量获得预期扩展。
 4. **P8D8 提升总吞吐，但长输入 TPOT 反向恶化。** 相对 Replica P2D4，P8D8 在 18/18 组提高吞吐，平均提高 40.1%，但 `IL=16384` 的 TPOT 增加 37.2% 至 61.3%，其中 `OL=1024` 的 E2E 反而增加约 11% 至 14%。
 5. **TP 与 Replica 扩展均存在非单调性。** TP4 并未全面优于 TP2；相同设备数下 Replica P2D2/P2D4 的 E2E 简单平均分别比对应 TP 拓扑高约 17%/21%。拓扑类型不能只按总设备数等价替换。
-6. **KV 传输不是本轮瓶颈。** PD 分离的平均 KV transfer 仅为亚毫秒至约 3 ms，而高负载下 Prefill/Decode queue 达数万至百万毫秒。
-7. **结果文件完整但 workload 受污染。** 198 个 workload 均有结果且 `completed=200`；两套 PD 合并数据完全合规，九套 PD 分离数据均有多数 workload 混入一条 `input_length=1`、`output_length=1`、`created_time=0` 的特殊请求。
+6. **Host Memory Bandwidth 已生效，但当前负载几乎不敏感。** TP4 PD 合并中，读写带宽由 480 降至 64 GB/s 后，累计 L2 load 从 79.14 ms 增至 359.46 ms，但 121,113 次 iteration 中仅 27 次发生 load，且全部被上一轮 374--454 ms 的 forward 覆盖，E2E 与吞吐 18/18 组不变。Replica-P2D2 PD 分离中没有发生 L2 load，核心指标与 480 GB/s 基线逐项完全相同。
+7. **KV transfer 带宽已生效，但传输不是本轮瓶颈。** Replica-P2D2 的 `bw_gbps` 从 811 降至 128 后，典型 KV transfer 从 0.208--2.998 ms 增至 1.211--18.889 ms，倍率为 5.82--6.30 倍；但相对数万至百万毫秒的 Prefill/Decode queue 仍很小，最终 E2E 和吞吐的平均相对变化均低于 0.005%。
+8. **结果文件完整但 workload 受污染。** 252 个 workload 均有结果且 `completed=200`；三套 PD 合并数据完全合规，十一套 PD 分离数据均有多数 workload 混入一条 `input_length=1`、`output_length=1`、`created_time=0` 的特殊请求。
 
 
 ## 2. 测试目标与验收口径
@@ -73,9 +74,17 @@
 
 分离模式下，实际角色拓扑由 `disagg.prefill/decode` 内的 `tp_size` 与 `replicas` 共同决定。顶层 `scheduler.tp_size=1` 不代表 P/D 两侧的实际拓扑。Decode 多副本实验使用 `decode_queue_mode=per_replica_queue`；P3D1 的 Decode 仅有 1 个副本，沿用单队列不影响拓扑含义。
 
+三套敏感性实验保持对应拓扑不变，仅调整带宽参数：
+
+| 对照实验 | 拓扑 | 基线 | 变量配置 |
+| --- | --- | --- | --- |
+| PD 合并 Host BW | TP4、DP1 | read/write=480 GB/s | read/write=64 GB/s |
+| PD 分离 Host BW | Replica-P2D2 | read/write=480 GB/s | read/write=64 GB/s |
+| PD 分离 KV BW | Replica-P2D2 | `bw_gbps=811` | `bw_gbps=128` |
+
 ### 4.2 工作负载矩阵
 
-每套配置运行 $3 \times 3 \times 2 = 18$ 个 workload，共 198 个 workload：
+每套配置运行 $3 \times 3 \times 2 = 18$ 个 workload，共 252 个 workload：
 
 | 参数 | 取值 |
 | --- | --- |
@@ -100,7 +109,7 @@
 
 $$E2E = TTFT + (OL - 1) \times TPOT$$
 
-11 套结果均通过该一致性检查；PD 分离结果的最大相对误差低于 0.051%，PD 合并结果的轻微偏差来自请求级长度和均值聚合方式。
+14 套结果均通过该一致性检查；PD 分离结果的最大相对误差低于 0.051%，PD 合并结果的轻微偏差来自请求级长度和均值聚合方式。
 
 ## 5. 互联与 Host Memory Bandwidth 假设
 
@@ -282,9 +291,9 @@ $$E2E = TTFT + (OL - 1) \times TPOT$$
 
 ### 6.1 分析口径与数据完整性
 
-- 11 套配置均覆盖 `RR={1,8,64}`、`IL={1024,4096,16384}`、`OL={1024,4096}`，即每套 18 个 workload；每组均有 200 条请求且 `completed=200`，TTFT、TPOT、E2E 和吞吐字段完整。
-- 两套 PD 合并实验的 18 组请求长度均符合目标。
-- **异常：**九套 PD 分离实验中均存在 `input_length=1`、`output_length=1`、`created_time=0` 的特殊请求。除 TP-P2D4 有 16 组受影响外，其余八套 PD 分离配置均有 17 组受影响。受影响组实际由 199 条目标请求和 1 条 `1x1` 请求组成；OL=1024 时总输出为 203,777，OL=4096 时为 815,105。
+- 14 套配置均覆盖 `RR={1,8,64}`、`IL={1024,4096,16384}`、`OL={1024,4096}`，即每套 18 个 workload；每组均有 200 条请求且 `completed=200`，TTFT、TPOT、E2E 和吞吐字段完整。
+- 三套 PD 合并实验的 18 组请求长度均符合目标。
+- **异常：**十一套 PD 分离实验中均存在 `input_length=1`、`output_length=1`、`created_time=0` 的特殊请求。除 TP-P2D4 有 16 组受影响外，其余十套 PD 分离配置均有 17 组受影响，共影响 186 个 workload。受影响组实际由 199 条目标请求和 1 条 `1x1` 请求组成；OL=1024 时总输出为 203,777，OL=4096 时为 815,105。
 - 下表均沿用原始汇总文件的 mean 指标，未剔除该特殊请求。由于异常请求只占 0.5%，大部分趋势仍可参考，但 PD 分离结果不宜直接作为最终基线，尤其是低 RR 下的延迟和吞吐比较。
 - 所有配置仅有 seed=1，当前结论描述确定性模拟中的趋势，不代表跨 seed 的统计置信度。
 
@@ -292,6 +301,7 @@ $$E2E = TTFT + (OL - 1) \times TPOT$$
 | --- | ---: | ---: | ---: | ---: | --- |
 | PD 合并 TP2 | 18/18 | 200/组 | 18/18 | 0 | 通过 |
 | PD 合并 TP4 | 18/18 | 200/组 | 18/18 | 0 | 通过 |
+| PD 合并 TP4、Host BW64 | 18/18 | 200/组 | 18/18 | 0 | 通过 |
 | PD 分离 P1D1 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
 | PD 分离 TP-P2D2 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
 | PD 分离 TP-P4D2 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
@@ -301,6 +311,8 @@ $$E2E = TTFT + (OL - 1) \times TPOT$$
 | PD 分离 Replica-P4D2 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
 | PD 分离 Replica-P2D4 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
 | PD 分离 Replica-P8D8 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
+| PD 分离 Replica-P2D2、Host BW64 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
+| PD 分离 Replica-P2D2、KV BW128 | 18/18 | 200/组 | 1/18 | 17 | 有条件通过 |
 
 
 
@@ -1156,11 +1168,79 @@ Replica-P4D2 与 Replica-P2D2 几乎重合：平均 E2E 仅降低 0.4%、吞吐�
 
 相对 Replica-P2D4，P8D8 在 18/18 组提高吞吐，平均提高 40.1%，TTFT 和 E2E 分别平均降低 26.9% 和 15.4%。但 `IL=16384` 的 TPOT 增加 37.2% 至 61.3%，`OL=1024` 的 E2E 在三档 RR 下反而增加约 11% 至 14%。最大 Prefill queue 降至 194 秒，而最大 Decode queue 升至 186 秒，显示瓶颈从 Prefill 向 Decode 迁移，并伴随单副本 batch 变小或负载分配效率下降。
 
+### 6.5 带宽敏感性实验
+
+#### Host Memory Bandwidth：PD 合并 TP4
+
+该实验将 `memory_read_bandwidth_gb` 和 `memory_write_bandwidth_gb` 同时从 480 降至 64，拓扑保持 TP4、DP1、PD 合并不变。
+
+| RR | IL | OL | TTFT (ms) | TPOT (ms/token) | E2E (ms) | Output throughput (token/s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1024 | 1024 | 119.603 | 8.470 | 8,784.115 | 1,020.916 |
+| 1 | 1024 | 4096 | 123.563 | 18.950 | 77,725.384 | 3,185.330 |
+| 1 | 4096 | 1024 | 512.761 | 15.482 | 16,353.793 | 1,014.326 |
+| 1 | 4096 | 4096 | 518.943 | 45.318 | 186,103.058 | 2,400.474 |
+| 1 | 16384 | 1024 | 87,962.174 | 168.297 | 260,642.962 | 462.591 |
+| 1 | 16384 | 4096 | 183,808.079 | 92.558 | 563,117.886 | 961.146 |
+| 8 | 1024 | 1024 | 314.569 | 37.981 | 39,170.987 | 3,824.922 |
+| 8 | 1024 | 4096 | 314.569 | 41.534 | 170,400.227 | 4,409.989 |
+| 8 | 4096 | 1024 | 25,533.003 | 84.831 | 112,397.196 | 1,647.665 |
+| 8 | 4096 | 4096 | 25,533.003 | 66.985 | 299,901.717 | 2,627.311 |
+| 8 | 16384 | 1024 | 171,261.801 | 168.297 | 343,942.589 | 462.591 |
+| 8 | 16384 | 4096 | 267,107.707 | 92.558 | 646,417.513 | 961.146 |
+| 64 | 1024 | 1024 | 7,846.947 | 40.255 | 49,037.885 | 4,053.409 |
+| 64 | 1024 | 4096 | 7,846.947 | 42.365 | 181,342.102 | 4,480.675 |
+| 64 | 4096 | 1024 | 35,945.456 | 84.831 | 122,809.650 | 1,647.665 |
+| 64 | 4096 | 4096 | 35,945.456 | 66.985 | 310,314.171 | 2,627.311 |
+| 64 | 16384 | 1024 | 181,674.255 | 168.297 | 354,355.043 | 462.591 |
+| 64 | 16384 | 4096 | 277,520.160 | 92.558 | 656,829.967 | 961.146 |
+
+相对 480 GB/s 基线，E2E 和吞吐 18/18 组不变；TTFT 平均增加 0.164%，绝对增加 0.096--2.416 ms，TPOT 平均降低 0.0024%。这组微小的 TTFT/TPOT 反向变化在 E2E 中完全抵消，不代表 Decode 因带宽降低而加速。
+
+| L2 直接指标 | 480 GB/s | 64 GB/s |
+| --- | ---: | ---: |
+| 总 iteration | 121,113 | 121,113 |
+| 非零 L2 load iteration | 27 | 27 |
+| 累计 L2 load | 79.14 ms | 359.46 ms |
+| 最大单次 L2 load | 3.53 ms | 15.56 ms |
+| 累计 L2 backup | 10.124 s | 25.244 s |
+| 累计模型 forward | 6,230.93 s | 6,230.93 s |
+| 重叠后暴露的 L2 load | 0 ms | 0 ms |
+
+参数已经进入 L2 I/O 模型，但 H2D load 只占 0.0223% 的 iteration，并且只出现在 `IL=16384` 的 6 个 workload。发生 load 时，上一轮 forward 为 374--454 ms，显著大于 64 GB/s 下最大 15.56 ms 的 load，因此全部被 overlap schedule 隐藏。与此同时，本实验也降低了 write bandwidth，累计 D2H backup 增加 15.12 s；该变量混杂使毫秒级 TTFT 差异不能单独归因于 read bandwidth。
+
+#### Host Memory Bandwidth：PD 分离 Replica-P2D2
+
+Replica-P2D2 将 Host read/write 从 480 同时降至 64 GB/s 后，TTFT、TPOT、E2E 和吞吐在 18/18 个 workload 中逐项完全相同，整体均值仍为 TTFT 203,431.68 ms、TPOT 59.141 ms/token、E2E 349,384.11 ms、吞吐 1,840.03 token/s。
+
+直接指标显示两组均有 197,501 次 iteration 和 3,209 次 L2 backup，但 **L2 load 为 0 次**。累计 backup 从 19.779 s 增至 80.072 s，模型 forward 均为 11,948.42 s。也就是说，write-through 写入发生且 write bandwidth 参数改变了直接受控时长，但当前 PD 分离请求计时没有体现这部分差异；read bandwidth 则因为没有 Host L2→GPU load-back 而没有可作用对象。
+
+#### KV Transfer Bandwidth：PD 分离 Replica-P2D2
+
+该实验仅将 `disagg.kv_transfer.bw_gbps` 从 811 降至 128，Replica-P2D2 拓扑和 Host bandwidth 保持不变。
+
+| IL | 811 GB/s 典型 KV transfer | 128 GB/s 典型 KV transfer | 放大倍率 |
+| ---: | ---: | ---: | ---: |
+| 1024 | 0.208--0.400 ms | 1.211--2.436 ms | 5.82--6.09 倍 |
+| 4096 | 0.765 ms | 4.737 ms | 6.20 倍 |
+| 16384 | 2.998 ms | 18.889 ms | 6.30 倍 |
+
+理论带宽比为 $811/128=6.336$。实测倍率略低，是因为传输模型还包含固定 20 μs 延迟；结果证明参数已经进入 Prefill→Decode KV transfer 路径。
+
+| 指标 | 811 GB/s | 128 GB/s | 逐 workload 平均相对变化 |
+| --- | ---: | ---: | ---: |
+| TTFT (ms) | 203,431.68 | 203,438.73 | +0.42685% |
+| TPOT (ms/token) | 59.141 | 59.138 | -0.00787% |
+| E2E (ms) | 349,384.11 | 349,388.11 | -0.00425% |
+| Output throughput (token/s) | 1,840.033 | 1,840.035 | -0.00115% |
+
+TTFT 的逐 workload 变化范围为 +0.0018% 至 +2.1302%，E2E 为 -0.1447% 至 +0.0397%。低于 0.1% 的局部反向变化来自 batching、队列边界和均值聚合，不应解释为降低带宽带来性能收益。即使在 128 GB/s 下，最大约 18.9 ms 的传输仍远小于高负载下数万至百万毫秒的队列时间，因此它不是当前瓶颈。
+
 
 
 ## 7. 跨配置分析
 
-### 7.1 十一套配置整体均值
+### 7.1 十四套配置整体均值
 
 以下为每套配置对 18 个 workload 的简单算术平均，仅用于整体观察，不应替代同一 workload 的逐项比较：
 
@@ -1168,12 +1248,15 @@ Replica-P4D2 与 Replica-P2D2 几乎重合：平均 E2E 仅降低 0.4%、吞吐�
 | ------------ | -------------: | -------------------: | ------------: | ---------------------: |
 | PD 合并 TP2  |     108,843.07 |               68.220 |    279,255.30 |               1,782.27 |
 | PD 合并 TP4  |      72,770.29 |               74.254 |    244,424.79 |               2,067.29 |
+| PD 合并 TP4、Host BW64 |      72,771.61 |               74.253 |    244,424.79 |               2,067.29 |
 | PD 分离 P1D1 |     254,427.31 |               56.859 |    398,170.54 |               1,239.21 |
 | PD 分离 TP-P2D2 |     111,570.01 |               61.321 |    262,262.51 |               1,776.69 |
 | PD 分离 TP-P4D2 |     128,820.86 |               66.291 |    287,618.70 |               1,675.38 |
 | PD 分离 TP-P2D4 |      75,707.86 |               45.636 |    184,988.00 |               2,159.43 |
 | PD 分离 Replica-P3D1 |     293,448.00 |               59.450 |    441,313.80 |               1,240.49 |
 | PD 分离 Replica-P2D2 |     203,431.68 |               59.141 |    349,384.11 |               1,840.03 |
+| PD 分离 Replica-P2D2、Host BW64 |     203,431.68 |               59.141 |    349,384.11 |               1,840.03 |
+| PD 分离 Replica-P2D2、KV BW128 |     203,438.73 |               59.138 |    349,388.11 |               1,840.04 |
 | PD 分离 Replica-P4D2 |     203,335.96 |               59.069 |    349,175.55 |               1,858.78 |
 | PD 分离 Replica-P2D4 |     115,440.83 |               61.212 |    255,320.57 |               2,429.42 |
 | PD 分离 Replica-P8D8 |      55,698.12 |               76.892 |    216,660.91 |               3,040.34 |
@@ -1187,7 +1270,8 @@ Replica-P4D2 与 Replica-P2D2 几乎重合：平均 E2E 仅降低 0.4%、吞吐�
 3. **Prefill Replica 扩展几乎失效。**Replica-P2D2 扩至 Replica-P4D2 后，大多数长输入结果完全或近似重合；P3D1 相对 P1D1 还出现整体回退。额外 Prefill replicas 没有按预期降低 Prefill queue，需要检查副本 admission、affinity、虚拟时钟和 AIC batch 输入。
 4. **P8D8 体现吞吐与单请求延迟的权衡。**P8D8 吞吐最高，特别是 `RR=64, IL=1024` 达 8,531 至 9,895 token/s；但长输入 TPOT 显著高于 Replica-P2D4，`IL=16384, OL=1024` 的 E2E 反而恶化。不能仅按总吞吐认定扩容全面成功。
 5. **TP 与 Replica 拓扑不等价。**相同 P/D 设备数下，两类拓扑的 batch 形成、通信和排队机制不同。Replica-P2D2/P2D4 的 E2E 简单平均分别比对应 TP 拓扑高约 17%/21%，因此容量规划必须显式标注扩展方式。
-6. **KV 传输不是当前瓶颈。**PD 分离实验的 KV transfer 最大约 3 ms，而 Replica 配置的最大 Prefill queue 为 194 至 1,103 秒、最大 Decode queue 为 27 至 186 秒。`bw_gbps=811` 已进入传输计算路径，但本组数据主要反映计算与排队能力。
+6. **Host Memory Bandwidth 不是当前关键路径瓶颈。**TP4 PD 合并的 Host BW64 数据证明 L2 I/O 时长会随参数变化，但 H2D load 极少且被 forward 完全覆盖；Replica-P2D2 更是没有发生 L2 load。当前测试只能说明 workload 对 Host bandwidth 不敏感，不能说明 64 GB/s 与 480 GB/s 等效。
+7. **KV 传输不是当前瓶颈。**`bw_gbps` 从 811 降至 128 后，KV transfer 按理论方向放大约 6 倍，但最大仍只有约 18.9 ms，而 Replica 配置的最大 Prefill queue 为 194 至 1,103 秒、最大 Decode queue 为 27 至 186 秒。最终 E2E 与吞吐变化低于 0.005%，说明本组数据主要反映计算与排队能力。
 
 ## 8. 异常与风险分级
 
@@ -1196,36 +1280,42 @@ Replica-P4D2 与 Replica-P2D2 几乎重合：平均 E2E 仅降低 0.4%、吞吐�
 1. **TP-P4D2 扩展全面回退。** 相对 TP-P2D2，增加 Prefill TP 后 18/18 个 workload 的 TTFT、TPOT、E2E 全部变差，吞吐全部下降。建议检查 RTX PRO 6000 Server 的 TP4 Prefill AIC 曲线、TP 通信模型、拓扑映射和 predictor 输入。
 2. **Prefill Replica 扩展不生效或反向扩展。** Replica-P2D2 扩至 Replica-P4D2 的平均 E2E/吞吐仅变化约 0.4%；P3D1 相对 P1D1 的平均 E2E 增加 7.8%。该现象覆盖确定性同 seed 数据，不能归因于普通随机波动。
 3. **P8D8 长输入 TPOT 反向恶化。** 相对 Replica-P2D4，`IL=16384` 的 TPOT 增加 37.2% 至 61.3%，并使 `OL=1024` 的 E2E 恶化约 11% 至 14%。应检查 Decode replica-local batching、负载均衡和队列时间归属。
-4. **特殊 `1x1` 请求污染聚合。** 九套 PD 分离数据共有 152 个 workload 受影响。请求固定表现为 `input_length=1`、`output_length=1`、`created_time=0`，更像探测、占位或残留请求。它占每组请求数的 0.5%，但对低 RR 下的 mean TTFT/E2E 和吞吐可能产生不成比例的影响。
+4. **特殊 `1x1` 请求污染聚合。** 十一套 PD 分离数据共有 186 个 workload 受影响。请求固定表现为 `input_length=1`、`output_length=1`、`created_time=0`，更像探测、占位或残留请求。它占每组请求数的 0.5%，但对低 RR 下的 mean TTFT/E2E 和吞吐可能产生不成比例的影响。
 
 ### 8.2 中优先级
 
 1. **PD 合并 TP4 的 TP 扩展非单调。** TP4 相比 TP2 的吞吐多数提高，但部分短输入和 `IL=16384, OL=1024` 组合回退，需要核验 TP4 Decode 预测曲线及通信开销。
 2. **同设备数 TP/Replica 结果不等价。** 这可能来自合理的 TP 通信与 Replica 独立队列差异，但当前差距较大，需用 iteration trace 和 AIC 单步预测拆分验证。
-3. **单 seed。** 本轮只能证明确定性仿真在 seed=1 下的行为，不能提供跨 seed 的置信区间。
+3. **PD 分离的 L2 backup 未反映到最终指标。** Replica-P2D2 的累计 backup 从 19.779 s 增至 80.072 s，但 18/18 组核心指标完全相同。需要核对 PD 请求时钟与 HiCache backup 记账边界，避免 I/O 已计算但未进入请求生命周期。
+4. **单 seed。** 本轮只能证明确定性仿真在 seed=1 下的行为，不能提供跨 seed 的置信区间。
 
 ### 8.3 解释性现象
 
 1. **RR=8 与 RR=64 的 TPOT/吞吐相同。** 这符合确定性容量模型进入饱和区的表现，不应直接判为数据重复。
 2. **长 OL 下 TPOT 有时降低。** 该现象与更稳定的 continuous batching 相容，但需要 iteration 级 batch-size 统计验证。
+3. **降低带宽后局部指标略有改善。** KV BW128 中低于 0.1% 的 TPOT、E2E 或吞吐反向变化由 batching、队列边界和聚合口径主导，不构成“低带宽更快”的证据。
 
 ## 9. 结论与配置建议
 
 1. 对本轮 Qwen3-8B、固定长度、大输出 workload，优先增加 Decode 资源；在已测试的 6 设备预算中，无论 TP 还是 Replica 扩展，都优先选择 P2D4 而不是 P4D2。
 2. 811 GB/s 只应作为假设性互联带宽，不代表 RTX PRO 6000 的真实能力。
-3. 480 GB/s Host Memory Bandwidth 应通过本机 NUMA 感知的 STREAM 实测校准，并分别验证 300、480、614.4 GB/s 对 HiCache 场景的影响。
+3. 480 GB/s Host Memory Bandwidth 应通过本机 NUMA 感知的 STREAM 实测校准；后续必须固定 write、只扫 read，或固定 read、只扫 write，避免本轮读写同时变化的因果混杂。
+4. Host bandwidth 验证必须构造“写入 Host L2→GPU L1 淘汰→再次命中并 load-back”的请求序列，并同时报告 `l2_load_latency`、`l2_backup_latency` 和 overlap 后暴露时间。仅开启 L2 和 write-through 不保证 read bandwidth 会影响 E2E。
+5. KV transfer 带宽评估应在缩短队列或提高传输占比的 workload 上进行；当前 128 GB/s 已经证明参数生效，但不能用于推断更低带宽下的拐点。
 
 ## 10. 后续验证计划
 
 | 优先级 | 验证项 | 预期产物 |
 | --- | --- | --- |
-| P0 | 定位并排除 `created_time=0` 的 `1x1` 请求 | 修复代码、单元测试、重新生成九套 PD 分离指标 |
+| P0 | 定位并排除 `created_time=0` 的 `1x1` 请求 | 修复代码、单元测试、重新生成十一套 PD 分离指标 |
 | P0 | 核对 `bw_gbps` 单位 | 字段迁移或换算修复、兼容性测试、配置文档 |
+| P0 | 核对 PD 分离 L2 backup 记账 | 请求时钟与 iteration I/O 时长对齐测试 |
 | P0 | 复核 P4D2 全面回退 | TP2/TP4 Prefill 单点 AIC 曲线、iteration trace、拓扑映射检查 |
 | P0 | 复核 Prefill Replica 扩展失效 | P2D2/P4D2 的 replica admission、affinity、busy-until 与 batch trace |
 | P0 | 复核 P8D8 长输入 TPOT 回退 | Decode 每副本 batch-size、队列时间、利用率与路由分布 |
 | P1 | 增加多 seed | 至少 3 个 seed，报告 mean、标准差和置信区间 |
-| P1 | 带宽敏感性测试 | KV transfer 与 Host Memory Bandwidth sweep |
+| P1 | Host BW 单变量测试 | 固定 write 的 read sweep、固定 read 的 write sweep、强制 L2 load-back workload |
+| P1 | KV BW 拐点测试 | 控制队列后的 811/128/64/32 GB/s sweep 与传输占比曲线 |
 
 
 ## 11. 已知限制
@@ -1234,7 +1324,7 @@ Replica-P4D2 与 Replica-P2D2 几乎重合：平均 E2E 仅降低 0.4%、吞吐�
 2. RTX PRO 6000 不支持 NVLink，811 GB/s 是替代拓扑假设；结论不代表该 GPU 的真实多卡互联性能。
 3. Host Memory Bandwidth 480 GB/s 未经本机实测校准。
 4. 仅测试 Qwen3-8B、FP16 和当前 AIC 数据库，不能直接外推到 MoE、FP8 KV Cache 或其他模型。
-5. 仅使用 seed=1，且九套 PD 分离 mean 指标受特殊请求影响。
+5. 仅使用 seed=1，且十一套 PD 分离 mean 指标受特殊请求影响。
 6. 本轮启用了 L2 HiCache，但没有 no-cache/L1 对照组，因此无法从本轮数据中单独量化 480 GB/s 参数带来的收益。
 
 ## 12. 数据与制品位置
@@ -1245,12 +1335,15 @@ Replica-P4D2 与 Replica-P2D2 几乎重合：平均 E2E 仅降低 0.4%、吞吐�
 | 核心配置 | `tair-kvcache/hisim/tools/pd_disagg_rtx6000_sglang_0_5_10.json` |
 | PD 合并 TP2 | `cases_same_seed_1-tp2-dp1-PDagg` |
 | PD 合并 TP4 | `cases_same_seed_1-tp4-dp1-PDagg` |
+| PD 合并 TP4、Host BW64 | `cases_same_seed_1-tp4-dp-1-MemBW64-PDagg` |
 | PD 分离 P1D1 | `cases_same_seed_1-P1D1-tp1-dp1-PDdisagg` |
 | PD 分离 TP-P2D2 | `cases_same_seed_1-P2D2-Ptp2-Dtp2-dp1-PDdisagg` |
 | PD 分离 TP-P4D2 | `cases_same_seed_1-P4D2-Ptp4-Dtp2-dp1-PDdisagg` |
 | PD 分离 TP-P2D4 | `cases_same_seed_1-P2D4-Ptp2-Dtp4-dp1-PDdisagg` |
 | PD 分离 Replica-P3D1 | `cases_same_seed_1-P3D1-tp1-dp1-Preplica3-PDdisagg-SingleReplica` |
 | PD 分离 Replica-P2D2 | `cases_same_seed_1-P2D2-tp1-dp1-Preplica2-Dreplica2-PDdisagg` |
+| PD 分离 Replica-P2D2、Host BW64 | `cases_same_seed_1-P2D2-tp1-dp1-Preplica2-Dreplica2-MemBW64-PDdisagg` |
+| PD 分离 Replica-P2D2、KV BW128 | `cases_same_seed_1-P2D2-tp1-dp1-Preplica2-Dreplica2-KVBW128-PDdisagg` |
 | PD 分离 Replica-P4D2 | `cases_same_seed_1-P4D2-tp1-dp1-Preplica4-Dreplica2-PDdisagg` |
 | PD 分离 Replica-P2D4 | `cases_same_seed_1-P2D4-tp1-dp1-Preplica2-Dreplica4-PDdisagg` |
 | PD 分离 Replica-P8D8 | `cases_same_seed_1-P8D8-tp1-dp1-Preplica8-Dreplica8-PDdisagg` |
